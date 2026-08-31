@@ -1,0 +1,67 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>AskJobs Consultant Autofill — Settings</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, sans-serif;
+        max-width: 480px;
+        margin: 40px auto;
+        color: #111827;
+      }
+      h1 {
+        font-size: 18px;
+      }
+      p {
+        color: #4b5563;
+        font-size: 14px;
+        line-height: 1.5;
+      }
+      input {
+        width: 100%;
+        padding: 10px;
+        border: 1px solid #d1d5db;
+        border-radius: 8px;
+        font-size: 13px;
+        box-sizing: border-box;
+      }
+      button {
+        margin-top: 10px;
+        padding: 10px 16px;
+        border: none;
+        border-radius: 8px;
+        background: #c02c2a;
+        color: #fff;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button.secondary {
+        background: #e5e7eb;
+        color: #111827;
+        margin-left: 8px;
+      }
+      #saved {
+        color: #16a34a;
+        font-size: 13px;
+        margin-top: 8px;
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Connect your consultant account</h1>
+    <p>
+      Generate a token from the Consultant app's Extension page, then paste
+      it here to let this extension autofill job applications with a
+      candidate's profile and their optimized resume.
+    </p>
+    <input id="token-input" type="password" placeholder="ajext_..." />
+    <div>
+      <button id="save-btn">Save Token</button>
+      <button id="clear-btn" class="secondary">Disconnect</button>
+    </div>
+    <div id="saved">Saved.</div>
+    <script src="options.js"></script>
+  </body>
+</html>

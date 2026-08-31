@@ -1,0 +1,76 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>AskJobs Consultant Autofill</title>
+    <style>
+      body {
+        width: 240px;
+        font-family: system-ui, -apple-system, sans-serif;
+        margin: 0;
+        padding: 14px;
+        background: #111827;
+        color: #fff;
+      }
+      h1 {
+        font-size: 14px;
+        margin: 0 0 10px;
+      }
+      .status {
+        font-size: 12px;
+        margin-bottom: 12px;
+        padding: 8px;
+        border-radius: 8px;
+      }
+      .status.connected {
+        background: #14532d;
+        color: #bbf7d0;
+      }
+      .status.disconnected {
+        background: #7f1d1d;
+        color: #fecaca;
+      }
+      button {
+        width: 100%;
+        padding: 8px;
+        border: none;
+        border-radius: 8px;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        margin-bottom: 8px;
+      }
+      #fill-btn {
+        background: #c02c2a;
+        color: #fff;
+      }
+      #enable-site-btn {
+        background: #1d4ed8;
+        color: #fff;
+      }
+      #options-btn {
+        background: #374151;
+        color: #fff;
+      }
+      .hidden {
+        display: none;
+      }
+      .hint {
+        font-size: 11px;
+        color: #9ca3af;
+        margin: -4px 0 10px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>AskJobs Consultant Autofill</h1>
+    <div id="status" class="status">Checking…</div>
+    <button id="fill-btn" class="hidden">Fill this application</button>
+    <button id="enable-site-btn" class="hidden">Enable on this site</button>
+    <div id="enable-hint" class="hint hidden">
+      Not one of the built-in sites — click above to allow AskJobs Consultant Autofill on this specific page only.
+    </div>
+    <button id="options-btn">Settings</button>
+    <script src="popup.js"></script>
+  </body>
+</html>

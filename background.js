@@ -119,7 +119,7 @@ async function fetchFileAsDataUrl(url) {
   }
 }
 
-// How long an unclaimed handoff stays valid before we give up on it (e.g.
+// How long an UNCLAIMED handoff stays valid before we give up on it (e.g.
 // the tab it was meant for never loaded, or loaded and errored out).
 const HANDOFF_TTL_MS = 5 * 60 * 1000;
 
@@ -132,7 +132,14 @@ const HANDOFF_TTL_MS = 5 * 60 * 1000;
 async function getPendingHandoffs() {
   const { pendingHandoffs } = await chrome.storage.session.get("pendingHandoffs");
   const now = Date.now();
-  return (pendingHandoffs || []).filter((h) => now - h.receivedAt < HANDOFF_TTL_MS);
+  // Confirmed real gap: this used to expire EVERY entry after HANDOFF_TTL_MS
+  // regardless of claimed status, so a multi-step application taking longer
+  // than 5 minutes could lose its own already-in-use handoff on a routine
+  // reload partway through, with no way to get it back short of starting
+  // over from the Consultant app. Once a tab has actually claimed an entry,
+  // it's meant to last that tab's whole session — only still-UNCLAIMED
+  // entries (e.g. a tab that never loaded at all) age out.
+  return (pendingHandoffs || []).filter((h) => h.claimedByTabId != null || now - h.receivedAt < HANDOFF_TTL_MS);
 }
 
 // Bound to the claiming TAB, not consumed on first read — a reload of the
@@ -231,7 +238,46 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       case "IS_SITE_SUPPORTED": {
         const supportedHosts = await getSupportedHosts();
-        sendResponse({ supported: isHostnameSupported(message.hostname, supportedHosts) });
+        let supported = isHostnameSupported(message.hostname, supportedHosts);
+        // Confirmed real bug: the popup's "Enable on this site" flow grants a
+        // runtime host permission and injects this very script via
+        // chrome.scripting.executeScript, but init()'s own support check only
+        // ever consulted the bundled, static site-support.json list — so a
+        // manually-enabled site (by definition NOT in that list) still got
+        // immediately rejected here regardless, making "Enable on this site"
+        // a dead end for autofill itself (it only ever fed the
+        // recordUnsupportedSite telemetry below). A site the user has
+        // explicitly been granted runtime permission for is just as
+        // legitimate as one in the static list.
+        if (!supported && message.origin) {
+          try {
+            supported = await chrome.permissions.contains({ origins: [`${message.origin}/*`] });
+          } catch {
+            // Malformed origin — stay unsupported rather than throw.
+          }
+        }
+        sendResponse({ supported });
+        break;
+      }
+      case "SET_MANUAL_CANDIDATE_HANDOFF": {
+        // From the popup's candidate picker — covers a job opened without
+        // ever going through the Consultant app's Apply button (no handoff
+        // was ever queued for this tab at all). Pre-claimed for this exact
+        // tab (the popup already knows which tab it's acting on, via
+        // chrome.tabs.query — no hostname-matching needed like the real
+        // handoff flow), and persisted the same way, so a reload of this
+        // same tab finds it automatically via the normal GET_PENDING_HANDOFF
+        // path — the consultant shouldn't have to reselect a candidate every
+        // time a multi-step application form reloads or re-navigates.
+        const queue = await getPendingHandoffs();
+        queue.push({
+          candidateId: message.candidateId,
+          hostname: message.hostname,
+          receivedAt: Date.now(),
+          claimedByTabId: message.tabId,
+        });
+        await chrome.storage.session.set({ pendingHandoffs: queue });
+        sendResponse({ ok: true });
         break;
       }
       default:

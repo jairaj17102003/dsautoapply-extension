@@ -60,6 +60,25 @@
         color: #9ca3af;
         margin: -4px 0 10px;
       }
+      .divider {
+        border: none;
+        border-top: 1px solid #27272a;
+        margin: 10px 0;
+      }
+      select {
+        width: 100%;
+        padding: 7px;
+        border-radius: 8px;
+        border: 1px solid #3f3f46;
+        background: #18181b;
+        color: #fff;
+        font-size: 12px;
+        margin-bottom: 6px;
+      }
+      #manual-candidate-btn {
+        background: #374151;
+        color: #fff;
+      }
     </style>
   </head>
   <body>
@@ -70,6 +89,18 @@
     <div id="enable-hint" class="hint hidden">
       Not one of the built-in sites — click above to allow AskJobs Consultant Autofill on this specific page only.
     </div>
+
+    <div id="manual-candidate-section" class="hidden">
+      <hr class="divider" />
+      <div class="hint" style="margin-top: 0">
+        Opened this job outside the Consultant app's Apply flow? Pick a candidate to fill for:
+      </div>
+      <select id="candidate-select">
+        <option value="">Loading candidates…</option>
+      </select>
+      <button id="manual-candidate-btn" disabled>Fill for this candidate</button>
+    </div>
+
     <button id="options-btn">Settings</button>
     <script src="popup.js"></script>
   </body>

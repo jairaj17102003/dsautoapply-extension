@@ -43,31 +43,27 @@
       excludePatterns: ["phone code", "country code", "extension"],
     },
     // Structured address sub-fields — checked BEFORE the generic "location"
-    // fallback below. Confirmed real bug: the old bare "address"/"city"
-    // patterns lived under a single "location" key mapped to one flat
-    // profile.personalInfo.location string ("Hyderabad"), which got dumped
-    // into every address-shaped field on a multi-field form (Address Line
-    // 1, Address Line 2, City, State, Postal Code all getting the same
-    // value). Now sourced from the dedicated profile.address object
-    // instead, one real sub-field per real sub-field.
+    // fallback below. The old bare "address"/"city" patterns lived under a
+    // single "location" key mapped to one flat profile.address string
+    // ("Hyderabad"), which would have dumped the same value into every
+    // address-shaped field on a multi-field form (Address Line 1, Address
+    // Line 2, City, State, Postal Code all getting the same value). Now
+    // sourced from Candidate's own dedicated addressStreet/addressCity/
+    // addressState/addressPostalCode/addressCountry fields instead, one real
+    // sub-field per real sub-field — profile.address itself is untouched and
+    // still used for the generic "location" fallback below (see
+    // Candidate.model.js's comment on why these are additive, not merged).
     { key: "addressStreet", patterns: ["street address", "address line 1", "address line1", "mailing address", "home address"] },
     { key: "addressCity", patterns: ["city"] },
     { key: "addressState", patterns: ["state/province", "state / province", "province", "state"] },
     { key: "addressPostalCode", patterns: ["postal code", "zip code", "zipcode", "postcode"] },
-    // Confirmed real bug: with no dedicated "country" category, a combobox
-    // asking "Please choose the country in which you are located." fell
-    // through to the backend's generic classify-fields AI fallback, which
-    // — lacking any better option — mapped it to the "location" key and
-    // suggested the candidate's stored CITY ("Hyderabad") as if it were a
-    // country. profile.address.country already exists and was simply never
-    // wired up to anything.
     {
       key: "addressCountry",
       patterns: ["country"],
       // "Country Phone Code"/"Country Code" belong to the phone dial-code
       // selector, not an address; "Country of Citizenship" is a distinct,
       // more sensitive legal-status question. Neither should get the
-      // candidate's address.country value.
+      // candidate's addressCountry value.
       excludePatterns: ["phone code", "country code", "citizenship"],
     },
     { key: "location", patterns: ["location"] },
@@ -687,11 +683,15 @@
       case "location":
         return profile.address || null;
       case "addressStreet":
+        return profile.addressStreet || null;
       case "addressCity":
+        return profile.addressCity || null;
       case "addressState":
+        return profile.addressState || null;
       case "addressPostalCode":
+        return profile.addressPostalCode || null;
       case "addressCountry":
-        return null;
+        return profile.addressCountry || null;
       case "linkedin":
         return profile.linkedinUrl || null;
       case "portfolio":
@@ -843,6 +843,23 @@
     field.blur();
     field.dispatchEvent(new Event("blur", { bubbles: true, composed: true }));
     field.dispatchEvent(new Event("focusout", { bubbles: true, composed: true }));
+
+    // Confirmed real (RTX's Phenom-based application form): this bulk
+    // native-setter-plus-dispatched-events approach silently failed on
+    // plain text inputs there specifically — field.value read back empty
+    // right after, while every caller had no way to know and reported
+    // "filled" regardless (a real, separate bug this also fixes: the return
+    // value below lets callers report what actually happened instead of
+    // assuming success). Re-typing character-by-character is a genuine
+    // simulated keystroke sequence (real InputEvents with data/inputType),
+    // which some frameworks only recognize as legitimate user input — kept
+    // as a fallback, not the default, since it's slower and the bulk
+    // approach already works correctly on every other site this was tested
+    // against.
+    if (field.value !== value) {
+      typeCharacterByCharacter(field, value);
+    }
+    return field.value === value;
   }
 
   // Types a string into a field character-by-character, WITHOUT wrapping it
@@ -1488,10 +1505,15 @@
     // Preserving it and appending the digits keeps the field as
     // "+1XXXXXXXXXX" instead of losing the "+1" entirely.
     const finalValue = key === "phone" && isBareDialCodePrefix ? `${field.value.trim()}${value}` : value;
-    setNativeValue(field, finalValue);
+    const filled = setNativeValue(field, finalValue);
     attemptedSignatures.add(signature);
-    console.log("[AskJobs] generic field filled:", key, "=", finalValue, "->", fieldLabel);
-    recordResult("filled", fieldLabel, finalValue);
+    if (filled) {
+      console.log("[AskJobs] generic field filled:", key, "=", finalValue, "->", fieldLabel);
+      recordResult("filled", fieldLabel, finalValue);
+    } else {
+      console.log("[AskJobs] generic field fill didn't stick (even after retry):", key, "=", finalValue, "->", fieldLabel);
+      recordResult("skipped", fieldLabel, `Couldn't confirm "${finalValue}" was actually accepted — please check and fill directly`);
+    }
     if (key === "phone") await fillNearbyCountrySelector(field);
   }
 
@@ -4384,47 +4406,17 @@
     };
   }
 
-  async function init() {
-    console.log("[AskJobs] content script loaded on", location.hostname);
-
-    // Belt-and-suspenders — manifest content_scripts.matches already
-    // restricts injection to supported hosts, this just double-checks.
-    const supportCheck = await sendMessage({ type: "IS_SITE_SUPPORTED", hostname: location.hostname });
-    console.log("[AskJobs] site supported?", supportCheck);
-    if (!supportCheck?.supported) return;
-
-    // A single check here loses a real race almost every time: the new tab
-    // opens (and this script runs) IMMEDIATELY on "Apply with Autofill"
-    // click, synchronously, to dodge the popup blocker — but the actual
-    // handoff message isn't sent from the AskJobs tab until AFTER PDF
-    // generation, a Firebase Storage upload, and the backend save all
-    // finish, which can take several real seconds. Poll for a few seconds
-    // instead of checking once, so this tab is still around by the time
-    // the handoff actually lands. Cheap to keep polling — background.js's
-    // queue is tab-bound, so this can't steal a handoff meant for another
-    // tab even if a few polls happen before the right one shows up.
-    let handoffResult = null;
-    for (let attempt = 0; attempt < 10; attempt++) {
-      handoffResult = await sendMessage({ type: "GET_PENDING_HANDOFF", hostname: location.hostname });
-      if (handoffResult?.pendingHandoff) break;
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-    }
-    pendingHandoff = handoffResult?.pendingHandoff || null;
-    console.log("[AskJobs] pending handoff:", pendingHandoff);
-
-    // Unlike OG (any logged-in user can autofill their own profile), every
-    // session here is scoped to one specific candidate application — there's
-    // no "whoever's logged in" fallback, so without a handoff there's
-    // nothing to autofill from at all.
-    if (!pendingHandoff?.candidateId) {
-      console.warn('[AskJobs] no pending handoff for this tab — open this page via "Apply" from the Consultant app.');
-      return;
-    }
-
-    const profileResult = await sendMessage({
-      type: "API_FETCH",
-      path: `/api/v1/candidates/${pendingHandoff.candidateId}`,
-    });
+  // Fetches candidate profile + EEO data for candidateId, resolves the
+  // resume (job-specific via pendingHandoff.resumeVersionId if set, else the
+  // candidate's master resume), then injects the sidebar and runs the first
+  // fill pass. Shared by both ways a candidateId can reach this tab: a real
+  // "Apply" handoff from the Consultant app (init(), below), or a candidate
+  // picked manually in the popup when no handoff exists at all (e.g. a job
+  // opened by clicking through LinkedIn/the company's own listing directly,
+  // where there was never a candidate identity attached to the click).
+  let mutationObserverStarted = false;
+  async function loadCandidateContextAndFill(candidateId) {
+    const profileResult = await sendMessage({ type: "API_FETCH", path: `/api/v1/candidates/${candidateId}` });
     console.log("[AskJobs] candidate profile fetch result:", profileResult);
     if (!profileResult?.ok) {
       console.warn("[AskJobs] not connected or candidate fetch failed — stopping. Check the extension's Options page for a saved token.");
@@ -4446,10 +4438,7 @@
     // veteran status are deliberately NEVER auto-filled regardless of
     // whether real data exists here — isSensitiveSelfIdQuestion blocks
     // those categories outright by design, not because the data's missing.
-    const eeoResult = await sendMessage({
-      type: "API_FETCH",
-      path: `/api/v1/candidates/${pendingHandoff.candidateId}/eeo`,
-    });
+    const eeoResult = await sendMessage({ type: "API_FETCH", path: `/api/v1/candidates/${candidateId}/eeo` });
     console.log("[AskJobs] candidate EEO fetch result:", eeoResult);
     const eeo = eeoResult?.ok ? eeoResult.data || {} : {};
     eeoProfile = eeo;
@@ -4469,7 +4458,9 @@
 
     // Skills are needed broadly and early (the Skills field can appear on
     // the very first page), so fetched eagerly here — this also resolves
-    // resumeFileUrl/resumeCoverLetter as a side effect, but
+    // resumeFileUrl/resumeCoverLetter as a side effect (falling back to the
+    // candidate's master resume when there's no job-specific
+    // resumeVersionId, e.g. the manual-candidate-picker path below), but
     // attachResumeFile() still re-fetches fresh whenever an actual upload
     // field is found, in case this snapshot goes stale many pages later.
     await getResumeFileUrl();
@@ -4477,9 +4468,9 @@
     // Confirmed real (BambooHR): the actual application form is rendered
     // inside an <iframe>, invisible to a content script that only runs in
     // the top-level frame — manifest.json sets all_frames: true so this
-    // init() runs (and can scan/fill) inside a matching iframe too, not
-    // just the top page. Several approaches to the VISIBLE sidebar UI were
-    // tried and discarded here (only the top frame shows one — but then an
+    // runs (and can scan/fill) inside a matching iframe too, not just the
+    // top page. Several approaches to the VISIBLE sidebar UI were tried and
+    // discarded here (only the top frame shows one — but then an
     // iframe-hosted form's suggestions had nowhere to render at all; an
     // election between frames reporting field counts — but that chased one
     // race condition and one iframe-positioning edge case after another,
@@ -4506,7 +4497,11 @@
     // page functionality. Instead: only fill on page load and on an
     // explicit "Fill this application" click (sidebar or popup) — this
     // observer just detects new fields and prompts you to click again,
-    // it never touches the DOM itself.
+    // it never touches the DOM itself. Guarded so a second call into this
+    // function (e.g. the manual candidate picker used after the automatic
+    // handoff path already ran) doesn't attach a duplicate observer.
+    if (mutationObserverStarted) return;
+    mutationObserverStarted = true;
     let promptTimer = null;
     const observer = new MutationObserver((mutations) => {
       // Ignore mutations caused by our own fill pass (e.g. clicking "Add
@@ -4530,11 +4525,68 @@
     observer.observe(document.body, { childList: true, subtree: true });
   }
 
-  // Manual trigger from the popup ("Fill this application" button there).
+  async function init() {
+    console.log("[AskJobs] content script loaded on", location.hostname);
+
+    // Belt-and-suspenders for the common case (manifest content_scripts.matches
+    // already restricts automatic injection to the bundled list) — but also
+    // the real gate for a manually "Enable on this site" injection, which by
+    // definition targets a hostname NOT in that bundled list. origin is
+    // passed so background.js can additionally accept a runtime-granted
+    // permission for this exact site, not just the static list.
+    const supportCheck = await sendMessage({ type: "IS_SITE_SUPPORTED", hostname: location.hostname, origin: location.origin });
+    console.log("[AskJobs] site supported?", supportCheck);
+    if (!supportCheck?.supported) return;
+
+    // A single check here loses a real race almost every time: the new tab
+    // opens (and this script runs) IMMEDIATELY on "Apply with Autofill"
+    // click, synchronously, to dodge the popup blocker — but the actual
+    // handoff message isn't sent from the AskJobs tab until AFTER PDF
+    // generation, a Firebase Storage upload, and the backend save all
+    // finish, which can take several real seconds. Poll for a few seconds
+    // instead of checking once, so this tab is still around by the time
+    // the handoff actually lands. Cheap to keep polling — background.js's
+    // queue is tab-bound, so this can't steal a handoff meant for another
+    // tab even if a few polls happen before the right one shows up.
+    let handoffResult = null;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      handoffResult = await sendMessage({ type: "GET_PENDING_HANDOFF", hostname: location.hostname });
+      if (handoffResult?.pendingHandoff) break;
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    pendingHandoff = handoffResult?.pendingHandoff || null;
+    console.log("[AskJobs] pending handoff:", pendingHandoff);
+
+    // Unlike OG (any logged-in user can autofill their own profile), every
+    // session here is scoped to one specific candidate application — there's
+    // no "whoever's logged in" fallback, so without a handoff there's
+    // nothing to autofill from at all. The popup's manual candidate picker
+    // (see the FILL_FOR_CANDIDATE handler below) covers exactly this case —
+    // a job opened without ever going through the Consultant app's Apply
+    // button, so no handoff was ever queued for this tab.
+    if (!pendingHandoff?.candidateId) {
+      console.warn(
+        '[AskJobs] no pending handoff for this tab — open this page via "Apply" from the Consultant app, or pick a candidate from the extension popup.',
+      );
+      return;
+    }
+
+    await loadCandidateContextAndFill(pendingHandoff.candidateId);
+  }
+
+  // Manual triggers from the popup: TRIGGER_FILL re-runs a scan against
+  // whatever candidate context is already loaded (or none, if init() never
+  // got a handoff); FILL_FOR_CANDIDATE supplies one directly — the popup's
+  // fallback for a job opened without ever going through the Consultant
+  // app's Apply button, so init() had no handoff to find.
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type === "TRIGGER_FILL") {
       scanAndFill(document);
       sendResponse({ ok: true });
+    } else if (message?.type === "FILL_FOR_CANDIDATE" && message.candidateId) {
+      pendingHandoff = { candidateId: message.candidateId };
+      loadCandidateContextAndFill(message.candidateId).then(() => sendResponse({ ok: true }));
+      return true; // keep the message channel open for the async response
     }
   });
 

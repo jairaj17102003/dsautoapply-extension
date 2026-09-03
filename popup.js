@@ -19,12 +19,29 @@ function originPatternFor(url) {
   }
 }
 
+// Re-injects content-script.js (safe no-op if it's already alive — see its
+// own window.__askjobsAutofillInjected guard) then sends it a message.
+// Shared by both "Fill this application" and the manual candidate picker —
+// either one needs the script actually present in the tab, which a prior
+// page reload or step navigation may have wiped out.
+async function reinjectThenMessage(tabId, message) {
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["content-script.js"] });
+  } catch (error) {
+    console.warn("[AskJobs] re-injection failed (page may not allow it):", error);
+  }
+  chrome.tabs.sendMessage(tabId, message);
+}
+
 document.addEventListener("DOMContentLoaded", async () => {
   const statusEl = document.getElementById("status");
   const fillBtn = document.getElementById("fill-btn");
   const enableBtn = document.getElementById("enable-site-btn");
   const enableHint = document.getElementById("enable-hint");
   const optionsBtn = document.getElementById("options-btn");
+  const manualSection = document.getElementById("manual-candidate-section");
+  const candidateSelect = document.getElementById("candidate-select");
+  const manualCandidateBtn = document.getElementById("manual-candidate-btn");
 
   const { token } = await chrome.runtime.sendMessage({ type: "GET_TOKEN" });
   const connected = !!token;
@@ -33,15 +50,84 @@ document.addEventListener("DOMContentLoaded", async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   const pattern = tab?.url ? originPatternFor(tab.url) : null;
 
+  // Covers a job opened without ever going through the Consultant app's
+  // Apply button (clicked through LinkedIn/Indeed/the company's own listing
+  // directly) — there's no handoff queued for a tab like that at all, so
+  // the content script has no candidate to build context from on its own.
+  // Since the extension token already identifies a specific consultant,
+  // this lets them pick which of their own candidates to fill for instead.
+  // Falls back to the candidate's master resume (no job-specific
+  // ResumeVersion exists for this path) via the same logic
+  // getResumeFileUrl() already has for that case.
+  async function setUpManualCandidatePicker() {
+    if (!connected) return;
+    manualSection.classList.remove("hidden");
+
+    // 100 is the backend's own hard cap (getPageParams) — a consultant with
+    // more candidates than that would need search/pagination here too, not
+    // attempted yet since 100 comfortably covers real usage so far.
+    const result = await chrome.runtime.sendMessage({ type: "API_FETCH", path: "/api/v1/candidates?limit=100" });
+    if (!result?.ok) {
+      candidateSelect.innerHTML = '<option value="">Couldn\'t load candidates</option>';
+      return;
+    }
+    const candidates = result.data?.items || [];
+    if (candidates.length === 0) {
+      candidateSelect.innerHTML = '<option value="">No candidates found</option>';
+      return;
+    }
+    candidateSelect.innerHTML =
+      '<option value="">Select a candidate…</option>' +
+      candidates
+        .map((c) => `<option value="${c._id}">${c.firstName} ${c.lastName} (${c.email})</option>`)
+        .join("");
+  }
+
+  candidateSelect.addEventListener("change", () => {
+    manualCandidateBtn.disabled = !candidateSelect.value || !tab?.id;
+  });
+
+  manualCandidateBtn.addEventListener(
+    "click",
+    async () => {
+      const candidateId = candidateSelect.value;
+      // Persisted (not just messaged to the current script instance) so a
+      // reload of this same tab — routine on a multi-step application form —
+      // finds this same candidate automatically next time, via the normal
+      // handoff path init() already checks, instead of requiring the picker
+      // to be redone from scratch after every reload.
+      const hostname = tab?.url ? new URL(tab.url).hostname : null;
+      if (hostname) {
+        await chrome.runtime.sendMessage({
+          type: "SET_MANUAL_CANDIDATE_HANDOFF",
+          candidateId,
+          hostname,
+          tabId: tab.id,
+        });
+      }
+      await reinjectThenMessage(tab.id, { type: "FILL_FOR_CANDIDATE", candidateId });
+      window.close();
+    },
+    { once: true },
+  );
+
   function wireFillButton() {
     fillBtn.classList.remove("hidden");
     enableBtn.classList.add("hidden");
     enableHint.classList.add("hidden");
     fillBtn.disabled = !tab?.id || !connected;
+    setUpManualCandidatePicker();
     fillBtn.addEventListener(
       "click",
-      () => {
-        chrome.tabs.sendMessage(tab.id, { type: "TRIGGER_FILL" });
+      async () => {
+        // Confirmed real gap: on a site that was only ever manually enabled
+        // (not in the built-in content_scripts list), a page reload or the
+        // ATS navigating to a new step wipes out the previously-injected
+        // script entirely — sendMessage would then go nowhere silently, with
+        // no error shown, making "Fill this application" look like it does
+        // nothing. reinjectThenMessage re-injects first (safe no-op if
+        // already alive) so the message always has something to reach.
+        await reinjectThenMessage(tab.id, { type: "TRIGGER_FILL" });
         window.close();
       },
       { once: true }

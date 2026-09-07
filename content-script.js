@@ -105,8 +105,6 @@
       patterns: [
         "worked here before",
         "previously employed",
-        "prior employee",
-        "former employee",
         "worked for this company",
         "worked at this company",
         // Confirmed real (Barclays' Workday form): "Have you previously
@@ -118,6 +116,16 @@
         "worked at this organization",
         "previously worked for",
         "previously worked at",
+        // Present tense, no "-ed" — confirmed real (RTX/Phenom): "Did you
+        // previously WORK FOR RTX (including its predecessors...) in any
+        // capacity?" doesn't contain "previously worked for" at all, so it
+        // fell through to the generic AI-classification queue instead of
+        // using the deterministic profile.experience company-name check
+        // radioAnswerForKey('workedHereBefore') already does — a strictly
+        // more reliable answer than hoping an LLM reasons it out from resume
+        // prose.
+        "previously work for",
+        "previously work at",
         // "ever employed by" confirmed real via Genpact's Workday form
         // ("Were you ever employed by Genpact?") — specific enough (3
         // words, "ever" implies self-referential history) to keep
@@ -129,6 +137,14 @@
         // being applied to. Those bare phrases are too generic to assume
         // they're about "this employer" specifically.
         "ever employed by",
+        // "prior employee"/"former employee" (bare, unqualified) were
+        // REMOVED for the identical reason — confirmed real (RTX): "Are you
+        // a CURRENT or FORMER EMPLOYEE of RTX's Independent Auditor,
+        // PriceWaterhouseCoopers (PwC)?" matched bare "former employee" even
+        // though it's a third-party conflict-of-interest question, nothing
+        // to do with the employer being applied to. Every remaining pattern
+        // in this list names "this company"/"this organization"/the literal
+        // employer, or "ever" — a bare "prior/former employee" never does.
       ],
     },
   ];
@@ -444,6 +460,11 @@
   // self-ID categories isSensitiveSelfIdQuestion otherwise blocks outright.
   let eeoProfile = null;
   let resumeFileUrl = null;
+  // The actual ResumeVersion/MasterResume fileName (e.g.
+  // "Divya-I-Zelis-v1.docx") — used by attachResumeFile() so the file
+  // handed to the ATS's upload field carries its real name instead of a
+  // generic placeholder.
+  let resumeFileName = null;
   // True when resumeFileUrl came from the fallback below rather than the
   // job-specific customized resume — lets the sidebar say so, instead of
   // silently attaching a generic resume while claiming success as if it
@@ -818,6 +839,71 @@
     }
   }
 
+  // react-datepicker (confirmed real: RTX's Phenom-based Experience/
+  // Education "From"/"To" fields) renders a plain type="text" <input>
+  // wrapped in .react-datepicker-wrapper — nothing in its own markup marks
+  // it as date-shaped (no placeholder, no type="date"), so without this
+  // check it fell through to the generic plain-text branch in
+  // fillStructuredField, which typed the raw unformatted ISO value
+  // (e.g. "2020-01-01T00:00:00.000Z") straight in.
+  function isReactDatePickerField(field) {
+    return Boolean(field.closest(".react-datepicker-wrapper"));
+  }
+
+  // Confirmed real via actual open-calendar HTML: this specific
+  // react-datepicker instance is configured as a MONTH picker (no day
+  // grid at all — .react-datepicker__monthPicker), and doesn't parse typed
+  // text into a date at all. Focusing it just opens the calendar showing
+  // today; nothing typed afterward changes what's selected, so
+  // formatDateForField + typeCharacterByCharacter (which works for masked
+  // segmented inputs elsewhere) does nothing here. It has to be driven the
+  // way a real user would: the year <select class="range-select"> (its
+  // prev/next buttons are mislabeled "Previous/Next Month" but actually
+  // step the YEAR in this mode) to reach the target year, then a real
+  // click on the matching .react-datepicker__month-N cell (N=0 for
+  // January .. 11 for December). Returns false — instead of guessing at a
+  // day-grid calendar's different DOM shape with no evidence it even
+  // exists here — so the caller can fall back to the typing path, which
+  // still might be right for some other site's differently-configured
+  // react-datepicker.
+  async function fillMonthPickerDate(field, date) {
+    field.focus();
+    field.dispatchEvent(new Event("focus", { bubbles: true, composed: true }));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    const monthPicker = document.querySelector(".react-datepicker__monthPicker");
+    if (!monthPicker) return false;
+
+    const container = monthPicker.closest(".react-datepicker__month-container") || monthPicker.parentElement;
+    const yearSelect = container?.querySelector("select.range-select");
+    const targetYear = String(date.getFullYear());
+    if (yearSelect && yearSelect.value !== targetYear) {
+      const hasYear = Array.from(yearSelect.options).some((o) => o.value === targetYear);
+      if (!hasYear) return false;
+      // NOT setNativeValue — it blurs the field at the end, which closes
+      // this whole popup before the month cell below can be clicked
+      // (confirmed real: the year briefly changed then the calendar reset
+      // to today, same as if nothing had happened at all). Choosing a
+      // year from this dropdown shouldn't blur/dismiss the popup any more
+      // than a real user opening the native <select> and picking one would.
+      const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(yearSelect), "value");
+      descriptor.set.call(yearSelect, targetYear);
+      yearSelect.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+
+    const refreshedPicker = document.querySelector(".react-datepicker__monthPicker");
+    const monthCell = refreshedPicker?.querySelector(`.react-datepicker__month-${date.getMonth()}`);
+    if (!monthCell || monthCell.classList.contains("react-datepicker__month-text--disabled")) return false;
+
+    const opts = { bubbles: true, cancelable: true, view: window };
+    monthCell.dispatchEvent(new MouseEvent("mousedown", opts));
+    monthCell.dispatchEvent(new MouseEvent("mouseup", opts));
+    monthCell.click();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    return Boolean(field.value);
+  }
+
   // Sets the value via the native property setter and dispatches real
   // focus/input/change/keydown/blur events — mimics an actual user
   // interaction (click in, type, click away) rather than a silent value
@@ -932,11 +1018,39 @@
   async function getMasterResumeFallback(candidateId) {
     const result = await sendMessage({ type: "API_FETCH", path: `/api/v1/candidates/${candidateId}/master-resume` });
     console.log("[AskJobs] master resume fallback fetch result:", result);
-    if (!result?.ok) return { fileUrl: null, skills: [] };
+    if (!result?.ok) return { fileUrl: null, fileName: null, skills: [] };
     return {
       fileUrl: result.data?.downloadUrl || null,
+      fileName: result.data?.resume?.fileName || null,
       skills: flattenSkills(result.data?.resume?.parsedData?.skills),
     };
+  }
+
+  // getResumeFileUrl() caches on resumeFileUrl and skips straight past
+  // resumeSkills once that's set (see its own guard below) — fine as long
+  // as both were populated together on the one call that mattered, but
+  // confirmed real (RTX/Phenom multi-step form): the Skills field can be
+  // reached on a later SPA step than whichever step's fill pass first
+  // resolved resumeFileUrl, and by then this cache guard means resumeSkills
+  // never gets a second chance even though the resume-version data was
+  // always there. Bypasses the cache and re-fetches skills specifically,
+  // as a last resort right before fillSkillsField would otherwise give up.
+  async function refetchResumeSkills() {
+    if (pendingHandoff?.resumeVersionId) {
+      const resumeResult = await sendMessage({
+        type: "API_FETCH",
+        path: `/api/v1/resume-versions/${pendingHandoff.resumeVersionId}`,
+      });
+      console.log("[AskJobs] skills late-refetch (resume version) result:", resumeResult);
+      const skills = resumeResult?.ok ? flattenSkills(resumeResult.data?.version?.structuredContent?.skills) : [];
+      if (skills.length) return skills;
+    }
+    if (pendingHandoff?.candidateId) {
+      const fallback = await getMasterResumeFallback(pendingHandoff.candidateId);
+      console.log("[AskJobs] skills late-refetch (master resume fallback) skills:", fallback.skills);
+      if (fallback.skills.length) return fallback.skills;
+    }
+    return [];
   }
 
   async function getResumeFileUrl() {
@@ -950,6 +1064,7 @@
       console.log("[AskJobs] on-demand resume version fetch result:", resumeResult);
       if (resumeResult?.ok) {
         resumeFileUrl = resumeResult.data?.downloadUrl || null;
+        resumeFileName = resumeResult.data?.version?.fileName || null;
         resumeSkills = flattenSkills(resumeResult.data?.version?.structuredContent?.skills);
         resumeCoverLetter = resumeResult.data?.version?.coverLetter || null;
       }
@@ -959,6 +1074,7 @@
       const fallback = await getMasterResumeFallback(pendingHandoff.candidateId);
       resumeFileUrl = fallback.fileUrl;
       if (resumeFileUrl) {
+        resumeFileName = fallback.fileName;
         resumeIsFallbackPrimary = true;
         if (!resumeSkills.length) resumeSkills = fallback.skills;
         console.log("[AskJobs] no job-specific resume version available — using master resume as fallback:", resumeFileUrl);
@@ -989,7 +1105,18 @@
       }
 
       const blob = await (await fetch(fetchResult.dataUrl)).blob();
-      const file = new File([blob], "resume.pdf", { type: "application/pdf" });
+      // Confirmed real: this used to hardcode "resume.pdf" / "application/
+      // pdf" regardless of what the actual file was — every resume here is
+      // a .docx (see optimization.worker.js's fileName pattern:
+      // "FirstName-LastName-Company-vN.docx"), so the ATS was receiving a
+      // real docx's bytes mislabeled as a PDF. blob.type is the actual
+      // Content-Type the file was served with (preserved end-to-end through
+      // the background fetch's data: URL), and resumeFileName is the real
+      // "Divya-I-Zelis-v1.docx"-style name — both now used as-is instead of
+      // a generic placeholder.
+      const file = new File([blob], resumeFileName || "resume.docx", {
+        type: blob.type || "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      });
       const dataTransfer = new DataTransfer();
       dataTransfer.items.add(file);
       input.files = dataTransfer.files;
@@ -1171,6 +1298,9 @@
   // out of scope — if neither shape is detected, this reports failure and
   // the caller flags it as "need attention" rather than claiming success.
   async function fillSkillsField(field) {
+    if (!resumeSkills || resumeSkills.length === 0) {
+      resumeSkills = await refetchResumeSkills();
+    }
     if (!resumeSkills || resumeSkills.length === 0) {
       console.log("[AskJobs] skills: nothing to fill — resumeSkills is empty (no resume handoff/data for this session)");
       return false;
@@ -1902,12 +2032,18 @@
     { key: "institution", patterns: ["school", "university", "institution", "college"] },
     { key: "degree", patterns: ["degree"] },
     { key: "field", patterns: ["field of study", "major", "specialization", "discipline"] },
+    // Ported from OG with a stale assumption baked into its comment ("we
+    // don't store when someone STARTED at an institution") — not true for
+    // our Candidate model, whose education entries have startDate/endDate
+    // same as experience (confirmed real: RTX/Phenom's Education section
+    // has its own plain "From"/"To" fields, reported "not recognized" with
+    // no matcher for either). Same patterns as EXPERIENCE_FIELD_MATCHERS.
+    { key: "startDate", patterns: ["from", "start date", "started"] },
+    { key: "endDate", patterns: ["to", "end date", "ended"] },
     // "lastyearattended" targets Workday's own field id directly (confirmed
     // via real HTML: id="...-lastYearAttended-dateSectionYear-input" — its
     // own accessible label is just the generic "Year", shared with the
     // "firstYearAttended" field, so label text alone can't tell them apart).
-    // "firstYearAttended" deliberately has no matcher — we don't store when
-    // someone STARTED at an institution, only when they graduated.
     { key: "graduationYear", patterns: ["graduation year", "year of passing", "completion year", "year of graduation", "completion date", "graduation date", "lastyearattended"] },
     { key: "gpa", patterns: ["gpa", "cgpa", "overall result", "percentage", "grade"] },
   ];
@@ -2144,7 +2280,23 @@
   async function fillStructuredField(field, value, fieldLabel, key) {
     const stringValue = String(value);
     if (field.tagName === "SELECT") {
-      const option = Array.from(field.options).find((o) => normalize(o.textContent).includes(normalize(stringValue)));
+      // Confirmed real (RTX/Phenom's Degree dropdown): a plain substring
+      // check only ever matches when the option's own text is short enough
+      // to be contained in the profile's value ("Please Select" vs "yes"-
+      // style long-option/short-answer fields) — it fails the opposite,
+      // very common shape where the option NAMES A CATEGORY ("Bachelors")
+      // and the profile has the specific phrase ("Bachelor of Technology").
+      // degreeSynonymsMatch/comboboxTextsMatch already solve exactly this
+      // for custom-combobox degree fields elsewhere in this file; a plain
+      // native <select> deserves the same fallback instead of only ever
+      // working when the value happens to already be the option's exact
+      // wording.
+      const targetNormalized = normalize(stringValue);
+      const options = Array.from(field.options);
+      const option =
+        options.find((o) => normalize(o.textContent).includes(targetNormalized)) ||
+        options.find((o) => degreeSynonymsMatch(o.textContent, stringValue)) ||
+        options.find((o) => comboboxTextsMatch(o.textContent, targetNormalized));
       if (!option) return false;
       field.value = option.value;
       field.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
@@ -2159,6 +2311,16 @@
       // own segment-by-segment interaction and silently stayed empty when
       // typed into this way instead. setNativeValue (inside fillDateField)
       // sets it directly, correctly, like any other native form control.
+      fillDateField(field, finalValue);
+      return true;
+    }
+    if (isReactDatePickerField(field)) {
+      const parsedDate = new Date(stringValue);
+      if (!Number.isNaN(parsedDate.getTime()) && (await fillMonthPickerDate(field, parsedDate))) {
+        return true;
+      }
+      const finalValue = formatDateForField(field, stringValue);
+      if (!finalValue) return false;
       fillDateField(field, finalValue);
       return true;
     }
@@ -2188,8 +2350,13 @@
     if (isComboboxField(field)) {
       return await fillCustomCombobox(field, stringValue, fieldLabel);
     }
-    setNativeValue(field, stringValue);
-    return true;
+    // Confirmed real bug: this discarded setNativeValue's return value and
+    // always reported success, so a framework that silently rejects the
+    // bulk native setter (confirmed: RTX's Phenom-based From/To fields)
+    // never got the self-heal typeCharacterByCharacter retry that's already
+    // built into setNativeValue for exactly this case — the sidebar showed
+    // "filled" with the right value while the visible field stayed empty.
+    return setNativeValue(field, stringValue);
   }
 
   // Confirmed real (Greenhouse's phone/country combobox): "No country
@@ -2832,11 +2999,42 @@
   // the whole section container can't otherwise tell which entry a field
   // belongs to. Falls back to the whole container if the site doesn't nest
   // entries this way.
+  function getRepeatedEntryContainers(container) {
+    let entryContainers = Array.from(container.querySelectorAll(':scope > [role="group"]'));
+    if (entryContainers.length === 0) {
+      // Breezy-style repeated entries: <ul><li ng-repeat="...">...</li></ul>,
+      // no [role="group"] wrapper at all. Falling through to the shared
+      // container for every entry index re-scanned ALL entries built so
+      // far on every subsequent entry's fill pass — confirmed real:
+      // Education's scanned field count grew from 11 to 16 between entry
+      // 1 and entry 2, because entry 2's pass re-scanned entry 1's still-
+      // unfilled fields against entry 2's data too. A <li> is this site's
+      // real per-entry boundary, same role [role="group"] plays elsewhere.
+      entryContainers = Array.from(container.querySelectorAll("li"));
+    }
+    return entryContainers;
+  }
+
   async function fillRepeatedEntries(container, matchers, entries, sectionLabel) {
     if (!container || !entries?.length) return;
 
     for (let i = 0; i < entries.length; i++) {
-      if (i > 0) {
+      let entryContainers = getRepeatedEntryContainers(container);
+
+      // Only click "Add" when there genuinely aren't enough slots yet for
+      // this index — confirmed real, serious bug: this used to click "Add"
+      // unconditionally on every single call, with no check for how many
+      // entry slots already existed. A form that reveals new fields between
+      // fill passes (RTX/Phenom's "New fields detected — click Fill again")
+      // got re-run more than once, and each run clicked "Add" again on top
+      // of what a PREVIOUS run had already built — 3 real experiences
+      // became 5 duplicate slots, 2 educations became 3. Once the slot
+      // count drifted from the real entry count, entries[i] no longer lined
+      // up with the right entryContainers[i], so one entry's data (e.g.
+      // Field of Study) landed in a completely different entry's slot —
+      // and since an already-filled field is never revisited, there was no
+      // way for a later run to self-correct it.
+      if (i >= entryContainers.length) {
         // Same broader selector as revealFirstEntryIfNeeded — an "Add"
         // control is just as often an <a>/[role='button'] as a real
         // <button> (confirmed real on Breezy: "Add Education"/"Add
@@ -2851,20 +3049,9 @@
         }
         addButton.click();
         await new Promise((resolve) => setTimeout(resolve, 400));
+        entryContainers = getRepeatedEntryContainers(container);
       }
 
-      let entryContainers = Array.from(container.querySelectorAll(':scope > [role="group"]'));
-      if (entryContainers.length === 0) {
-        // Breezy-style repeated entries: <ul><li ng-repeat="...">...</li></ul>,
-        // no [role="group"] wrapper at all. Falling through to the shared
-        // container for every entry index re-scanned ALL entries built so
-        // far on every subsequent entry's fill pass — confirmed real:
-        // Education's scanned field count grew from 11 to 16 between entry
-        // 1 and entry 2, because entry 2's pass re-scanned entry 1's still-
-        // unfilled fields against entry 2's data too. A <li> is this site's
-        // real per-entry boundary, same role [role="group"] plays elsewhere.
-        entryContainers = Array.from(container.querySelectorAll("li"));
-      }
       const entryContainer = entryContainers[i] || container;
       await fillStructuredSection(entryContainer, matchers, entries[i]);
     }
@@ -3838,9 +4025,26 @@
   // discover only as a fallback once Insert is clicked.
   async function collectUnansweredQuestions(root) {
     const items = [];
-    const fields = deepQueryAll(root, "textarea, input[type='text']");
+    // Confirmed real, serious bug: this selector never included "select" at
+    // all, so a plain native <select> screening question (e.g. RTX/Phenom's
+    // "Are you a citizen of the United States?" — Yes/No, no matching
+    // RADIO_MATCHERS category so fillScreeningSelect correctly declines it)
+    // was invisible to this scan entirely. It's not a textarea/text input,
+    // and it's not caught by the combobox loop below either (a plain
+    // <select> has no role="combobox"/aria-haspopup) — "AI-fill remaining
+    // questions" reported "No open-ended questions found" while real,
+    // genuinely unanswered required questions sat right there on the page.
+    const fields = deepQueryAll(root, "textarea, input[type='text'], select");
     for (const field of fields) {
-      if (field.disabled || field.value) continue;
+      if (field.disabled) continue;
+      // Same placeholder-option quirk handled elsewhere (setNativeValue's
+      // caller, fillField): a <select> whose placeholder <option> has no
+      // explicit value="" defaults .value to the option's own text, so
+      // `field.value` alone can't tell "unanswered" from "answered" here.
+      const isUnansweredSelect =
+        field.tagName === "SELECT" &&
+        PLACEHOLDER_OPTION_TEXT.test(normalize(field.selectedOptions?.[0]?.textContent || ""));
+      if (field.value && !isUnansweredSelect) continue;
       // Already sitting in the automatic classification queue from this same
       // fill pass (maybeQueueFieldForClassification) — that queue chains
       // straight into runQualificationAnswerPass for anything it can't
@@ -3873,6 +4077,24 @@
         field.getAttribute("placeholder") ||
         ""
       ).trim();
+      // A select fillScreeningSelect already recognizes — gender/disability/
+      // sensitive-self-id, or a RADIO_MATCHERS category like "former
+      // employee of ..." — already got its own suggestion or "Recognized,
+      // but no stored preference set yet" message during the main scan,
+      // even when there was no data to fill. Re-listing it here as an
+      // "AI can answer this" candidate would just be a duplicate suggestion
+      // for the exact same question.
+      if (field.tagName === "SELECT") {
+        const normalizedLabel = normalize(label);
+        if (
+          isGenderIdentityQuestion(normalizedLabel) ||
+          isDisabilityQuestion(normalizedLabel) ||
+          isSensitiveSelfIdQuestion(normalizedLabel) ||
+          matchRadioQuestion(normalizedLabel)
+        ) {
+          continue;
+        }
+      }
       // Too short to plausibly be a real question — avoids scooping up
       // stray unlabeled/cosmetic fields as if they were screening questions.
       // Too long is rejected too: a real question is never this long, so
@@ -3884,7 +4106,20 @@
       // short question would ever produce.
       if (label.length < 10 || label.length > MAX_QUESTION_LABEL_LENGTH) continue;
 
-      items.push({ kind: "field", field, questionText: label, fieldType: field.type || "text" });
+      // options is what lets the AI actually pick a valid answer for a
+      // select (runQualificationAnswerPass sends it straight through to the
+      // backend) — renderQualificationAnswers already knew how to insert
+      // into a SELECT correctly, it just never received one from here.
+      const options = field.tagName === "SELECT"
+        ? Array.from(field.options).map((o) => o.textContent.trim()).filter((t) => t && !PLACEHOLDER_OPTION_TEXT.test(normalize(t)))
+        : undefined;
+      items.push({
+        kind: "field",
+        field,
+        questionText: label,
+        fieldType: field.tagName === "SELECT" ? "select" : field.type || "text",
+        options,
+      });
     }
 
     const comboButtons = deepQueryAll(root, 'button[aria-haspopup="listbox"], [role="combobox"]');
@@ -4395,6 +4630,13 @@
         field: e.fieldOfStudy,
         graduationYear: e.endDate ? new Date(e.endDate).getFullYear() : undefined,
         gpa: e.gpa,
+        // Carried through for EDUCATION_FIELD_MATCHERS' startDate/endDate
+        // keys (a plain "From"/"To" pair, distinct from graduationYear
+        // above) — this reshaped object literal never passed these through
+        // at all before, so they'd have always come back "no data on file"
+        // regardless of the matcher recognizing the field correctly.
+        startDate: e.startDate,
+        endDate: e.endDate,
       })),
       certifications: (candidate.certifications || []).map((c) => ({
         name: c.name,
@@ -4584,7 +4826,12 @@
       scanAndFill(document);
       sendResponse({ ok: true });
     } else if (message?.type === "FILL_FOR_CANDIDATE" && message.candidateId) {
-      pendingHandoff = { candidateId: message.candidateId };
+      // jobId/resumeVersionId are optional — when the popup's picker also
+      // resolved a specific in-progress Application, this is what lets
+      // getResumeFileUrl() use that job's actual optimized resume instead
+      // of always falling back to the master resume (see background.js's
+      // SET_MANUAL_CANDIDATE_HANDOFF for why this matters).
+      pendingHandoff = { candidateId: message.candidateId, jobId: message.jobId, resumeVersionId: message.resumeVersionId };
       loadCandidateContextAndFill(message.candidateId).then(() => sendResponse({ ok: true }));
       return true; // keep the message channel open for the async response
     }

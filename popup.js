@@ -41,7 +41,11 @@ document.addEventListener("DOMContentLoaded", async () => {
   const optionsBtn = document.getElementById("options-btn");
   const manualSection = document.getElementById("manual-candidate-section");
   const candidateSelect = document.getElementById("candidate-select");
+  const resumeVersionSelect = document.getElementById("resume-version-select");
   const manualCandidateBtn = document.getElementById("manual-candidate-btn");
+  // Keyed by ResumeVersion._id — looked up on submit for its jobId, since
+  // <option value> can only carry one string.
+  let resumeVersionsById = {};
 
   const { token } = await chrome.runtime.sendMessage({ type: "GET_TOKEN" });
   const connected = !!token;
@@ -83,14 +87,60 @@ document.addEventListener("DOMContentLoaded", async () => {
         .join("");
   }
 
+  // Confirmed real gap: the picker used to only ever send candidateId, with
+  // no way to say WHICH resume this fill should use — getResumeFileUrl()
+  // then had no resumeVersionId to look up and silently fell back to the
+  // candidate's master resume, even when a real job-optimized version
+  // already existed (just never reachable from here). Common case this
+  // fixes: a job.url that's actually a LinkedIn listing — Apply opens
+  // LinkedIn first, and only LinkedIn's OWN "Apply" button leads to the
+  // real ATS page, so the automatic handoff's tab/hostname tracking never
+  // catches up and the consultant reaches for this picker instead.
+  //
+  // Listed by resume VERSION, not by Application — a candidate can be
+  // re-optimized against the same job more than once (v1, v2, ...) without
+  // ever re-dispatching, and each version.fileName already encodes exactly
+  // what a consultant would want to search for: "FirstName-LastName-
+  // Company-vN.docx" (see optimization.worker.js). Typing while this
+  // <select> is focused jumps to the first matching option text, so this
+  // doubles as the "type the resume name" search the fileName convention
+  // was designed to support.
+  async function loadResumeVersionsFor(candidateId) {
+    resumeVersionSelect.classList.remove("hidden");
+    resumeVersionSelect.innerHTML = '<option value="">Loading resumes…</option>';
+    const result = await chrome.runtime.sendMessage({
+      type: "API_FETCH",
+      path: `/api/v1/candidates/${candidateId}/resume-versions`,
+    });
+    if (!result?.ok) {
+      resumeVersionSelect.innerHTML = '<option value="">Use master resume (couldn\'t load resume versions)</option>';
+      resumeVersionsById = {};
+      return;
+    }
+    const versions = result.data || [];
+    resumeVersionsById = Object.fromEntries(versions.map((v) => [v._id, v]));
+    resumeVersionSelect.innerHTML =
+      '<option value="">Use master resume (no specific version)</option>' +
+      versions.map((v) => `<option value="${v._id}">${v.fileName}</option>`).join("");
+  }
+
   candidateSelect.addEventListener("change", () => {
     manualCandidateBtn.disabled = !candidateSelect.value || !tab?.id;
+    if (candidateSelect.value) {
+      loadResumeVersionsFor(candidateSelect.value);
+    } else {
+      resumeVersionSelect.classList.add("hidden");
+      resumeVersionsById = {};
+    }
   });
 
   manualCandidateBtn.addEventListener(
     "click",
     async () => {
       const candidateId = candidateSelect.value;
+      const selectedVersion = resumeVersionsById[resumeVersionSelect.value];
+      const jobId = selectedVersion?.jobId;
+      const resumeVersionId = selectedVersion?._id;
       // Persisted (not just messaged to the current script instance) so a
       // reload of this same tab — routine on a multi-step application form —
       // finds this same candidate automatically next time, via the normal
@@ -101,11 +151,13 @@ document.addEventListener("DOMContentLoaded", async () => {
         await chrome.runtime.sendMessage({
           type: "SET_MANUAL_CANDIDATE_HANDOFF",
           candidateId,
+          jobId,
+          resumeVersionId,
           hostname,
           tabId: tab.id,
         });
       }
-      await reinjectThenMessage(tab.id, { type: "FILL_FOR_CANDIDATE", candidateId });
+      await reinjectThenMessage(tab.id, { type: "FILL_FOR_CANDIDATE", candidateId, jobId, resumeVersionId });
       window.close();
     },
     { once: true },

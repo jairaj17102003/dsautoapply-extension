@@ -158,17 +158,34 @@ async function claimPendingHandoff(hostname, tabId) {
     entry = queue.find((h) => h.hostname === hostname && h.claimedByTabId == null);
   }
 
-  // Falls back to the oldest still-unclaimed handoff regardless of hostname.
+  // Falls back to the newest still-unclaimed handoff regardless of hostname.
   // Confirmed real: a "careers.company.com" link is often just a landing
   // page that redirects to the actual ATS platform on a completely
   // different domain (e.g. Timken's careers.timken.com bounces to
-  // career8.successfactors.com) — the tab that actually finishes loading
-  // frequently has a different hostname than the one recorded when Apply
-  // was clicked (job.url, pre-redirect). Since Apply opens exactly one new
-  // tab per click, "the oldest thing nobody's claimed yet" is a safe
-  // fallback rather than a guess.
+  // career8.successfactors.com — or a job.url that's actually a LinkedIn
+  // listing, which redirects to the real ATS only after a second, manual
+  // "Apply" click on LinkedIn itself) — the tab that actually finishes
+  // loading frequently has a different hostname than the one recorded when
+  // Apply was clicked (job.url, pre-redirect).
+  //
+  // NEWEST, not oldest: this used to take queue.find() (the FIRST unclaimed
+  // entry in push-order, i.e. the OLDEST) on the assumption that Apply
+  // opens exactly one new tab per click, so anything unclaimed must be that
+  // one tab's own handoff. That assumption breaks the moment a PREVIOUS
+  // attempt's handoff never got claimed at all (the tab was closed before
+  // its content script ever ran, or loaded before the extension was
+  // reloaded with a fix) — it then sits unclaimed for up to HANDOFF_TTL_MS,
+  // and a later, unrelated tab's fallback lookup would silently steal that
+  // stale entry instead of the fresh one just pushed for THIS click,
+  // reusing an old candidate/resume version with no way to tell.  The most
+  // recently pushed unclaimed entry is always the better guess.
   if (!entry) {
-    entry = queue.find((h) => h.claimedByTabId == null);
+    for (let i = queue.length - 1; i >= 0; i--) {
+      if (queue[i].claimedByTabId == null) {
+        entry = queue[i];
+        break;
+      }
+    }
   }
 
   if (entry && tabId != null) entry.claimedByTabId = tabId;
@@ -272,6 +289,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const queue = await getPendingHandoffs();
         queue.push({
           candidateId: message.candidateId,
+          // Optional — set when the popup's picker also resolved a specific
+          // in-progress Application for this candidate (see popup.js).
+          // Without these, getResumeFileUrl() has no job-specific
+          // resumeVersionId to look up and silently falls back to the
+          // candidate's master resume — confirmed real, and the actual
+          // reason skills/resume content looked wrong on a job that DID
+          // have a real optimized resume: the manual picker never carried
+          // this through before, even when the consultant had already
+          // clicked Apply for this exact job in the Consultant app first.
+          jobId: message.jobId,
+          resumeVersionId: message.resumeVersionId,
           hostname: message.hostname,
           receivedAt: Date.now(),
           claimedByTabId: message.tabId,

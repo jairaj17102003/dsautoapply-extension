@@ -1515,6 +1515,17 @@
     if (attemptedSignatures.has(signature)) return;
 
     if (field.type === "file") {
+      // Confirmed real, serious bug (Workday, 7-Eleven's job form): this
+      // treated EVERY <input type="file"> on the page as "the resume
+      // slot," with nothing distinguishing the actual top-level Resume/CV
+      // field from a per-entry generic "Attachments" dropzone nested
+      // inside e.g. a Certifications entry (Workday reuses the identical
+      // file-upload widget markup for both). The certification's own
+      // Attachments field sits earlier in the DOM and got the resume file
+      // instead, leaving the real Resume/CV field empty. Skipping any
+      // file input inside a repeated-entry section here — those are
+      // per-entry supplementary attachments, never the primary resume.
+      if (isInsideRepeatedEntrySection(field)) return;
       resumeFileInputFound = true;
       if (field.value) return;
       attemptedSignatures.add(signature);
@@ -2106,12 +2117,23 @@
     { key: "expiryDate", patterns: ["expiration date", "expiry date", "end date", "valid until", "expires"] },
     { key: "date", patterns: ["issue date", "date issued", "date"] },
     { key: "url", patterns: ["credential url", "certificate url", "url", "link"] },
-    { key: "certificateId", patterns: ["credential id", "certificate id", "license number", "certification id"] },
+    // Confirmed real (Workday, 7-Eleven's job form): reordering this ahead
+    // of "name" only helps when the label actually matches one of THESE
+    // patterns — "Certification Number" matched none of them and still
+    // fell through to bare "certification" in "name" below, filling the
+    // certification's NAME into a field meant for a license/credential
+    // number. "certification number" needed to be listed explicitly, not
+    // just implied by being "more specific than a bare word."
+    { key: "certificateId", patterns: ["credential id", "certificate id", "license number", "certification id", "certification number"] },
     // Confirmed real (Workday, 7-Eleven's job form): a bare "Certification"
     // label (no "name" suffix at all) matched none of the original
     // patterns — the field is still clearly the certification's own name
     // field, not needing the word "name" spelled out to mean that.
-    { key: "name", patterns: ["certification name", "certificate name", "credential name", "certification", "certificate", "name", "title"] },
+    // excludePatterns: a nested "Specialty"/"Specialties" field's id gets
+    // scoped under its parent certification's own id (Workday's nesting
+    // convention), so it also contains "certification" as a whole word
+    // once normalized — genuinely unrelated to the certification's name.
+    { key: "name", patterns: ["certification name", "certificate name", "credential name", "certification", "certificate", "name", "title"], excludePatterns: ["specialty", "specialties"] },
   ];
 
   // profile.websites (built by adaptCandidateProfile()) is a flat array of
@@ -2145,12 +2167,31 @@
     const strongText = normalize(
       [field.name, field.id, field.getAttribute("aria-label"), labelForField(field)].join(" ")
     );
+    // excludePatterns confirmed necessary (Workday's Certifications
+    // section, 7-Eleven's job form): a nested "Specialty" field's id is
+    // "certification-11--specialties-7--specialtyParent" — Workday scopes
+    // every sub-entity's id under its parent entry's id namespace, and
+    // normalize() turns those hyphens into spaces, so the id alone reads
+    // as "...certification 11 specialties 7 specialtyparent...", matching
+    // "certification" as a whole word even though the field is a
+    // completely unrelated Specialty, not a certification name. Same
+    // excludePatterns convention matchRadioQuestion already uses.
     for (const matcher of matchers) {
-      if (matcher.patterns.some((p) => matchesWholeWord(strongText, p))) return matcher.key;
+      if (
+        matcher.patterns.some((p) => matchesWholeWord(strongText, p)) &&
+        !(matcher.excludePatterns || []).some((p) => matchesWholeWord(strongText, p))
+      ) {
+        return matcher.key;
+      }
     }
     const placeholderText = normalize(field.getAttribute("placeholder") || "");
     for (const matcher of matchers) {
-      if (matcher.patterns.some((p) => matchesWholeWord(placeholderText, p))) return matcher.key;
+      if (
+        matcher.patterns.some((p) => matchesWholeWord(placeholderText, p)) &&
+        !(matcher.excludePatterns || []).some((p) => matchesWholeWord(placeholderText, p))
+      ) {
+        return matcher.key;
+      }
     }
     return null;
   }
@@ -2319,6 +2360,14 @@
     return [findSectionContainer("education"), findSectionContainer("experience")].some((container) =>
       container?.contains?.(field)
     );
+  }
+
+  // Broader than isInsideEducationOrExperienceSection above — every
+  // repeated-entry section a candidate can have multiple of, used to keep
+  // the primary resume-upload slot from being confused with a per-entry
+  // file input scoped to just one entry (see fillField's file-type branch).
+  function isInsideRepeatedEntrySection(field) {
+    return ["education", "experience", "certifications", "websites"].some((key) => findSectionContainer(key)?.contains?.(field));
   }
 
   async function fillStructuredField(field, value, fieldLabel, key) {
@@ -3791,7 +3840,29 @@
   // step of a multi-step form), but we don't touch them automatically
   // anymore. Just nudges you to click "Fill this application" again.
   // Same dispatch pattern as recordResult/showAiStatus.
+  //
+  // Confirmed real, serious bug: an AI suggestion card already on screen
+  // holds a direct reference to the exact field/combobox element it was
+  // built for. The DOM churn that makes this function fire at all (Workday
+  // re-rendering part of the form) can swap that element out for a brand
+  // new node with the same label — the old card's Insert button is left
+  // pointing at a detached ghost. Clicking it still ran end-to-end (no
+  // error, card removed normally) but every lookup off that dead node
+  // found nothing ("zero options rendered"), so it silently reported
+  // "Couldn't find a matching option" instead of ever filling the field,
+  // with no indication anything was stale. Since this file deliberately
+  // never auto-touches the DOM for a re-render like this on its own, the
+  // only safe response is to clear every pending suggestion now — paired
+  // with clearing the per-frame queue-dedup trackers so the same
+  // still-unfilled field is free to be re-collected against its fresh live
+  // element the next time "AI-fill remaining questions" runs, instead of
+  // being silently skipped forever as "already queued."
   function showNewFieldsPrompt() {
+    queuedFieldSignatures.clear();
+    queuedRadioGroupNames.clear();
+    queuedCheckboxGroupNames.clear();
+    pendingClassificationItems = [];
+
     if (window.self !== window.top) {
       window.top.postMessage({ source: "askjobs-extension", type: "remote-new-fields-prompt" }, "*");
       return;
@@ -3799,6 +3870,8 @@
     if (!sidebarShadow) return;
     const counter = sidebarShadow.querySelector("#askjobs-counter");
     if (counter) counter.textContent = "New fields detected — click Fill again";
+    const resultsContainer = sidebarShadow.querySelector("#askjobs-ai-results");
+    if (resultsContainer) resultsContainer.innerHTML = "";
   }
 
   // Sets the sidebar host's position via a <style> tag's textContent
@@ -4762,6 +4835,27 @@
   // where there was never a candidate identity attached to the click).
   let mutationObserverStarted = false;
   async function loadCandidateContextAndFill(candidateId) {
+    // Confirmed real, serious bug: the manual candidate picker's handoff
+    // (FILL_FOR_CANDIDATE) carries jobId/resumeVersionId but never
+    // companyName/jobTitle — and radioAnswerForKey('workedHereBefore')
+    // returns null (no answer) the instant pendingHandoff.companyName is
+    // missing, regardless of how complete profile.experience is. Every
+    // "Have you been previously employed with us?" question came back
+    // "Recognized, but no stored preference set yet" through this path,
+    // even though the deterministic company-name check was fully able to
+    // answer it. Backfilling from the job itself (now that the picker
+    // resolved a specific jobId) fixes this the same way the real
+    // Apply-flow handoff already works, since that one always had
+    // companyName from the start.
+    if (pendingHandoff?.jobId && !pendingHandoff.companyName) {
+      const jobResult = await sendMessage({ type: "API_FETCH", path: `/api/v1/jobs/${pendingHandoff.jobId}` });
+      console.log("[AskJobs] backfilling companyName/jobTitle from job for manual-picker handoff:", jobResult);
+      if (jobResult?.ok) {
+        pendingHandoff.companyName = jobResult.data?.company;
+        pendingHandoff.jobTitle = jobResult.data?.title;
+      }
+    }
+
     const profileResult = await sendMessage({ type: "API_FETCH", path: `/api/v1/candidates/${candidateId}` });
     console.log("[AskJobs] candidate profile fetch result:", profileResult);
     if (!profileResult?.ok) {

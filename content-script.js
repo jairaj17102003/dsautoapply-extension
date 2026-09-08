@@ -583,18 +583,32 @@
     return (text || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
   }
 
-  // Like `el.textContent`, but excludes non-visible text nodes (SVG <title>
-  // is the common offender — flag icons pair an accessibility <title> with a
+  // Like `el.textContent`, but excludes non-visible text nodes. Originally
+  // just stripped <title>/<style>/<script> tags (SVG <title> was the first
+  // confirmed offender — flag icons pair an accessibility <title> with a
   // visible label span, and plain .textContent concatenates both with no
   // separator, e.g. "United States" + "United States" -> "United
-  // StatesUnited States". That doubled text was wrongly read as this
-  // combobox's "current answer," making an untouched widget look
-  // already-filled).
+  // StatesUnited States", wrongly read as an already-answered value).
+  //
+  // That tag-stripping approach didn't generalize, though — confirmed real
+  // (isolved's ATS, via NBME): a "State/Province" combobox's CLOSED,
+  // display:none listbox holds all 50+ state names as real DOM text
+  // permanently (a common accessible-combobox pattern: the full listbox
+  // exists in the DOM at all times, just visually hidden until opened),
+  // and none of those elements are <title>/<style>/<script> — the entire
+  // hidden option list leaked into "currentText" as one giant concatenated
+  // string, which is non-empty and doesn't match a placeholder pattern, so
+  // the field was wrongly treated as already-answered and silently skipped
+  // — never filled, never even queued for the AI fallback.
+  //
+  // innerText (read from the LIVE element, not a detached clone —
+  // innerText on a disconnected node returns nothing meaningful, since it
+  // has no layout) reflects actual CSS rendering, so both problems — a
+  // non-rendered <title> and an entire display:none subtree — are excluded
+  // by the same mechanism, not two different special cases.
   function visibleText(el) {
     if (!el) return "";
-    const clone = el.cloneNode(true);
-    clone.querySelectorAll("title, style, script").forEach((node) => node.remove());
-    return clone.textContent || "";
+    return el.innerText || "";
   }
 
   function labelForOne(field) {
@@ -687,6 +701,20 @@
   // address string into sub-fields would be exactly the kind of guessing
   // this file deliberately avoids everywhere else; only the generic
   // single-field "location" category gets a value.
+  // Confirmed real (Luxoft): the candidate's stored phone, as freely typed
+  // by a consultant (e.g. "+1(940)3906443"), was rejected outright by a
+  // stricter validator ("only numbers, minus symbol, and one plus symbol
+  // are allowed") — parentheses specifically aren't in that allowlist.
+  // Reducing to a leading "+" (if the original had one) plus digits only is
+  // the one shape almost every phone validator accepts; nothing so far has
+  // required the opposite (a specific punctuated format), so this is a
+  // strict improvement, not a trade-off.
+  function normalizePhoneForFilling(phone) {
+    const hasPlus = phone.trim().startsWith("+");
+    const digits = phone.replace(/\D/g, "");
+    return hasPlus ? `+${digits}` : digits;
+  }
+
   function valueForKey(key) {
     if (!profile) return null;
 
@@ -700,7 +728,7 @@
       case "email":
         return profile.email || null;
       case "phone":
-        return profile.phone || null;
+        return profile.phone ? normalizePhoneForFilling(profile.phone) : null;
       case "location":
         return profile.address || null;
       case "addressStreet":
@@ -2063,11 +2091,27 @@
   // is clicked (confirmed via real HTML, same shape as Work Experience) —
   // handled the same way via revealFirstEntryIfNeeded before filling.
   const CERTIFICATION_FIELD_MATCHERS = [
-    { key: "name", patterns: ["certification name", "certificate name", "credential name", "name", "title"] },
+    // Order matters — classifyStructured returns the FIRST matcher whose
+    // pattern matches, so the more specific keys below (issuer/date/url/
+    // certificateId) need first refusal before the bare "certification"/
+    // "certificate" patterns added to "name" below get a chance — otherwise
+    // a label like "Certification Number" or "Certification Date" would
+    // wrongly resolve to "name" instead of falling through to its real key.
     { key: "issuer", patterns: ["issuing organization", "issuer", "organization", "issued by"] },
+    // Checked before the bare "date" key below — "Expiration Date"/"End
+    // Date"/"Valid Until" all contain the substring "date" too (or don't,
+    // in "valid until"'s case, but would otherwise fall through
+    // unrecognized), so without this a certification's expiry field would
+    // wrongly resolve to its issue date instead, or never resolve at all.
+    { key: "expiryDate", patterns: ["expiration date", "expiry date", "end date", "valid until", "expires"] },
     { key: "date", patterns: ["issue date", "date issued", "date"] },
     { key: "url", patterns: ["credential url", "certificate url", "url", "link"] },
     { key: "certificateId", patterns: ["credential id", "certificate id", "license number", "certification id"] },
+    // Confirmed real (Workday, 7-Eleven's job form): a bare "Certification"
+    // label (no "name" suffix at all) matched none of the original
+    // patterns — the field is still clearly the certification's own name
+    // field, not needing the word "name" spelled out to mean that.
+    { key: "name", patterns: ["certification name", "certificate name", "credential name", "certification", "certificate", "name", "title"] },
   ];
 
   // profile.websites (built by adaptCandidateProfile()) is a flat array of
@@ -4164,6 +4208,65 @@
       items.push({ kind: "combobox", button, questionText: label, fieldType: "combobox", options });
     }
 
+    // Confirmed real, same bug class as the missing "select" case above:
+    // this never scanned radio/checkbox GROUPS at all, so a question like
+    // "If you are under 18 years of age, can you provide required proof of
+    // your eligibility to work?" — deliberately excluded from the
+    // atLeast18-style matcher (it's a conditional/hypothetical question,
+    // not a plain age check) and correctly queued into
+    // pendingClassificationItems by scanAndFillRadioGroups during the main
+    // scan — was invisible to "AI-fill remaining questions" ever
+    // discovering it independently. queuedRadioGroupNames/
+    // queuedCheckboxGroupNames (shared with the main scan) prevent
+    // re-collecting one already sitting in that queue as a duplicate card.
+    const radios = deepQueryAll(root, 'input[type="radio"]');
+    const radioGroups = new Map();
+    for (const radio of radios) {
+      if (!radio.name || radio.disabled) continue;
+      if (!radioGroups.has(radio.name)) radioGroups.set(radio.name, []);
+      radioGroups.get(radio.name).push(radio);
+    }
+    for (const [name, groupRadios] of radioGroups) {
+      if (queuedRadioGroupNames.has(name)) continue;
+      if (groupRadios.some((r) => r.checked)) continue; // already answered
+      const rawQuestionText = groupQuestionText(groupRadios);
+      if (rawQuestionText.length < 10 || rawQuestionText.length > MAX_QUESTION_LABEL_LENGTH) continue;
+      const normalizedQuestion = normalize(rawQuestionText);
+      if (
+        isGenderIdentityQuestion(normalizedQuestion) ||
+        isDisabilityQuestion(normalizedQuestion) ||
+        isSensitiveSelfIdQuestion(normalizedQuestion) ||
+        matchRadioQuestion(normalizedQuestion)
+      ) {
+        continue; // Already got its own suggestion/"no stored preference" message during the main scan.
+      }
+      const options = groupRadios.map((r) => (labelForField(r) || r.value || "").trim()).filter(Boolean);
+      items.push({ kind: "radioGroup", radios: groupRadios, questionText: rawQuestionText, fieldType: "radio", options });
+    }
+
+    const checkboxes = deepQueryAll(root, 'input[type="checkbox"]');
+    const checkboxGroups = new Map();
+    for (const box of checkboxes) {
+      if (box.disabled) continue;
+      const fieldsetEl = questionFieldsetFor(box);
+      if (!fieldsetEl) continue;
+      if (!checkboxGroups.has(fieldsetEl)) checkboxGroups.set(fieldsetEl, []);
+      checkboxGroups.get(fieldsetEl).push(box);
+    }
+    for (const [fieldsetEl, groupBoxes] of checkboxGroups) {
+      if (groupBoxes.length < 2) continue; // A lone checkbox isn't a grouped question — see scanAndFillCheckboxGroups.
+      const legend = fieldsetEl.querySelector("legend");
+      const rawQuestionText = (legend?.textContent || "").trim();
+      const name = legend?.querySelector("[id]")?.id || legend?.id || groupBoxes[0].id;
+      if (!name || queuedCheckboxGroupNames.has(name)) continue;
+      if (groupBoxes.some((b) => b.checked)) continue;
+      if (rawQuestionText.length < 10 || rawQuestionText.length > MAX_QUESTION_LABEL_LENGTH) continue;
+      const normalizedQuestion = normalize(rawQuestionText);
+      if (isSensitiveSelfIdQuestion(normalizedQuestion) || matchRadioQuestion(normalizedQuestion)) continue;
+      const options = groupBoxes.map((b) => (labelForField(b) || b.value || "").trim()).filter(Boolean);
+      items.push({ kind: "checkboxGroup", boxes: groupBoxes, questionText: rawQuestionText, fieldType: "checkbox", options });
+    }
+
     return items;
   }
 
@@ -4642,6 +4745,7 @@
         name: c.name,
         issuer: c.issuer,
         date: c.issueDate,
+        expiryDate: c.expiryDate,
         url: c.credentialUrl,
       })),
       websites: [candidate.linkedinUrl, candidate.githubUrl, candidate.portfolioUrl].filter(Boolean),

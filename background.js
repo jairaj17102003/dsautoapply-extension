@@ -99,10 +99,19 @@ async function fetchFileAsDataUrl(url) {
     } catch {
       return { ok: false, status: 0, error: "Invalid URL" };
     }
-    // Allows Firebase Storage (prod STORAGE_DRIVER=firebase) and our own API
-    // host (local dev's STORAGE_DRIVER=local serves resume files from the
-    // Backend's own /uploads/... static route instead).
-    const allowedHostnames = [new URL(API_BASE).hostname, "firebasestorage.googleapis.com"];
+    // Confirmed real (BrassRing resume-attach failure, "URL host not
+    // allowed"): Backend/src/config/storage.js's getSignedDownloadUrl uses
+    // the Firebase Admin SDK's bucket().getSignedUrl(), which returns a
+    // real Google Cloud Storage signed URL on storage.googleapis.com — a
+    // completely different domain from firebasestorage.googleapis.com (the
+    // CLIENT SDK's public download-URL format, e.g.
+    // firebasestorage.googleapis.com/v0/b/{bucket}/o/{path}?alt=media).
+    // Every resume download URL this Backend actually issues uses the
+    // former, which wasn't in this allowlist at all — resume auto-attach
+    // was rejected before it ever reached the actual fetch. Also allows
+    // our own API host (local dev's STORAGE_DRIVER=local serves resume
+    // files from the Backend's own /uploads/... static route instead).
+    const allowedHostnames = [new URL(API_BASE).hostname, "storage.googleapis.com", "firebasestorage.googleapis.com"];
     if (!allowedHostnames.includes(parsed.hostname)) {
       return { ok: false, status: 0, error: "URL host not allowed" };
     }

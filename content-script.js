@@ -112,6 +112,11 @@
     // for "transcript"/"transcripts").
     { key: "certifications", patterns: ["certifications", "certification"] },
     { key: "coverLetter", patterns: ["cover letter", "covering letter", "motivation letter"] },
+    // Confirmed real (a BrassRing portal): a REQUIRED "paste your resume as
+    // plain text" textarea sitting right alongside the file-upload field,
+    // not a substitute for it — some ATS platforms want the raw text
+    // indexed/searchable server-side in addition to the actual file.
+    { key: "resumeText", patterns: ["paste your resume", "copy & paste", "copy and paste"] },
     // Confirmed real (Johns Hopkins APL's iCIMS form): a page can have
     // several genuinely different file-upload fields besides the resume
     // itself — "Please upload your transcripts (unofficial is fine)" and
@@ -574,6 +579,11 @@
   // alongside the resume file/skills in getResumeFileUrl(), not generated
   // on demand like OG's version.
   let resumeCoverLetter = null;
+  // Plain-text rendering of the resume (ResumeVersion.content, or
+  // MasterResume.parsedText as fallback) — confirmed real (a BrassRing
+  // portal): some ATS forms have a REQUIRED "paste your resume as plain
+  // text" textarea alongside the file upload, not just the file itself.
+  let resumeRawText = null;
   let pendingHandoff = null;
   let sidebarShadow = null;
   let sidebarHost = null;
@@ -862,6 +872,8 @@
           : null;
       case "prefix":
         return profile.prefix || null;
+      case "resumeText":
+        return resumeRawText || null;
       case "citizenshipCountry":
         return profile.citizenshipCountry || null;
       case "expectedSalary":
@@ -1199,11 +1211,12 @@
   async function getMasterResumeFallback(candidateId) {
     const result = await sendMessage({ type: "API_FETCH", path: `/api/v1/candidates/${candidateId}/master-resume` });
     console.log("[AskJobs] master resume fallback fetch result:", result);
-    if (!result?.ok) return { fileUrl: null, fileName: null, skills: [] };
+    if (!result?.ok) return { fileUrl: null, fileName: null, skills: [], rawText: null };
     return {
       fileUrl: result.data?.downloadUrl || null,
       fileName: result.data?.resume?.fileName || null,
       skills: flattenSkills(result.data?.resume?.parsedData?.skills),
+      rawText: result.data?.resume?.parsedText || null,
     };
   }
 
@@ -1248,6 +1261,7 @@
         resumeFileName = resumeResult.data?.version?.fileName || null;
         resumeSkills = flattenSkills(resumeResult.data?.version?.structuredContent?.skills);
         resumeCoverLetter = resumeResult.data?.version?.coverLetter || null;
+        resumeRawText = resumeResult.data?.version?.content || null;
       }
     }
 
@@ -1258,6 +1272,7 @@
         resumeFileName = fallback.fileName;
         resumeIsFallbackPrimary = true;
         if (!resumeSkills.length) resumeSkills = fallback.skills;
+        if (!resumeRawText) resumeRawText = fallback.rawText;
         console.log("[AskJobs] no job-specific resume version available — using master resume as fallback:", resumeFileUrl);
       }
     }
@@ -1897,6 +1912,21 @@
       } else {
         recordResult("skipped", fieldLabel, "Couldn't enter the date correctly — please set it manually");
       }
+      return;
+    }
+
+    // A dedicated branch, not the generic fallback below — that one echoes
+    // the actual inserted value back into the sidebar's result detail,
+    // which would mean dumping the entire multi-paragraph resume text
+    // there instead of a short, readable status.
+    if (key === "resumeText") {
+      const filled = setNativeValue(field, value);
+      attemptedSignatures.add(signature);
+      recordResult(
+        filled ? "filled" : "skipped",
+        fieldLabel,
+        filled ? "Pasted your resume text" : "Couldn't confirm the resume text was actually accepted — please paste it directly",
+      );
       return;
     }
 

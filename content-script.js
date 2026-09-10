@@ -29,6 +29,12 @@
   const MAX_QUESTION_LABEL_LENGTH = 800;
 
   const FIELD_MATCHERS = [
+    // Optional salutation ("Mr"/"Mrs"/"Ms"/"Mx"/"Dr") — a plain identity
+    // field some ATS forms ask for right next to the name fields, not an
+    // EEO/voluntary-disclosure category. Checked before firstName/lastName
+    // since it's usually the field right before them on the page, though
+    // matcher order doesn't actually matter here (the patterns don't overlap).
+    { key: "prefix", patterns: ["prefix", "salutation", "honorific"] },
     { key: "firstName", patterns: ["first name", "firstname", "given name"] },
     { key: "lastName", patterns: ["last name", "lastname", "surname", "family name"] },
     { key: "email", patterns: ["email"] },
@@ -824,6 +830,8 @@
         return profile.certifications?.length
           ? profile.certifications.map((c) => c.name).filter(Boolean).join(", ") || null
           : null;
+      case "prefix":
+        return profile.prefix || null;
       case "citizenshipCountry":
         return profile.citizenshipCountry || null;
       case "expectedSalary":

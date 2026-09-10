@@ -414,7 +414,20 @@
       matchesWholeWord(normalizedQuestionText, "country") &&
       !normalizedQuestionText.includes("phone code") &&
       !normalizedQuestionText.includes("country code") &&
-      !normalizedQuestionText.includes("citizenship")
+      !normalizedQuestionText.includes("citizenship") &&
+      // Confirmed real (Nelnet's Workday form, rendered as a custom
+      // aria-haspopup combobox button, not a native <select>):
+      // "Are you eligible to work in the country for which you are
+      // applying?" contains the bare word "country" too, and this
+      // function is checked BEFORE matchRadioQuestion in
+      // scanAndFillGenericComboboxes — without this exclusion it always
+      // won the race, offering the candidate's actual country name
+      // ("India") as the answer to what's really a Yes/No
+      // work-authorization question. The same exclusion already exists on
+      // the FIELD_MATCHERS addressCountry entry for the native-<select>/
+      // plain-input path (classify()) — this is the standalone-function
+      // equivalent for the combobox path, which classify() never sees.
+      !normalizedQuestionText.includes("eligible to work")
     );
   }
 

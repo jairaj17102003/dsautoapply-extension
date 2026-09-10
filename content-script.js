@@ -72,7 +72,34 @@
     { key: "currentJobTitle", patterns: ["current title", "job title", "current role"] },
     { key: "dateOfBirth", patterns: ["date of birth", "birth date", "dob"] },
     { key: "skills", patterns: ["skills", "key skills", "skill set"] },
+    // Confirmed real (Johns Hopkins APL's iCIMS form): a bare single text
+    // field labeled just "Certifications" — a summary field, not a
+    // repeated-entry section (that shape is handled separately by
+    // CERTIFICATION_FIELD_MATCHERS/fillCertifications). Plural listed
+    // explicitly, not left to a "certification" substring, since
+    // matchesWholeWord requires a boundary right after the pattern and
+    // "certification" flowing into "s" isn't one (same class of gap fixed
+    // for "transcript"/"transcripts").
+    { key: "certifications", patterns: ["certifications", "certification"] },
     { key: "coverLetter", patterns: ["cover letter", "covering letter", "motivation letter"] },
+    // Confirmed real (Johns Hopkins APL's iCIMS form): a page can have
+    // several genuinely different file-upload fields besides the resume
+    // itself — "Please upload your transcripts (unofficial is fine)" and
+    // two separate "Please upload an additional document (as needed)"
+    // fields all sat on the same page as the real Resume upload. None of
+    // them are inside a repeated-entry section (see
+    // isInsideRepeatedEntrySection), so nothing was stopping fillField's
+    // file-type branch from treating every one of them as "the resume
+    // slot" too — the exact same resume file got attached three extra
+    // times into fields that had nothing to do with it.
+    // Confirmed real via actual HTML (Johns Hopkins APL): matchesWholeWord
+    // requires a word boundary right after the pattern too (\btranscript\b)
+    // — the real label says "transcripts" (plural), and "t" flowing into
+    // "s" is a word-to-word transition, not a boundary, so singular
+    // "transcript" alone never matched it. Every plural-prone pattern here
+    // now lists both forms explicitly, the same way this file always spells
+    // out variants rather than relying on a stemming regex.
+    { key: "otherDocument", patterns: ["transcript", "transcripts", "writing sample", "writing samples", "additional document", "additional documents", "letter of recommendation", "letters of recommendation", "recommendation letter", "recommendation letters", "reference letter", "reference letters", "references"] },
     // Deliberately NOT matching a bare "name" substring here — that wrongly
     // matched fields like "Middle Name" or "Nickname", filling them with
     // the user's full name. "full name"/"your name" are specific enough to
@@ -205,6 +232,19 @@
   function eeoHispanicOrLatinoText() {
     if (eeoProfile?.hispanicOrLatino === "yes") return "Hispanic or Latino";
     if (eeoProfile?.hispanicOrLatino === "no") return "Not Hispanic or Latino";
+    return null;
+  }
+
+  // Mirrors eeoVeteranStatusText(). Every Disability reader below used to
+  // read jobPreferences?.disabilityStatus, which held lowercase raw enum
+  // text ("yes"/"no"/"prefer not to say") instead of the properly-cased
+  // strings every other EEO helper here produces — reading straight from
+  // eeoProfile.disability (same place veteranStatus lives) instead keeps
+  // this consistent with eeoVeteranStatusText/eeoHispanicOrLatinoText.
+  function eeoDisabilityText() {
+    if (eeoProfile?.disability === "yes") return "Yes";
+    if (eeoProfile?.disability === "no") return "No";
+    if (eeoProfile?.disability === "decline_to_answer") return "Decline to answer";
     return null;
   }
 
@@ -438,7 +478,7 @@
   ];
 
   function bestDisabilityOptionText(optionTexts) {
-    const stored = normalize(jobPreferences?.disabilityStatus || "");
+    const stored = normalize(eeoDisabilityText() || "");
     if (!stored) return null;
     const exact = optionTexts.find((t) => normalize(t) === stored);
     if (exact) return exact;
@@ -749,6 +789,18 @@
         return profile.currentJobTitle || null;
       case "dateOfBirth":
         return profile.dob || null;
+      // Confirmed real (Johns Hopkins APL's iCIMS form): a bare single
+      // <input type="text" id="rcf2070"> labeled just "Certifications" —
+      // not a repeated-entry section with its own Name/Issuer/Date
+      // sub-fields (CERTIFICATION_FIELD_MATCHERS/fillCertifications is for
+      // that shape). No FIELD_MATCHERS key covered this bare summary-style
+      // field at all, so classify() always returned null and the field was
+      // never even attempted, let alone recognized as an open-ended
+      // question for the AI-fill pass to pick up.
+      case "certifications":
+        return profile.certifications?.length
+          ? profile.certifications.map((c) => c.name).filter(Boolean).join(", ") || null
+          : null;
       default:
         return null;
     }
@@ -859,12 +911,46 @@
   // character silently did nothing, leaving the field empty while the
   // sidebar wrongly reported success. A native date input just needs its
   // value set directly, the same as any other native form control.
-  function fillDateField(field, formattedValue) {
+  // Returns whether the field actually ended up holding a real date —
+  // confirmed real (BambooHR's "Date Available" field): its masked
+  // mm/dd/yyyy input's own mask handler can partially reject/mangle
+  // simulated keystrokes instead of cleanly accepting or rejecting them —
+  // typing "09/09/2026" character-by-character came out as "0m/dd/9yyy",
+  // visibly broken (leftover placeholder letters mixed with real digits),
+  // yet the caller still unconditionally reported success. A field the
+  // sidebar already marked "done" gets no second look from the candidate,
+  // so a false success here is worse than reporting nothing. A native
+  // type="date" input has no such mask to corrupt — setNativeValue sets
+  // it directly and that's authoritative.
+  async function fillDateField(field, formattedValue) {
     if (field.type === "date") {
       setNativeValue(field, formattedValue);
-    } else {
-      typeCharacterByCharacter(field, formattedValue);
+      return true;
     }
+
+    // Confirmed real (BambooHR's "Date Available" field): its live input
+    // mask mangled character-by-character keystrokes into a garbled mix of
+    // digits and leftover placeholder letters ("0m/dd/9yyy") instead of
+    // cleanly accepting or rejecting them. Setting the whole value in one
+    // native-setter + input event (closer to a real paste) lets the mask
+    // re-derive its own formatting from the complete string at once,
+    // instead of tracking a rapid sequence of individual keystrokes —
+    // tried first since it's less likely to desync a mask's own caret
+    // tracking; typeCharacterByCharacter (needed by masks that only react
+    // to real per-keystroke events) is the fallback, not the first attempt.
+    setNativeValue(field, formattedValue);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    if (field.value === formattedValue) return true;
+
+    typeCharacterByCharacter(field, formattedValue);
+    if (field.value.length > 0 && !/[a-zA-Z]/.test(field.value)) return true;
+
+    // Neither approach produced a clean result — leave the field empty
+    // rather than a half-typed, visibly broken mix of digits and leftover
+    // mask placeholder letters, which reads as real (wrong) data instead
+    // of an obviously still-unfilled field.
+    setNativeValue(field, "");
+    return false;
   }
 
   // react-datepicker (confirmed real: RTX's Phenom-based Experience/
@@ -1309,7 +1395,30 @@
       else skippedCount -= 1;
       fieldResults[existingIndex] = { status, label: resolvedLabel, detail: resolvedDetail };
     } else {
-      fieldResults.push({ status, label: resolvedLabel, detail: resolvedDetail });
+      // Confirmed real: a pending "review above and click Insert" entry
+      // (showSuggestionCard's companion recordResult call, logged the
+      // moment a suggestion is offered) and the REAL outcome once Insert
+      // is actually clicked always have different detail text by design —
+      // the exact match above never recognizes them as the same field, so
+      // both stayed in the results list forever ("Gender*" shown twice:
+      // once still asking for review, once already ticked done). Only
+      // safe to collapse the two when there's EXACTLY ONE pending entry
+      // under this label — a repeated-entry field (e.g. "Field of Study",
+      // once per education) can have several simultaneous pending entries
+      // sharing the same generic label, and guessing which one a later
+      // result belongs to would risk silently erasing the wrong one.
+      const pendingIndexes = [];
+      fieldResults.forEach((r, i) => {
+        if (r.label === resolvedLabel && r.status === "skipped" && /review above and click Insert/.test(r.detail)) {
+          pendingIndexes.push(i);
+        }
+      });
+      if (pendingIndexes.length === 1) {
+        skippedCount -= 1;
+        fieldResults[pendingIndexes[0]] = { status, label: resolvedLabel, detail: resolvedDetail };
+      } else {
+        fieldResults.push({ status, label: resolvedLabel, detail: resolvedDetail });
+      }
     }
     if (status === "filled") filledCount += 1;
     else skippedCount += 1;
@@ -1412,9 +1521,12 @@
         queuedFieldSignatures.add(signature);
         const todayFormatted = formatDateForField(field, new Date().toISOString());
         if (todayFormatted) {
-          renderStoredValueSuggestion(label, `${todayFormatted} (today)`, () => {
-            fillDateField(field, todayFormatted);
-            recordResult("filled", label, `${todayFormatted} (today's date, reviewed)`);
+          renderStoredValueSuggestion(label, `${todayFormatted} (today)`, async () => {
+            if (await fillDateField(field, todayFormatted)) {
+              recordResult("filled", label, `${todayFormatted} (today's date, reviewed)`);
+            } else {
+              recordResult("skipped", label, "Couldn't enter the date correctly — please set it manually");
+            }
           });
           recordResult("skipped", label, "Suggested today's date — review above and click Insert, or set an exact date directly");
         }
@@ -1450,7 +1562,7 @@
     }
     if (isDisabilityQuestion(questionText)) {
       queuedFieldSignatures.add(signature);
-      const stored = jobPreferences?.disabilityStatus;
+      const stored = eeoDisabilityText();
       if (stored) {
         renderStoredValueSuggestion(label, stored, () => {
           if (field.tagName === "TEXTAREA") {
@@ -1458,11 +1570,11 @@
           } else {
             setNativeValue(field, stored);
           }
-          recordResult("filled", label, `${stored} (from your Settings, reviewed)`);
+          recordResult("filled", label, `${stored} (from the candidate's EEO profile, reviewed)`);
         });
-        recordResult("skipped", label, "Suggested from your Settings — review above and click Insert");
+        recordResult("skipped", label, "Suggested from the candidate's EEO profile — review above and click Insert");
       } else {
-        recordResult("skipped", label, "Voluntary demographic question — set a disability status in Settings to get a suggestion, or answer directly");
+        recordResult("skipped", label, "Voluntary demographic question — no disability status set in the candidate's EEO profile, please answer directly");
       }
       return;
     }
@@ -1514,6 +1626,19 @@
     // what lets a manual clear stick instead of silently being refilled.
     if (attemptedSignatures.has(signature)) return;
 
+    // Confirmed real (BambooHR's Fabric UI widget — Gender/Ethnicity/
+    // Disability/State/Country selects all use this shape): the actual
+    // interactive control is a <button aria-haspopup="true"> that opens a
+    // portal-rendered options menu; the paired <select aria-hidden="true">
+    // sitting next to it is a pure decoy the page's own JS keeps in sync
+    // for submission — it always starts with zero real <option>s (just one
+    // empty placeholder), so treating it as a real native select read its
+    // option list as empty and reported "no matching option found" even
+    // though a real, fillable value existed. scanAndFillGenericComboboxes
+    // handles the actual <button> instead; nothing is ever recoverable by
+    // touching the decoy <select> directly.
+    if (field.tagName === "SELECT" && field.getAttribute("aria-hidden") === "true") return;
+
     if (field.type === "file") {
       // Confirmed real, serious bug (Workday, 7-Eleven's job form): this
       // treated EVERY <input type="file"> on the page as "the resume
@@ -1528,6 +1653,31 @@
       if (isInsideRepeatedEntrySection(field)) return;
       resumeFileInputFound = true;
       if (field.value) return;
+      // Confirmed real (Johns Hopkins APL's iCIMS form): this widget
+      // submits the WHOLE PAGE (a real navigation, not AJAX) the instant a
+      // resume file is chosen, so the server can parse it and re-render the
+      // form. Per browser security, a real <input type="file">'s .value is
+      // ALWAYS blank on any fresh page load — reload included — so the
+      // check above can never see "already attached" once the page has
+      // reloaded even once. iCIMS's own markup carries the true state in a
+      // sibling hidden input named "<fieldId>_FileName" (its own visible
+      // "current file" display reads from the same value), which — being a
+      // plain hidden field, not a file input — DOES survive a reload.
+      // Without this, our own automatic fill-on-page-load kept re-selecting
+      // the same file on every reload, re-triggering iCIMS's own
+      // submit-and-reload cycle indefinitely — visible as the resume field
+      // re-uploading itself over and over.
+      // iCIMS's naming convention REPLACES the file input's own "_File"
+      // suffix with "_FileName" for the companion hidden field (confirmed
+      // real: "PortalProfileFields.Resume_File" -> companion
+      // "PortalProfileFields.Resume_FileName", not
+      // "PortalProfileFields.Resume_File_FileName") — appending onto the
+      // full id instead of replacing the suffix built a nonexistent id, so
+      // this lookup always returned null and the guard below never
+      // actually fired, letting the same re-upload/re-submit loop this was
+      // meant to stop keep happening exactly as before.
+      const companionFileName = document.getElementById(`${field.id.replace(/_File$/, "")}_FileName`);
+      if (companionFileName && companionFileName.value) return;
       attemptedSignatures.add(signature);
       // A "cover letter" upload is a genuinely different document from the
       // resume — attaching the resume into it would be actively wrong, not
@@ -1535,6 +1685,15 @@
       // letter TEXT field (below) gets AI-generated content.
       if (classify(field) === "coverLetter") {
         recordResult("skipped", fieldLabel, "Cover letter file upload — attach manually for now");
+        return;
+      }
+      // Confirmed real (Johns Hopkins APL's iCIMS form): "transcripts" and
+      // "additional document" upload fields sat on the same page as the
+      // real resume field, outside any repeated-entry section, so nothing
+      // above stopped them from also being treated as "the resume slot" —
+      // the same resume file got attached into all of them.
+      if (classify(field) === "otherDocument") {
+        recordResult("skipped", fieldLabel, "Not the resume field — attach manually if required");
         return;
       }
       const attached = await attachResumeFile(field);
@@ -1589,6 +1748,9 @@
     }
 
     const key = classify(field);
+    if (key && field.tagName === "SELECT") {
+      console.log("[AskJobs] native <select> classified as", key, "before ever reaching fillScreeningSelect:", fieldLabel);
+    }
     if (!key) {
       // A screening question (work auth, relocation, age, etc.) sometimes
       // renders as a plain native <select> rather than radios or a custom
@@ -1661,10 +1823,13 @@
       // character-by-character, but a native <input type="date"> (confirmed
       // real: silently stayed empty when typed into that way) needs its
       // value set directly instead.
-      fillDateField(field, finalValue);
       attemptedSignatures.add(signature);
-      recordResult("filled", fieldLabel, finalValue);
-      console.log("[AskJobs] generic field filled:", key, "=", finalValue, "->", fieldLabel);
+      if (await fillDateField(field, finalValue)) {
+        recordResult("filled", fieldLabel, finalValue);
+        console.log("[AskJobs] generic field filled:", key, "=", finalValue, "->", fieldLabel);
+      } else {
+        recordResult("skipped", fieldLabel, "Couldn't enter the date correctly — please set it manually");
+      }
       return;
     }
 
@@ -1945,9 +2110,20 @@
   async function fillScreeningSelect(field, signature, fieldLabel) {
     if (fieldLabel.length > MAX_QUESTION_LABEL_LENGTH) return false;
     const questionText = normalize(fieldLabel);
+    console.log(
+      "[AskJobs] fillScreeningSelect checking native <select>:",
+      fieldLabel,
+      "-> normalized:",
+      questionText,
+      "gender match:",
+      isGenderIdentityQuestion(questionText),
+      "disability match:",
+      isDisabilityQuestion(questionText),
+    );
 
     if (isGenderIdentityQuestion(questionText)) {
       const optionTexts = Array.from(field.options).map((o) => o.textContent.trim()).filter(Boolean);
+      console.log("[AskJobs] gender select — stored profile.gender:", profile?.gender, "options:", optionTexts);
       const suggestion = await resolveOptionMatch(fieldLabel, profile?.gender, optionTexts, bestGenderOptionText(optionTexts));
       if (suggestion) {
         renderStoredValueSuggestion(fieldLabel, suggestion, () => {
@@ -1967,9 +2143,10 @@
 
     if (isDisabilityQuestion(questionText)) {
       const optionTexts = Array.from(field.options).map((o) => o.textContent.trim()).filter(Boolean);
+      console.log("[AskJobs] disability select — stored eeoProfile.disability:", eeoProfile?.disability, "options:", optionTexts);
       const suggestion = await resolveOptionMatch(
         fieldLabel,
-        jobPreferences?.disabilityStatus,
+        eeoDisabilityText(),
         optionTexts,
         bestDisabilityOptionText(optionTexts),
       );
@@ -1979,12 +2156,12 @@
           if (option) {
             field.value = option.value;
             field.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-            recordResult("filled", fieldLabel, `${suggestion} (from your Settings, reviewed)`);
+            recordResult("filled", fieldLabel, `${suggestion} (from the candidate's EEO profile, reviewed)`);
           }
         });
-        recordResult("skipped", fieldLabel, "Suggested from your Settings — review above and click Insert");
+        recordResult("skipped", fieldLabel, "Suggested from the candidate's EEO profile — review above and click Insert");
       } else {
-        recordResult("skipped", fieldLabel, "Voluntary demographic question — set a disability status in Settings to get a suggestion, or answer directly");
+        recordResult("skipped", fieldLabel, "Voluntary demographic question — no disability status set in the candidate's EEO profile, please answer directly");
       }
       return true;
     }
@@ -2094,6 +2271,13 @@
     { key: "startDate", patterns: ["from", "start date", "started"] },
     { key: "endDate", patterns: ["to", "end date", "ended"] },
     { key: "description", patterns: ["description", "responsibilities", "summary", "duties"] },
+    // Confirmed real (Johns Hopkins APL's iCIMS form): "Is this your
+    // current job?" is a per-entry SELECT/dropdown, not a checkbox —
+    // CURRENT_POSITION_PATTERNS below only ever handles the checkbox
+    // shape, so this exact question was never even attempted for any
+    // entry, current or not (QuikTrip's own "current: true" entry was
+    // left on "— Make a Selection —" despite the data being right there).
+    { key: "isCurrentJob", patterns: ["current job", "currently work here", "current position", "still work here", "presently employed"] },
   ];
 
   const CURRENT_POSITION_PATTERNS = ["currently work here", "current position", "i currently work", "present"];
@@ -2372,6 +2556,50 @@
 
   async function fillStructuredField(field, value, fieldLabel, key) {
     const stringValue = String(value);
+    // Confirmed real (Johns Hopkins APL's iCIMS form): a Start/End date's
+    // own Month/Day/Year sub-controls each inherit the shared "Start
+    // date"/"End date" label text via their own aria-labelledby chain
+    // (which references the SAME outer label alongside their own), so all
+    // three independently classify as startDate/endDate too — the raw ISO
+    // value was being searched for whole in a Month/Day <select>'s Jan-Dec
+    // options (never matching) and typed verbatim into the Year <input>
+    // ("2022-07-01T00:00:00.000Z" is never a valid year), failing every
+    // time regardless of which of the three actually got reached. This
+    // widget's own naming convention suffixes each sub-control's id/name
+    // with "_Month"/"_Date"/"_Year", which is what lets each be filled
+    // with just its own portion of the parsed date instead of the whole
+    // value.
+    if (key === "startDate" || key === "endDate") {
+      const idOrName = field.id || field.name || "";
+      const isDateSubControl = /_(Month|Date|Year)$/.test(idOrName);
+      if (isDateSubControl) {
+        const parsed = new Date(stringValue);
+        if (Number.isNaN(parsed.getTime())) return false;
+        if (/_Month$/.test(idOrName) && field.tagName === "SELECT") {
+          const monthValue = String(parsed.getMonth() + 1).padStart(2, "0");
+          const option = Array.from(field.options).find((o) => o.value === monthValue);
+          if (!option) return false;
+          field.value = monthValue;
+          field.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+          return true;
+        }
+        if (/_Date$/.test(idOrName) && field.tagName === "SELECT") {
+          const dayValue = String(parsed.getDate());
+          const option = Array.from(field.options).find((o) => o.value === dayValue);
+          if (!option) return false;
+          field.value = dayValue;
+          field.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+          return true;
+        }
+        if (/_Year$/.test(idOrName)) {
+          return setNativeValue(field, String(parsed.getFullYear()));
+        }
+        return false;
+      }
+    }
+    if (isIcimsCustomDropdown(field)) {
+      return fillIcimsCustomDropdown(field, stringValue, fieldLabel, { fallbackToOther: key === "institution" });
+    }
     if (field.tagName === "SELECT") {
       // Confirmed real (RTX/Phenom's Degree dropdown): a plain substring
       // check only ever matches when the option's own text is short enough
@@ -2404,8 +2632,7 @@
       // own segment-by-segment interaction and silently stayed empty when
       // typed into this way instead. setNativeValue (inside fillDateField)
       // sets it directly, correctly, like any other native form control.
-      fillDateField(field, finalValue);
-      return true;
+      return fillDateField(field, finalValue);
     }
     if (isReactDatePickerField(field)) {
       const parsedDate = new Date(stringValue);
@@ -2414,8 +2641,7 @@
       }
       const finalValue = formatDateForField(field, stringValue);
       if (!finalValue) return false;
-      fillDateField(field, finalValue);
-      return true;
+      return fillDateField(field, finalValue);
     }
     if (isMultiselectSearchBox(field)) {
       return fillMultiselectSearch(field, [stringValue], fieldLabel, { fallbackToOther: key === "institution" });
@@ -2441,6 +2667,16 @@
     // matching option, so a genuine non-match now correctly comes back
     // false instead of a false-positive success.
     if (isComboboxField(field)) {
+      // Confirmed real (Johns Hopkins APL's iCIMS form): a raw,
+      // unformatted date value ("2022-07-01T00:00:00.000Z") was typed as
+      // SEARCH TEXT into some combobox-shaped element that also happened
+      // to classify as startDate/endDate — a date's real Month/Day/Year
+      // sub-controls are already handled by the branches above (native
+      // select, type="date", react-datepicker, spinbutton); nothing a
+      // dropdown's options actually contain is ever going to match a raw
+      // timestamp verbatim, so this path should never even be attempted
+      // for a date key regardless of which specific element triggers it.
+      if (key === "startDate" || key === "endDate") return false;
       return await fillCustomCombobox(field, stringValue, fieldLabel);
     }
     // Confirmed real bug: this discarded setNativeValue's return value and
@@ -2520,11 +2756,26 @@
   // "Bachelor of Technology" and would otherwise false-match. Real
   // category-style options (Bachelors, High School, Doctorate) are always
   // short, so this loses nothing by excluding long ones.
+  // Confirmed real (Johns Hopkins APL's iCIMS form): "college"/"university"
+  // etc. are near-universal filler words in institution names — checking
+  // them for overlap turned this into "any option containing the word
+  // 'College' matches any target institution whose own name also contains
+  // 'College'", regardless of which actual college either one is. The
+  // candidate's real school ("Vaagdevi College Of Engineering") wasn't in
+  // this site's list at all, but "Agnes Scott College" got selected
+  // anyway — sharing nothing with the real target except the word
+  // "College" — instead of correctly falling through to "Other, Not
+  // Listed". These words were never the discriminating part of a genuine
+  // degree-category match either (e.g. "Bachelors" vs "Bachelor of
+  // Technology" already overlaps on "bachelor" alone), so excluding them
+  // costs nothing there while fixing the institution false-positive.
+  const COMBOBOX_MATCH_STOPWORDS = new Set(["college", "university", "institute", "school", "academy", "polytechnic"]);
+
   function comboboxTextsMatch(optionText, targetNormalized) {
     const optionWords = normalize(optionText).split(" ").map(singularize).filter(Boolean);
     if (optionWords.length > 3) return false;
     const targetWords = targetNormalized.split(" ").map(singularize).filter(Boolean);
-    return optionWords.some((w) => w.length > 3 && targetWords.includes(w));
+    return optionWords.some((w) => w.length > 3 && !COMBOBOX_MATCH_STOPWORDS.has(w) && targetWords.includes(w));
   }
 
   function closeComboboxPopup(button) {
@@ -2666,11 +2917,25 @@
     // remote lookup rather than a local static list. 50x100ms gives that
     // room without making the common, fast case any slower (the loop still
     // breaks the instant options first appear).
+    // Confirmed real (BambooHR's Fabric UI widget — Gender/Ethnicity/
+    // Disability): its aria-haspopup="true" button opens a plain MUI-style
+    // menu whose real, clickable rows are role="menuitem", not the ARIA
+    // listbox role="option" every other site handled here uses. Checked
+    // only as a fallback (role="option" first) so a real listbox widget
+    // elsewhere on the page can't get confused with an unrelated
+    // navigation menu's menuitem rows.
+    const OPTION_ROLE_SELECTOR = '[role="option"]';
+    const MENUITEM_ROLE_SELECTOR = '[role="menuitem"]';
     let options = [];
     for (let attempt = 0; attempt < 50; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 100));
-      options = deepQueryAll(scopeEl, '[role="option"]').filter(isRealOptionCandidate);
+      options = deepQueryAll(scopeEl, OPTION_ROLE_SELECTOR).filter(isRealOptionCandidate);
       if (excludeOptions) options = options.filter((o) => !excludeOptions.has(o));
+      if (options.length === 0) {
+        let menuItems = deepQueryAll(scopeEl, MENUITEM_ROLE_SELECTOR).filter(isRealOptionCandidate);
+        if (excludeOptions) menuItems = menuItems.filter((o) => !excludeOptions.has(o));
+        options = menuItems;
+      }
       if (options.length > 0) break;
     }
 
@@ -2684,13 +2949,26 @@
     // that initial visible batch render before matching against it.
     if (options.length > 0) {
       await new Promise((resolve) => setTimeout(resolve, 250));
-      let settled = deepQueryAll(scopeEl, '[role="option"]').filter(isRealOptionCandidate);
+      const settleSelector = options.every((o) => o.matches(MENUITEM_ROLE_SELECTOR)) ? MENUITEM_ROLE_SELECTOR : OPTION_ROLE_SELECTOR;
+      let settled = deepQueryAll(scopeEl, settleSelector).filter(isRealOptionCandidate);
       if (excludeOptions) settled = settled.filter((o) => !excludeOptions.has(o));
       if (settled.length >= options.length) options = settled;
     }
 
     if (options.length === 0) {
-      console.log("[AskJobs] dropdown: zero options rendered while searching for", desiredText);
+      // Diagnostic only (not a fix): if a widget's real menu items use a
+      // different role than "option" (e.g. a plain aria-haspopup="true"
+      // button opens a role="menu" with role="menuitem" children, not an
+      // ARIA listbox), this tells us so from real evidence next time,
+      // instead of guessing which alternate role/selector to widen to.
+      console.log(
+        "[AskJobs] dropdown: zero options rendered while searching for",
+        desiredText,
+        "— menuitem count:",
+        deepQueryAll(scopeEl, '[role="menuitem"]').length,
+        "listitem count:",
+        deepQueryAll(scopeEl, '[role="listitem"], li').length,
+      );
       return null;
     }
 
@@ -2721,8 +2999,28 @@
   // dropdown's ACTUAL choices to the AI up front, instead of letting it
   // guess blind and only checking the guess against real options as a
   // fallback once Insert is clicked.
+  // Confirmed real (BambooHR's Fabric UI widget — Gender/Ethnicity/
+  // Disability/State/Highest Education all use it): its real, clickable
+  // rows are role="menuitem" (a plain MUI-style menu), not the ARIA
+  // listbox role="option" every other site handled here uses — checked
+  // only as a fallback, and only once role="option" comes up empty, so a
+  // real listbox elsewhere on the page can't get confused with an
+  // unrelated navigation menu's menuitem rows. See waitForBestMatchingOption
+  // for the same fallback, applied where an option is actually being
+  // matched rather than just listed.
+  async function gatherRealOptionOrMenuItemCandidates(scope, existingOptions) {
+    let candidates = deepQueryAll(scope, '[role="option"]').filter(isRealOptionCandidate);
+    candidates = candidates.filter((o) => !existingOptions.has(o));
+    if (candidates.length === 0) {
+      let menuItems = deepQueryAll(scope, '[role="menuitem"]').filter(isRealOptionCandidate);
+      menuItems = menuItems.filter((o) => !existingOptions.has(o));
+      candidates = menuItems;
+    }
+    return candidates;
+  }
+
   async function gatherComboboxOptions(button) {
-    const existingOptions = new Set(deepQueryAll(null, '[role="option"]'));
+    const existingOptions = new Set(deepQueryAll(null, '[role="option"], [role="menuitem"]'));
     clickComboboxTrigger(button);
 
     const controlsId = button.getAttribute("aria-controls");
@@ -2731,16 +3029,31 @@
     let options = [];
     for (let attempt = 0; attempt < 50; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 100));
-      options = deepQueryAll(scope, '[role="option"]').filter(isRealOptionCandidate);
-      options = options.filter((o) => !existingOptions.has(o));
+      options = await gatherRealOptionOrMenuItemCandidates(scope, existingOptions);
       if (options.length > 0) break;
     }
     if (options.length > 0) {
       await new Promise((resolve) => setTimeout(resolve, 250));
-      const settled = deepQueryAll(scope, '[role="option"]')
-        .filter(isRealOptionCandidate)
-        .filter((o) => !existingOptions.has(o));
+      const settled = await gatherRealOptionOrMenuItemCandidates(scope, existingOptions);
       if (settled.length >= options.length) options = settled;
+    }
+
+    // Confirmed real (same BambooHR widget): the page's OWN menu-
+    // positioning script can throw an uncaught exception while handling
+    // our click, leaving zero items rendered on the first open — a
+    // page-side bug, not something about how the click was dispatched.
+    // One retry (close, reopen, wait again) costs nothing when options
+    // were already found, and gives the page's own script a second,
+    // often-successful attempt when it wasn't.
+    if (options.length === 0) {
+      clickComboboxTrigger(button);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      clickComboboxTrigger(button);
+      for (let attempt = 0; attempt < 50; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        options = await gatherRealOptionOrMenuItemCandidates(scope, existingOptions);
+        if (options.length > 0) break;
+      }
     }
 
     const texts = [...new Set(options.map((o) => o.textContent.trim()).filter(Boolean))];
@@ -2750,7 +3063,7 @@
       labelForField(button) || button.getAttribute("aria-label") || button.id
     );
     if (texts.length === 0) {
-      console.log("[AskJobs] combobox rendered zero role=\"option\" elements on open — this widget may use a different markup shape our scanner doesn't recognize yet");
+      console.log("[AskJobs] combobox rendered zero role=\"option\"/role=\"menuitem\" elements on open — this widget may use a different markup shape our scanner doesn't recognize yet");
     }
     return texts;
   }
@@ -2785,7 +3098,23 @@
 
     const controlsId = button.getAttribute("aria-controls");
     const scope = (controlsId && document.getElementById(controlsId)) || document;
-    const match = await waitForBestMatchingOption(scope, desiredText, fieldLabel, existingOptions);
+    let match = await waitForBestMatchingOption(scope, desiredText, fieldLabel, existingOptions);
+
+    // Confirmed real (BambooHR's Gender/Ethnicity/Disability menu): the
+    // page's OWN menu-positioning script threw an uncaught exception while
+    // handling our click ("t.closest is not a function" inside its own
+    // bundle), leaving the popup with zero rendered items on the first
+    // open — a page-side bug, not something about how the click was
+    // dispatched, so it could just as easily hit a real user's first click
+    // too. One retry (close, reopen, wait again) costs nothing when a
+    // match was already found, and gives the page's own script a second,
+    // often-successful attempt when it wasn't.
+    if (!match) {
+      clickComboboxTrigger(button);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      clickComboboxTrigger(button);
+      match = await waitForBestMatchingOption(scope, desiredText, fieldLabel, existingOptions);
+    }
 
     if (!match) {
       console.log("[AskJobs] combobox: no matching option found (checked existing + AI fallback) for target:", desiredText, "->", fieldLabel);
@@ -2943,6 +3272,84 @@
     );
   }
 
+  // iCIMS's own reusable "styled dropdown" widget (confirmed real via
+  // actual HTML, Johns Hopkins APL: Degree type/Major/School all share it):
+  // the real, form-submitted <select> is visually hidden (class
+  // "dropdown-hide") and paired with a sibling <a role="combobox"
+  // id="<fieldId>_icimsDropdown"> that shows the chosen text, plus a
+  // <ul id="<fieldId>_dropdown-results"> of role="option" <li>s. The real
+  // <select> itself starts with just one empty/legacy <option> and never
+  // gains real ones on its own — fillStructuredField's plain-<select>
+  // branch (which only ever reads field.options) can never find a match
+  // here, so it always failed outright ("Degree type" stayed on "— Make a
+  // Selection —" even though the candidate's actual degree was known).
+  // Confirmed real, serious bug via actual DevTools output ("Duplicate
+  // form field id in the same form"): iCIMS's own DOM rebuild (revealing a
+  // new repeated entry) can leave two different entries' otherwise-
+  // identical widgets sharing the same id. document.getElementById always
+  // resolves to the FIRST matching element in the document regardless of
+  // which entry actually owns the id being asked for — "Is this your
+  // current job?" for one entry could silently open and click inside a
+  // completely different entry's identical-looking Yes/No widget, which
+  // is exactly consistent with the observed symptom (the wrong entry's
+  // dropdown changing, or one entry's dropdown never changing while a
+  // different one's does). Locating the trigger/results elements
+  // relative to `field` itself via direct DOM traversal — the trigger
+  // <a> and results container are always its next two siblings in this
+  // widget's markup — is immune to id collisions anywhere else on the
+  // page, unlike a global id lookup.
+  function isIcimsCustomDropdown(field) {
+    return field.tagName === "SELECT" && !!field.nextElementSibling?.matches('a.dropdown-select[role="combobox"]');
+  }
+
+  // icimsdropdown-search tells us whether typing narrows the list (School/
+  // Major — a large list) or every option is already static in the DOM
+  // (Degree type — a short fixed list) — typing into a search box that
+  // doesn't exist/do anything would just waste the wait time
+  // waitForBestMatchingOption already budgets for real narrowing.
+  async function fillIcimsCustomDropdown(field, desiredText, fieldLabel, { fallbackToOther = false } = {}) {
+    const trigger = field.nextElementSibling;
+    if (!trigger || !trigger.matches('a.dropdown-select[role="combobox"]')) return false;
+    const resultsContainer = trigger.nextElementSibling;
+    closeAnyOpenPopup();
+    // Confirmed real via actual HTML: unlike Workday's widgets (where
+    // role="option" elements only get created once opened, so a
+    // before-open snapshot safely excludes only some OTHER field's
+    // leftover options), this widget's <li role="option">s already exist
+    // in the DOM before opening — merely hidden, not absent. Snapshotting
+    // "existing options" here would exclude the very options we're about
+    // to match against. The dedicated per-field results container
+    // (queried below) already prevents cross-field leakage on its own, so
+    // no exclusion set is needed for this widget at all.
+    clickComboboxTrigger(trigger);
+
+    const searchInput =
+      field.getAttribute("icimsdropdown-search") === "1"
+        ? resultsContainer?.querySelector(".dropdown-search")
+        : null;
+    if (searchInput) typeStringInto(searchInput, searchPrefixFor(desiredText));
+
+    const scope = resultsContainer || document;
+    let match = await waitForBestMatchingOption(scope, desiredText, fieldLabel, null);
+
+    // Institution names especially are often just not in a site's curated
+    // list (confirmed real, Johns Hopkins APL: a candidate's real college
+    // wasn't among this widget's options) — same "Other, Not Listed"
+    // fallback fillMultiselectSearch already uses for this exact case,
+    // opt-in per caller (institution only, via fillStructuredField).
+    if (!match && fallbackToOther && searchInput) {
+      match = await trySelectOtherOption(searchInput, null);
+    }
+
+    if (!match) {
+      closeAnyOpenPopup();
+      return false;
+    }
+    clickMatchedOption(match);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    return true;
+  }
+
   // Same recognize-and-fill flow as fillStructuredSection's plain-field
   // loop, applied to combobox trigger buttons instead of input/select/
   // textarea elements.
@@ -2962,6 +3369,16 @@
       if (!key) {
         console.log("[AskJobs] combobox not recognized:", fieldLabel);
         recordResult("skipped", fieldLabel, "Not recognized as a known field");
+        continue;
+      }
+      // Same reasoning as fillStructuredField's isComboboxField branch: a
+      // raw date value was seen typed as search text into an
+      // aria-haspopup="listbox" element that classified as startDate/
+      // endDate — real date sub-controls (Month/Day/Year) aren't this
+      // widget shape, so nothing legitimate is ever lost by refusing to
+      // search a dropdown's options for a raw timestamp.
+      if (key === "startDate" || key === "endDate") {
+        console.log("[AskJobs] combobox recognized as", key, "but a date can't be filled via option search — skipping:", fieldLabel);
         continue;
       }
 
@@ -2986,7 +3403,20 @@
   // fallbacks instead of being silently locked out.
   async function fillStructuredSection(container, matchers, entryData) {
     if (!container || !entryData) return;
-    const fields = container.querySelectorAll("input, select, textarea");
+    // Confirmed real, serious bug via actual logs (Johns Hopkins APL's
+    // iCIMS form): findSectionContainer's own validation
+    // (isPlausibleSectionContainer) counts fields in this exact container
+    // via deepQueryAll and correctly found 15/18/29 real fields — proof
+    // the container itself is right — but this line used a plain
+    // container.querySelectorAll, which found ZERO for the very same
+    // container reference. Every education/experience field on this
+    // site sat unreachable behind that gap: the loop below had nothing to
+    // iterate, so no structured field (Degree type, Major, company,
+    // dates, ...) was ever even attempted, regardless of how correct the
+    // per-field fill logic was. deepQueryAll is what the container was
+    // already validated against, so using it here too is what actually
+    // keeps discovery and filling consistent.
+    const fields = deepQueryAll(container, "input, select, textarea");
     console.log("[AskJobs] structured section: scanning", fields.length, "field(s) with entry data", entryData);
 
     for (const field of fields) {
@@ -3020,7 +3450,12 @@
       // Leave a still-current entry's end date alone rather than guessing.
       if (key === "endDate" && entryData.current) continue;
 
-      const value = entryData[key];
+      // entryData has no literal "isCurrentJob" property — the underlying
+      // data is the plain boolean entryData.current, answered as an
+      // explicit Yes/No either way (unlike every other key here, where no
+      // data on file means leaving the field alone, "No" for a past
+      // position is a real, known answer worth filling in, not a guess).
+      const value = key === "isCurrentJob" ? (entryData.current ? "Yes" : "No") : entryData[key];
       if (value === undefined || value === null || value === "") {
         console.log("[AskJobs] structured field recognized as", key, "but no data for it:", fieldLabel);
         recordResult("skipped", fieldLabel, `Recognized as "${key}" but no data on file`);
@@ -3095,6 +3530,15 @@
   function getRepeatedEntryContainers(container) {
     let entryContainers = Array.from(container.querySelectorAll(':scope > [role="group"]'));
     if (entryContainers.length === 0) {
+      // iCIMS's own repeated-entry convention (confirmed real via actual
+      // HTML, Johns Hopkins APL): each entry is a
+      // <div class="iCIMS_CollectionContainer CandProfileFields.Education-
+      // N-Container">, no [role="group"] and no <li> at all. Checked before
+      // the generic <li> fallback below since it's a specific, reliable
+      // signal wherever it applies.
+      entryContainers = Array.from(container.querySelectorAll('[class*="iCIMS_CollectionContainer"]'));
+    }
+    if (entryContainers.length === 0) {
       // Breezy-style repeated entries: <ul><li ng-repeat="...">...</li></ul>,
       // no [role="group"] wrapper at all. Falling through to the shared
       // container for every entry index re-scanned ALL entries built so
@@ -3103,7 +3547,58 @@
       // 1 and entry 2, because entry 2's pass re-scanned entry 1's still-
       // unfilled fields against entry 2's data too. A <li> is this site's
       // real per-entry boundary, same role [role="group"] plays elsewhere.
-      entryContainers = Array.from(container.querySelectorAll("li"));
+      //
+      // Confirmed real, serious bug (Johns Hopkins APL's iCIMS form): a
+      // bare "li" selector with no further qualification ALSO matches
+      // every role="option" <li> inside any custom dropdown's results list
+      // anywhere within this container (School/Degree/Major's own
+      // "— Make a Selection —"/"Other, Not Listed" items, etc.) — a
+      // section with several such dropdowns produced dozens of these (61,
+      // then 122 across reruns as more options loaded), and the first TWO
+      // got treated as "the 2 real education entries": tiny, fieldless
+      // <li>s that made every subsequent structured-field scan find 0
+      // fields no matter how correct the actual fill logic was.
+      // role="option" is never a legitimate repeated-entry boundary on any
+      // site this file supports, so excluding it is always safe.
+      entryContainers = Array.from(container.querySelectorAll("li")).filter((li) => li.getAttribute("role") !== "option");
+    }
+    // Confirmed real via actual HTML (Johns Hopkins APL's iCIMS form):
+    // clicking "Add" to reveal a new entry inserted its DOM node BEFORE an
+    // existing later entry instead of appending it at the very end — the
+    // entry the page itself displays as "Work Experience (3)" sat, in raw
+    // DOM/query order, ahead of the one displayed as "Work Experience
+    // (2)". Relying on query order alone silently swapped which
+    // candidate's data landed where (T-Mobile's data went into the box
+    // labeled "(2)", Commerce Bank's into the box labeled "(3)"). iCIMS's
+    // own data-index attribute (present on every field row within an
+    // entry, and what the "(N)" legend text is itself built from) is
+    // reliable, so sorting by it corrects for DOM order not matching
+    // display order. Only reorders when EVERY entry has one, so sites
+    // without this attribute keep their original (already-correct) order.
+    // Confirmed real via actual console output: a nested [data-index]
+    // element isn't reliably found on every entry (one real run returned
+    // NaN for every entry, silently falling back to raw — wrong — DOM
+    // order with no indication anything had failed). Each entry's own
+    // <legend> directly contains its visible "(N)" label ("Work
+    // Experience (2)", "Education - For dual majors... (1)") — the exact
+    // text already shown on the page — so reading N from there is tied to
+    // something guaranteed to exist and visibly correct, rather than an
+    // internal attribute on some arbitrary descendant.
+    const withIndex = entryContainers.map((el) => {
+      const legendText = el.querySelector("legend")?.textContent || "";
+      const match = legendText.match(/\((\d+)\)/);
+      return { el, index: match ? Number(match[1]) : NaN };
+    });
+    if (withIndex.some((e) => !Number.isNaN(e.index))) {
+      // NaN entries (no parseable "(N)" found) sort to the end rather than
+      // aborting the whole reorder — partial, correct-where-possible
+      // ordering beats an all-or-nothing fallback to raw DOM order.
+      withIndex.sort((a, b) => {
+        if (Number.isNaN(a.index)) return 1;
+        if (Number.isNaN(b.index)) return -1;
+        return a.index - b.index;
+      });
+      entryContainers = withIndex.map((e) => e.el);
     }
     return entryContainers;
   }
@@ -3111,40 +3606,84 @@
   async function fillRepeatedEntries(container, matchers, entries, sectionLabel) {
     if (!container || !entries?.length) return;
 
-    for (let i = 0; i < entries.length; i++) {
-      let entryContainers = getRepeatedEntryContainers(container);
-
-      // Only click "Add" when there genuinely aren't enough slots yet for
-      // this index — confirmed real, serious bug: this used to click "Add"
-      // unconditionally on every single call, with no check for how many
-      // entry slots already existed. A form that reveals new fields between
-      // fill passes (RTX/Phenom's "New fields detected — click Fill again")
-      // got re-run more than once, and each run clicked "Add" again on top
-      // of what a PREVIOUS run had already built — 3 real experiences
-      // became 5 duplicate slots, 2 educations became 3. Once the slot
-      // count drifted from the real entry count, entries[i] no longer lined
-      // up with the right entryContainers[i], so one entry's data (e.g.
-      // Field of Study) landed in a completely different entry's slot —
-      // and since an already-filled field is never revisited, there was no
-      // way for a later run to self-correct it.
-      if (i >= entryContainers.length) {
-        // Same broader selector as revealFirstEntryIfNeeded — an "Add"
-        // control is just as often an <a>/[role='button'] as a real
-        // <button> (confirmed real on Breezy: "Add Education"/"Add
-        // Position" are both plain <a> links), and this search was missing
-        // that, silently stopping after the first entry on any such site.
-        const addButton = Array.from(container.querySelectorAll("button, a, [role='button']")).find((el) =>
-          /\badd\b/i.test((el.textContent || "").trim())
-        );
-        if (!addButton) {
-          console.log(`[AskJobs] ${sectionLabel}: no 'Add' button found for entry ${i + 1} of ${entries.length} — stopping`);
-          break;
-        }
-        addButton.click();
-        await new Promise((resolve) => setTimeout(resolve, 400));
-        entryContainers = getRepeatedEntryContainers(container);
+    // Confirmed real, serious bug: this used to click "Add" unconditionally
+    // on every single call, with no check for how many entry slots already
+    // existed. A form that reveals new fields between fill passes (RTX/
+    // Phenom's "New fields detected — click Fill again") got re-run more
+    // than once, and each run clicked "Add" again on top of what a
+    // PREVIOUS run had already built — 3 real experiences became 5
+    // duplicate slots, 2 educations became 3. Once the slot count drifted
+    // from the real entry count, entries[i] no longer lined up with the
+    // right entryContainers[i], so one entry's data (e.g. Field of Study)
+    // landed in a completely different entry's slot — and since an
+    // already-filled field is never revisited, there was no way for a
+    // later run to self-correct it.
+    //
+    // Confirmed real, serious bug (Johns Hopkins APL's iCIMS form): every
+    // needed "Add" click now happens FIRST, before any entry's data is
+    // filled — previously they were interleaved (fill entry 1, fill entry
+    // 2, click Add for entry 3, fill entry 3), and clicking "Add" can
+    // trigger the site's own JS to re-render the WHOLE repeated section,
+    // not just append the new slot. An earlier entry's already-clicked
+    // custom-dropdown selection ("Is this your current job?") got silently
+    // reverted by a LATER entry's Add-triggered re-render — the fill
+    // itself succeeded and was correctly recorded in the moment, but nothing
+    // was left to notice the subsequent rebuild undoing it, since the
+    // fields it wiped were never revisited by a later iteration. Revealing
+    // every slot up front means all of that DOM churn happens before any
+    // filling starts.
+    let entryContainers = getRepeatedEntryContainers(container);
+    // Confirmed real, serious bug: this loop has no bound of its own other
+    // than "until enough slots exist" — if a click doesn't actually grow
+    // entryContainers (e.g. Johns Hopkins APL's iCIMS form CSP-blocks the
+    // "Add" link's javascript: href navigation, and whatever else its
+    // onclick was supposed to do doesn't reliably fire either), the
+    // condition can never become true and this hangs forever, silently
+    // blocking every await'd call after it — including the generic field
+    // loop (Name, Resume, ...) that runs later in the same fill pass,
+    // which is why NOTHING past this point ever got touched. Capping
+    // attempts at entries.length (the same implicit bound the previous,
+    // per-index version of this loop always had) guarantees this can
+    // never run away — a genuinely broken "Add" control still gets caught
+    // by the "no more slots growing" case below and reported, instead of
+    // hanging the whole fill.
+    for (let attempt = 0; entryContainers.length < entries.length && attempt < entries.length; attempt++) {
+      // Same broader selector as revealFirstEntryIfNeeded — an "Add"
+      // control is just as often an <a>/[role='button'] as a real
+      // <button> (confirmed real on Breezy: "Add Education"/"Add
+      // Position" are both plain <a> links), and this search was missing
+      // that, silently stopping after the first entry on any such site.
+      //
+      // Confirmed real, serious bug via actual HTML (Johns Hopkins APL's
+      // iCIMS form): once a repeated section already has entries, EACH
+      // entry carries its OWN "Add More" control — older ones get hidden
+      // (a NoDisplay-style class) once superseded by a newer entry, but
+      // stay in the DOM rather than being removed. Unlike
+      // revealFirstEntryIfNeeded (only ever called with ZERO existing
+      // entries, where no stale button can exist yet), this loop runs
+      // with entries already present, so an unfiltered .find() picks up
+      // the FIRST matching "Add" text in document order — an old,
+      // hidden, no-longer-live button belonging to an earlier entry —
+      // instead of the current last entry's own live one. Filtering to
+      // visible elements only avoids clicking a stale control.
+      const addButton = Array.from(container.querySelectorAll("button, a, [role='button']")).find(
+        (el) => /\badd\b/i.test((el.textContent || "").trim()) && isVisible(el)
+      );
+      if (!addButton) {
+        console.log(`[AskJobs] ${sectionLabel}: no 'Add' button found for entry ${entryContainers.length + 1} of ${entries.length} — stopping`);
+        break;
       }
+      const countBeforeClick = entryContainers.length;
+      addButton.click();
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      entryContainers = getRepeatedEntryContainers(container);
+      if (entryContainers.length === countBeforeClick) {
+        console.log(`[AskJobs] ${sectionLabel}: clicking 'Add' didn't reveal a new entry (still ${entryContainers.length}) — stopping`);
+        break;
+      }
+    }
 
+    for (let i = 0; i < entries.length; i++) {
       const entryContainer = entryContainers[i] || container;
       await fillStructuredSection(entryContainer, matchers, entries[i]);
     }
@@ -3254,7 +3793,7 @@
         const optionTexts = groupRadios.map((r) => (labelForField(r) || r.value || "").trim()).filter(Boolean);
         const suggestion = await resolveOptionMatch(
           rawQuestionText,
-          jobPreferences?.disabilityStatus,
+          eeoDisabilityText(),
           optionTexts,
           bestDisabilityOptionText(optionTexts),
         );
@@ -3263,12 +3802,12 @@
             const target = groupRadios.find((r) => (labelForField(r) || r.value || "").trim() === suggestion);
             if (target) {
               setNativeChecked(target);
-              recordResult("filled", rawQuestionText, `${suggestion} (from your Settings, reviewed)`);
+              recordResult("filled", rawQuestionText, `${suggestion} (from the candidate's EEO profile, reviewed)`);
             }
           });
-          recordResult("skipped", rawQuestionText, "Suggested from your Settings — review above and click Insert");
+          recordResult("skipped", rawQuestionText, "Suggested from the candidate's EEO profile — review above and click Insert");
         } else {
-          recordResult("skipped", rawQuestionText, "Voluntary demographic question — set a disability status in Settings to get a suggestion, or answer directly");
+          recordResult("skipped", rawQuestionText, "Voluntary demographic question — no disability status set in the candidate's EEO profile, please answer directly");
         }
         continue;
       }
@@ -3341,7 +3880,14 @@
     // inside a shadow root — so the selector also matches any
     // role="combobox" element generically, not just Workday's button
     // shape.
-    const buttons = deepQueryAll(root, 'button[aria-haspopup="listbox"], [role="combobox"]');
+    // Confirmed real (BambooHR's Fabric UI widget — Gender/Ethnicity/
+    // Disability/State/Country all use it): the button uses the bare,
+    // older-spec aria-haspopup="true" instead of "listbox", and carries no
+    // role="combobox" either — invisible to both patterns above. Its class
+    // name (fab-SelectToggle) is the only reliable signal, since its paired
+    // real <select> is an aria-hidden decoy with zero options (see
+    // fillField's early skip for aria-hidden selects).
+    const buttons = deepQueryAll(root, 'button[aria-haspopup="listbox"], [role="combobox"], button.fab-SelectToggle[aria-haspopup]');
     console.log("[AskJobs] generic comboboxes: found", buttons.length, "button(s) on this page");
 
     for (const button of buttons) {
@@ -3404,16 +3950,16 @@
 
       if (isDisabilityQuestion(questionText)) {
         attemptedSignatures.add(signature);
-        const stored = jobPreferences?.disabilityStatus;
+        const stored = eeoDisabilityText();
         console.log("[AskJobs] generic combobox recognized as disability status, stored value:", stored, "->", fieldLabel);
         if (stored) {
           renderStoredValueSuggestion(fieldLabel, stored, async () => {
             const result = await fillCustomComboboxBestEffort(button, stored, fieldLabel);
-            recordResult(result.filled ? "filled" : "skipped", fieldLabel, result.filled ? `${result.value} (from your Settings, reviewed)` : "Couldn't find a matching option");
+            recordResult(result.filled ? "filled" : "skipped", fieldLabel, result.filled ? `${result.value} (from the candidate's EEO profile, reviewed)` : "Couldn't find a matching option");
           });
-          recordResult("skipped", fieldLabel, "Suggested from your Settings — review above and click Insert");
+          recordResult("skipped", fieldLabel, "Suggested from the candidate's EEO profile — review above and click Insert");
         } else {
-          recordResult("skipped", fieldLabel, "Voluntary demographic question — set a disability status in Settings to get a suggestion, or answer directly");
+          recordResult("skipped", fieldLabel, "Voluntary demographic question — no disability status set in the candidate's EEO profile, please answer directly");
         }
         continue;
       }
@@ -4116,7 +4662,11 @@
   // check has to run before collectUnansweredQuestions treats a text input
   // as free text).
   function isComboboxField(field) {
-    return field.matches('[role="combobox"]') || field.getAttribute("aria-haspopup") === "listbox";
+    return (
+      field.matches('[role="combobox"]') ||
+      field.getAttribute("aria-haspopup") === "listbox" ||
+      field.matches("button.fab-SelectToggle[aria-haspopup]")
+    );
   }
 
   // Confirmed real, from a live screening-questions pass: "Please choose
@@ -4239,7 +4789,7 @@
       });
     }
 
-    const comboButtons = deepQueryAll(root, 'button[aria-haspopup="listbox"], [role="combobox"]');
+    const comboButtons = deepQueryAll(root, 'button[aria-haspopup="listbox"], [role="combobox"], button.fab-SelectToggle[aria-haspopup]');
     for (const button of comboButtons) {
       if (button.disabled) continue;
       const signature = fieldSignature(button);
@@ -4726,7 +5276,24 @@
             if (option) {
               item.field.value = option.value;
               item.field.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-              recordResult("filled", item.questionText, `${finalValue} (AI-answered from resume, reviewed)`);
+              // Confirmed real (Johns Hopkins APL's iCIMS form): a select
+              // the site never pre-filled server-side ("Did you
+              // graduate?", unlike Country/State which arrive with
+              // selected="selected" from its own resume parser) was seen
+              // reverting to unselected sometime after being set purely
+              // client-side — reported "filled" regardless, giving no
+              // indication the value hadn't actually stuck. A short
+              // settle delay before checking catches an IMMEDIATE revert
+              // (a slower one, minutes later, isn't something a one-time
+              // check here can ever catch — that's a real limitation of
+              // this site's own re-validation behavior, not something
+              // fixable from an insert-time check alone).
+              await new Promise((resolve) => setTimeout(resolve, 150));
+              if (item.field.value === option.value) {
+                recordResult("filled", item.questionText, `${finalValue} (AI-answered from resume, reviewed)`);
+              } else {
+                recordResult("skipped", item.questionText, "Selected, but the page reverted it — please set it manually");
+              }
             } else {
               recordResult("skipped", item.questionText, "Couldn't find a matching option");
             }
@@ -4892,8 +5459,6 @@
       // like any other candidate profile field, defaulting true only
       // because that's the schema's own default absent explicit review.
       willingToRelocate: typeof profile.openToRelocate === "boolean" ? profile.openToRelocate : undefined,
-      disabilityStatus:
-        eeo.disability === "yes" ? "yes" : eeo.disability === "no" ? "no" : eeo.disability === "decline_to_answer" ? "prefer not to say" : undefined,
     };
 
     // Skills are needed broadly and early (the Skills field can appear on
@@ -4995,6 +5560,29 @@
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
     pendingHandoff = handoffResult?.pendingHandoff || null;
+    // Confirmed real, serious concern: a tab-bound handoff is deliberately
+    // long-lived so it survives a multi-page ATS wizard (this exact iCIMS
+    // form navigates across several page loads during one application) —
+    // but that same persistence means a candidate picked for one
+    // application, then forgotten, could resurface and silently offer
+    // their data on a LATER, unrelated visit to the same tab, with no
+    // fresh selection ever made for that visit.
+    //
+    // Confirmed real, serious regression from an earlier, too-aggressive
+    // version of this same check: a 1-HOUR cutoff invalidated a candidate
+    // still being actively used mid-testing-session — a real application
+    // (or a real multi-page debugging/testing pass over one) can easily
+    // run longer than an hour of wall-clock time without ever having gone
+    // stale, and this silently broke EVERY autofill on the page (nothing
+    // downstream of init() ever ran) with no obvious cause from the UI
+    // alone. 24 hours still catches a genuinely forgotten/abandoned
+    // handoff from a past, unrelated day without ever interfering with an
+    // actual same-day session, however long it runs.
+    const HANDOFF_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+    if (pendingHandoff && Date.now() - (pendingHandoff.receivedAt || 0) > HANDOFF_MAX_AGE_MS) {
+      console.log("[AskJobs] pending handoff is more than 24 hours old — treating as stale/expired:", pendingHandoff);
+      pendingHandoff = null;
+    }
     console.log("[AskJobs] pending handoff:", pendingHandoff);
 
     // Unlike OG (any logged-in user can autofill their own profile), every

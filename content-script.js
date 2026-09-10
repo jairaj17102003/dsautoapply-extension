@@ -1974,6 +1974,7 @@
       // correct value that's already in the field.
       await fillEducationAndExperience();
       await fillCertifications();
+      await fillLanguages();
       await fillWebsites();
 
       const fields = deepQueryAll(root, "input, select, textarea");
@@ -1986,8 +1987,8 @@
         // popup) silently skipped every field it had ever looked at before,
         // even ones still empty because they failed the first time (no data,
         // no matching <option>, not yet classified) — confirmed real: only
-        // fillWebsites()/fillEducationAndExperience()/fillCertifications()
-        // above, which never had this gate, actually re-ran on a second
+        // fillWebsites()/fillEducationAndExperience()/fillCertifications()/
+        // fillLanguages() above, which never had this gate, actually re-ran on a second
         // click. fillField()'s own attemptedSignatures + field.value checks
         // already prevent clobbering anything genuinely already filled or
         // edited by hand, so this loop doesn't need a second, cruder gate on
@@ -2362,11 +2363,45 @@
   // so it fits the same entries-array shape fillRepeatedEntries expects.
   const WEBSITE_FIELD_MATCHERS = [{ key: "url", patterns: ["website", "url", "link"] }];
 
+  // "language" alone would also match "Proficiency" fields on some sites
+  // that phrase it as "Language Proficiency" — checked second so the more
+  // specific "proficiency"/"fluency"/"level" patterns get first refusal,
+  // same ordering reason CERTIFICATION_FIELD_MATCHERS' more specific keys
+  // come before its bare "name" pattern above.
+  const LANGUAGE_FIELD_MATCHERS = [
+    { key: "proficiency", patterns: ["proficiency", "fluency", "level", "skill level"] },
+    { key: "language", patterns: ["language", "language name"] },
+  ];
+
+  // Candidate.model.js stores proficiency as a fixed enum
+  // (basic/conversational/fluent/native) — real ATS proficiency dropdowns
+  // word this every possible way ("Native or Bilingual", "Full
+  // Professional", "Elementary"...), so this maps to plain, commonly-used
+  // English words instead and lets the existing option-matching heuristics
+  // (comboboxTextsMatch, normalize+includes) find the closest real option,
+  // rather than inventing a hardcoded synonym table for wording no
+  // confirmed-real form has been seen using yet.
+  function languageProficiencyText(proficiency) {
+    switch (proficiency) {
+      case "native":
+        return "Native";
+      case "fluent":
+        return "Fluent";
+      case "conversational":
+        return "Conversational";
+      case "basic":
+        return "Basic";
+      default:
+        return null;
+    }
+  }
+
   const SECTION_PATTERNS = {
     education: ["education", "academic background", "qualifications"],
     experience: ["work experience", "employment", "professional experience", "experience"],
     certifications: ["certifications", "certification", "licenses", "credentials"],
     websites: ["websites", "website", "personal links"],
+    languages: ["languages", "language"],
   };
 
   // Word-boundary match, not plain substring — needed for short/ambiguous
@@ -2588,7 +2623,7 @@
   // the primary resume-upload slot from being confused with a per-entry
   // file input scoped to just one entry (see fillField's file-type branch).
   function isInsideRepeatedEntrySection(field) {
-    return ["education", "experience", "certifications", "websites"].some((key) => findSectionContainer(key)?.contains?.(field));
+    return ["education", "experience", "certifications", "websites", "languages"].some((key) => findSectionContainer(key)?.contains?.(field));
   }
 
   async function fillStructuredField(field, value, fieldLabel, key) {
@@ -3464,11 +3499,20 @@
     // shouldn't show as generic "Unlabeled field" in the sidebar when the
     // placeholder text is right there and already used to classify it.
     const fieldLabel = labelForField(field) || field.getAttribute("aria-label") || field.name || field.id || field.getAttribute("placeholder") || "Unlabeled field";
-      if (field.disabled || field.type === "hidden" || field.value) continue;
+      // Confirmed real (Workday's "I currently work here" checkbox): a
+      // checkbox's `.value` is the OPTION's value attribute ("on" by
+      // default when none is set), not whether it's checked — truthy
+      // regardless of check state. The plain `field.value` skip below used
+      // to silently discard every checkbox in a structured section before
+      // it ever reached the dedicated checkbox-handling block right after
+      // it, making that block permanently unreachable for any checkbox
+      // with a non-empty default value (i.e. nearly all of them).
+      if (field.disabled || field.type === "hidden" || (field.type !== "checkbox" && field.value)) continue;
       const signature = fieldSignature(field);
       if (attemptedSignatures.has(signature)) continue;
 
       if (field.type === "checkbox") {
+        if (field.checked) continue;
         const label = normalize(labelForField(field) || field.getAttribute("aria-label") || "");
         if (entryData.current && CURRENT_POSITION_PATTERNS.some((p) => matchesWholeWord(label, p))) {
           attemptedSignatures.add(signature);
@@ -3496,11 +3540,28 @@
       if (value === undefined || value === null || value === "") {
         console.log("[AskJobs] structured field recognized as", key, "but no data for it:", fieldLabel);
         recordResult("skipped", fieldLabel, `Recognized as "${key}" but no data on file`);
+        // Confirmed real bug (Workday): a job entry's own empty Location
+        // field, left unmarked here, was still untouched by the time the
+        // generic top-level per-field loop ran afterward — which has its
+        // OWN much looser bare "location" FIELD_MATCHER, mapped to
+        // profile.address (the candidate's HOME address, a completely
+        // different field meant for the page-level "Your Address"
+        // question). The generic loop happily "recognized" and filled it
+        // with the wrong value. Once classifyStructured has claimed a
+        // field for this structured key, the generic loop must never get
+        // a second, wrongly-scoped shot at it — whether or not there was
+        // real data to fill it with.
+        attemptedSignatures.add(signature);
         continue;
       }
 
+      // Marked attempted on failure too, same reasoning as the no-data
+      // branch above — a fill attempt that failed to stick is still a
+      // structured-section field, and must never fall through to the
+      // generic top-level scan's differently-scoped (and often wrong)
+      // matcher for the same-sounding label.
+      attemptedSignatures.add(signature);
       if (await fillStructuredField(field, value, fieldLabel, key)) {
-        attemptedSignatures.add(signature);
         recordResult("filled", fieldLabel, String(value));
         console.log("[AskJobs] structured field filled:", key, "=", value, "->", fieldLabel);
       } else {
@@ -3749,6 +3810,18 @@
     console.log("[AskJobs] certifications section container found?", !!container, container);
     await revealFirstEntryIfNeeded(container);
     await fillRepeatedEntries(container, CERTIFICATION_FIELD_MATCHERS, profile.certifications, "certifications");
+  }
+
+  async function fillLanguages() {
+    if (!profile?.languages?.length) return;
+    const container = findSectionContainer("languages");
+    console.log("[AskJobs] languages section container found?", !!container, container);
+    await revealFirstEntryIfNeeded(container);
+    const entries = profile.languages.map((l) => ({
+      language: l.language,
+      proficiency: languageProficiencyText(l.proficiency),
+    }));
+    await fillRepeatedEntries(container, LANGUAGE_FIELD_MATCHERS, entries, "languages");
   }
 
   async function fillWebsites() {

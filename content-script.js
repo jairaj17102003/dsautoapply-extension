@@ -66,6 +66,21 @@
       // candidate's addressCountry value.
       excludePatterns: ["phone code", "country code", "citizenship"],
     },
+    // Distinct from addressCountry above — a legal-status question ("are
+    // you a citizen of...", "country of citizenship"), not a residence
+    // question. addressCountry explicitly excludes "citizenship" so the two
+    // never fight over the same field.
+    { key: "citizenshipCountry", patterns: ["citizenship", "country of citizenship", "citizen of"] },
+    // Free text on the profile — matched against however a given ATS
+    // phrases it, same pattern-list approach as everything else here.
+    { key: "expectedSalary", patterns: ["expected salary", "desired salary", "salary expectation", "salary expectations", "compensation expectation", "compensation expectations"] },
+    // Deliberately NOT matching "available to start"/"date available" —
+    // isStartDateQuestion already owns that phrasing for the "suggest
+    // today's date" default, and some ATS forms genuinely want a DATE
+    // there, not a notice-period phrase like "2 weeks". Scoped to
+    // unambiguous "notice period" wording only, to avoid fighting over
+    // the same field.
+    { key: "noticePeriod", patterns: ["notice period", "notice required"] },
     { key: "location", patterns: ["location"] },
     { key: "linkedin", patterns: ["linkedin"] },
     { key: "portfolio", patterns: ["portfolio", "website", "personal site"] },
@@ -378,6 +393,14 @@
       !normalizedQuestionText.includes("country code") &&
       !normalizedQuestionText.includes("citizenship")
     );
+  }
+
+  // The category isCountryQuestion deliberately excludes — a legal-status
+  // question ("are you a citizen of...", "country of citizenship"), not a
+  // residence question, so it needs its own stored field
+  // (profile.citizenshipCountry) rather than reusing addressCountry.
+  function isCitizenshipQuestion(normalizedQuestionText) {
+    return normalizedQuestionText.includes("citizenship") || normalizedQuestionText.includes("citizen of");
   }
 
   // Confirmed real across MULTIPLE, wildly different ATS platforms
@@ -801,6 +824,12 @@
         return profile.certifications?.length
           ? profile.certifications.map((c) => c.name).filter(Boolean).join(", ") || null
           : null;
+      case "citizenshipCountry":
+        return profile.citizenshipCountry || null;
+      case "expectedSalary":
+        return profile.expectedSalary || null;
+      case "noticePeriod":
+        return profile.noticePeriod || null;
       default:
         return null;
     }
@@ -3966,7 +3995,14 @@
 
       if (isCountryQuestion(questionText)) {
         attemptedSignatures.add(signature);
-        const stored = profile?.address?.country;
+        // Confirmed real bug: this read profile?.address?.country, but
+        // `address` is the flat free-text address STRING field
+        // (Candidate.model.js) — country lives at the top-level
+        // addressCountry field instead, same as valueForKey("addressCountry")
+        // already reads it correctly. `.country` on a string is always
+        // undefined, so this suggestion silently never appeared for any
+        // custom-combobox-shaped Country field, even with real data set.
+        const stored = profile?.addressCountry;
         console.log("[AskJobs] generic combobox recognized as country, stored value:", stored, "->", fieldLabel);
         if (stored) {
           renderStoredValueSuggestion(fieldLabel, stored, async () => {
@@ -3976,6 +4012,22 @@
           recordResult("skipped", fieldLabel, "Suggested from your profile — review above and click Insert");
         } else {
           recordResult("skipped", fieldLabel, "Recognized as a country field, but no country set in your profile — please answer directly");
+        }
+        continue;
+      }
+
+      if (isCitizenshipQuestion(questionText)) {
+        attemptedSignatures.add(signature);
+        const stored = profile?.citizenshipCountry;
+        console.log("[AskJobs] generic combobox recognized as citizenship, stored value:", stored, "->", fieldLabel);
+        if (stored) {
+          renderStoredValueSuggestion(fieldLabel, stored, async () => {
+            const result = await fillCustomComboboxBestEffort(button, stored, fieldLabel);
+            recordResult(result.filled ? "filled" : "skipped", fieldLabel, result.filled ? `${result.value} (from your profile, reviewed)` : "Couldn't find a matching option");
+          });
+          recordResult("skipped", fieldLabel, "Suggested from your profile — review above and click Insert");
+        } else {
+          recordResult("skipped", fieldLabel, "Recognized as a citizenship question, but no citizenship country set in your profile — please answer directly");
         }
         continue;
       }
@@ -4824,7 +4876,8 @@
         isSensitiveSelfIdQuestion(normalizedLabel) ||
         isGenderIdentityQuestion(normalizedLabel) ||
         isDisabilityQuestion(normalizedLabel) ||
-        isCountryQuestion(normalizedLabel)
+        isCountryQuestion(normalizedLabel) ||
+        isCitizenshipQuestion(normalizedLabel)
       ) continue;
 
       const options = await gatherComboboxOptions(button);

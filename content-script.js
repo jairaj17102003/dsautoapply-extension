@@ -68,9 +68,18 @@
       patterns: ["country"],
       // "Country Phone Code"/"Country Code" belong to the phone dial-code
       // selector, not an address; "Country of Citizenship" is a distinct,
-      // more sensitive legal-status question. Neither should get the
-      // candidate's addressCountry value.
-      excludePatterns: ["phone code", "country code", "citizenship"],
+      // more sensitive legal-status question. Confirmed real (Nelnet's
+      // Workday form): "Are you eligible to work in the country for which
+      // you are applying?" is a plain work-authorization Yes/No question
+      // that happens to contain the bare word "country" too — without this
+      // exclusion, classify() (which runs before fillScreeningSelect ever
+      // gets a look at the field) claimed it as an addressCountry field and
+      // tried to match the candidate's actual country name against a
+      // Yes/No-only option list, instead of ever reaching the real
+      // workAuthorized logic (see RADIO_MATCHERS' matching "eligible to
+      // work" pattern). None of these should get the candidate's
+      // addressCountry value.
+      excludePatterns: ["phone code", "country code", "citizenship", "eligible to work"],
     },
     // Distinct from addressCountry above — a legal-status question ("are
     // you a citizen of...", "country of citizenship"), not a residence
@@ -145,7 +154,15 @@
       // around being UNDER 18 or mentions a work permit specifically.
       excludePatterns: ["under 18", "work permit"],
     },
-    { key: "workAuthorized", patterns: ["authorized to work", "legally authorized", "work authorization", "legally eligible to work"] },
+    // Confirmed real (Nelnet's Workday form): "Are you eligible to work in
+    // the country for which you are applying?" and "Upon hire, can you
+    // furnish proof you are eligible to work in the country for which
+    // you're applying?" both phrase this as bare "eligible to work",
+    // without "legally" — neither matched any of the other patterns here,
+    // so both fell through unrecognized (and one of them then got wrongly
+    // hijacked by classify()'s own bare "country" addressCountry matcher —
+    // see its excludePatterns for the fix on that side).
+    { key: "workAuthorized", patterns: ["authorized to work", "legally authorized", "work authorization", "legally eligible to work", "eligible to work"] },
     { key: "visaSponsorshipNeeded", patterns: ["sponsorship", "sponsor your employment", "require sponsorship"] },
     { key: "willingToRelocate", patterns: ["willing to relocate", "relocation"] },
     {

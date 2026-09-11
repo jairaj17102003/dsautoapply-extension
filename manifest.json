@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "AskJobs Consultant — Apply with Autofill",
+  "name": "AskJobs Recruiter — Apply with Autofill",
   "version": "0.1.0",
-  "description": "Autofill job application forms using a candidate's profile and their AI-optimized resume, for consultants applying on their behalf.",
+  "description": "Autofill job application forms using a candidate's profile and their AI-optimized resume, for recruiters applying on their behalf.",
   "action": {
     "default_popup": "popup.html",
     "default_title": "AskJobs Autofill"

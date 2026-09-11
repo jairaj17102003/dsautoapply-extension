@@ -1380,7 +1380,7 @@
   // for its on-demand version.
   async function generateAndSuggestCoverLetter(field, fieldLabel) {
     if (!pendingHandoff?.candidateId) {
-      recordResult("skipped", fieldLabel, 'Only available when applying via "Apply with Autofill" from the Consultant app');
+      recordResult("skipped", fieldLabel, 'Only available when applying via "Apply with Autofill" from the Recruiter app');
       return;
     }
 

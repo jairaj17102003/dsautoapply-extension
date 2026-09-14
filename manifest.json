@@ -140,7 +140,8 @@
     "https://careers.teradata.com/*",
 
     "http://localhost:4000/*",
-    "https://firebasestorage.googleapis.com/*"
+    "https://firebasestorage.googleapis.com/*",
+    "https://storage.googleapis.com/*"
   ],
   "optional_host_permissions": ["<all_urls>"],
   "externally_connectable": {

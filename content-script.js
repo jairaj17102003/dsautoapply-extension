@@ -38,6 +38,17 @@
     { key: "firstName", patterns: ["first name", "firstname", "given name"] },
     { key: "lastName", patterns: ["last name", "lastname", "surname", "family name"] },
     { key: "email", patterns: ["email"] },
+    // Confirmed real (a BrassRing "Create Profile" candidate portal): a
+    // bare "Username" field under its own "Security Information" section,
+    // asking the candidate to set up a login for THAT site — distinct from
+    // both the candidate's regular contact email (above) and their AskJobs
+    // portal login. Excluded from platform-specific "___ username" fields
+    // (GitHub/LinkedIn/etc.), which mean something else entirely.
+    {
+      key: "accountUsername",
+      patterns: ["username", "user name", "user id", "login id", "account username", "create a username", "choose a username"],
+      excludePatterns: ["github username", "linkedin username", "twitter username", "slack username"],
+    },
     {
       key: "phone",
       patterns: ["phone", "mobile", "contact number"],
@@ -100,6 +111,13 @@
     { key: "linkedin", patterns: ["linkedin"] },
     { key: "portfolio", patterns: ["portfolio", "website", "personal site"] },
     { key: "currentJobTitle", patterns: ["current title", "job title", "current role"] },
+    // Confirmed real (Wellfound's "Years of experience" dropdown): computed
+    // ONCE server-side from Candidate.experience whenever it's saved (see
+    // Backend's experienceCalculator.util.js) — deliberately not left for
+    // the AI-answering pass to re-derive from the resume on every single
+    // application, which is exactly what the "AI-answered ... reviewed"
+    // result this replaces was doing every time before.
+    { key: "totalExperience", patterns: ["years of experience", "years experience", "experience level"] },
     { key: "dateOfBirth", patterns: ["date of birth", "birth date", "dob"] },
     { key: "skills", patterns: ["skills", "key skills", "skill set"] },
     // Confirmed real (Johns Hopkins APL's iCIMS form): a bare single text
@@ -117,6 +135,23 @@
     // not a substitute for it — some ATS platforms want the raw text
     // indexed/searchable server-side in addition to the actual file.
     { key: "resumeText", patterns: ["paste your resume", "copy & paste", "copy and paste"] },
+    // Confirmed real (Wellfound's application modal): "Set a Password"/
+    // "Confirm Password" fields that aren't real <input type="password">
+    // elements at all — fillField's dedicated type="password" branch (see
+    // its own comment) never even sees them, so classify() needs its own
+    // fallback for whatever type they actually are. Same accountPassword
+    // key/value as that branch; fillStructuredField-style dedicated
+    // handling below keeps the raw password out of the sidebar's detail
+    // text the same way that branch does.
+    // "password" as a whole word already catches every real-world phrasing
+    // that contains it ("Confirm Password", "Re-enter Password", "Set a
+    // Password", "Password Verification", ...) — passcode/passphrase are
+    // the only genuinely distinct synonyms actually worth listing
+    // separately. Deliberately NOT matching bare "pin"/"code"/"secret" —
+    // those show up for things this file has no business touching (SMS
+    // verification codes, security questions), unlike password, which
+    // realistically never means anything else on a job application.
+    { key: "accountPassword", patterns: ["password", "passcode", "passphrase"] },
     // Confirmed real (Johns Hopkins APL's iCIMS form): a page can have
     // several genuinely different file-upload fields besides the resume
     // itself — "Please upload your transcripts (unofficial is fine)" and
@@ -838,8 +873,15 @@
         return profile.email || null;
       case "phone":
         return profile.phone ? normalizePhoneForFilling(profile.phone) : null;
+      // Confirmed real (Wellfound's "Set Your Location*" — placeholder
+      // "e.g. San Francisco"): a generic "location" field asking for a
+      // single free-text place name means a CITY, not the full mailing
+      // address — addressCity is the more correct answer whenever it's
+      // set, with the flat address string only as a fallback for a
+      // candidate who has that but never filled in the structured
+      // addressCity field specifically.
       case "location":
-        return profile.address || null;
+        return profile.addressCity || profile.address || null;
       case "addressStreet":
         return profile.addressStreet || null;
       case "addressCity":
@@ -856,6 +898,15 @@
         return profile.portfolioUrl || profile.githubUrl || null;
       case "currentJobTitle":
         return profile.currentJobTitle || null;
+      // Rounded to a whole number — real dropdowns overwhelmingly list
+      // whole years ("5 Years", "8 Years"), and the existing generic
+      // SELECT/combobox matching here already does substring matching, so
+      // a bare number string is what actually has a shot at matching one
+      // of those real option texts.
+      case "totalExperience":
+        return typeof profile.totalExperienceYears === "number" && profile.totalExperienceYears > 0
+          ? String(Math.round(profile.totalExperienceYears))
+          : null;
       case "dateOfBirth":
         return profile.dob || null;
       // Confirmed real (Johns Hopkins APL's iCIMS form): a bare single
@@ -874,6 +925,10 @@
         return profile.prefix || null;
       case "resumeText":
         return resumeRawText || null;
+      case "accountUsername":
+        return profile.accountEmail || null;
+      case "accountPassword":
+        return profile.accountPassword || null;
       case "citizenshipCountry":
         return profile.citizenshipCountry || null;
       case "expectedSalary":
@@ -1247,8 +1302,18 @@
     return [];
   }
 
-  async function getResumeFileUrl() {
-    if (resumeFileUrl) return resumeFileUrl;
+  // Confirmed real (a BrassRing portal, after a long testing session):
+  // getSignedDownloadUrl signs resume URLs with a 15-minute lifetime, but
+  // this function caches whatever it first resolves for as long as the
+  // tab stays open — a long multi-step application (or just a slow
+  // candidate) can easily outlast that, leaving attachResumeFile silently
+  // stuck retrying an expired URL with no way to recover. forceRefresh
+  // discards the cache and re-resolves a fresh one; see its one caller in
+  // attachResumeFile for when that's actually warranted (a 400/403 from
+  // the storage host, not just "no file input found yet").
+  async function getResumeFileUrl(forceRefresh = false) {
+    if (resumeFileUrl && !forceRefresh) return resumeFileUrl;
+    if (forceRefresh) resumeFileUrl = null;
 
     if (pendingHandoff?.resumeVersionId) {
       const resumeResult = await sendMessage({
@@ -1284,9 +1349,19 @@
   // from assigning `.files` directly, so we fake a drop event instead. Some
   // sites' file inputs reject this — that's the caller's cue to fall back
   // to a manual "download and attach" prompt.
+  // Returns { attached, fileMissing } instead of a bare boolean — confirmed
+  // real (a BrassRing portal): a 404/NoSuchKey from the storage host means
+  // the file was never actually uploaded (or was deleted) even though a
+  // ResumeVersion record still points at it, which is a completely
+  // different situation from "the site rejected the simulated file
+  // assignment." The caller's manual "download it here" fallback link
+  // reuses this SAME broken URL — pointing the candidate at it when the
+  // file is confirmed missing would just hand them a second dead link, so
+  // that case needs its own message instead (see fillField's resume
+  // branch).
   async function attachResumeFile(input) {
-    const fileUrl = await getResumeFileUrl();
-    if (!fileUrl) return false;
+    let fileUrl = await getResumeFileUrl();
+    if (!fileUrl) return { attached: false, fileMissing: false };
     try {
       // Fetching the file directly here would run in this page's origin
       // (e.g. barclays.wd3.myworkdayjobs.com) and get blocked by Firebase
@@ -1294,10 +1369,21 @@
       // origins. The background service worker fetches it instead, where
       // declared host_permissions bypass CORS, and hands it back as a data
       // URL (safe to pass through chrome.runtime.sendMessage).
-      const fetchResult = await sendMessage({ type: "FETCH_FILE_AS_DATA_URL", url: fileUrl });
+      let fetchResult = await sendMessage({ type: "FETCH_FILE_AS_DATA_URL", url: fileUrl });
+      // Confirmed real: a 15-minute-old signed URL, still cached from
+      // earlier in a long-running application, comes back as a 400/403
+      // from the storage host — a stale signature, not a real failure.
+      // Discarding the cache and resolving one fresh URL recovers this
+      // automatically instead of leaving the candidate stuck until they
+      // manually reload the page.
+      if (!fetchResult?.ok && (fetchResult?.status === 400 || fetchResult?.status === 403)) {
+        console.warn("AskJobs Autofill: resume URL looks expired, fetching a fresh one and retrying once", fetchResult);
+        fileUrl = await getResumeFileUrl(true);
+        if (fileUrl) fetchResult = await sendMessage({ type: "FETCH_FILE_AS_DATA_URL", url: fileUrl });
+      }
       if (!fetchResult?.ok) {
         console.warn("AskJobs Autofill: resume fetch via background failed", fetchResult);
-        return false;
+        return { attached: false, fileMissing: fetchResult?.status === 404 };
       }
 
       const blob = await (await fetch(fetchResult.dataUrl)).blob();
@@ -1317,10 +1403,10 @@
       dataTransfer.items.add(file);
       input.files = dataTransfer.files;
       input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-      return input.files.length > 0;
+      return { attached: input.files.length > 0, fileMissing: false };
     } catch (error) {
       console.warn("AskJobs Autofill: resume auto-attach failed", error);
-      return false;
+      return { attached: false, fileMissing: false };
     }
   }
 
@@ -1462,6 +1548,15 @@
   }
 
   function recordResultLocal(status, label, detail) {
+    // showSuggestionCard now auto-inserts immediately instead of waiting
+    // for a manual "Insert" click — every call site that renders a
+    // suggestion still separately logs this exact placeholder message
+    // right after, but by the time that line runs, the real "filled"/
+    // "skipped" outcome (from the auto-invoke that already happened) is
+    // already recorded. Showing this too would just add a stale,
+    // never-actionable "review above and click Insert" line with nothing
+    // left to review or click.
+    if (/review (above and click Insert|and click Insert)/.test(detail || "")) return;
     // Cheap check (isConnected) on every result — self-heals the sidebar if
     // an SPA re-render wiped it since injectSidebar()'s own initial call
     // (see that function's comment). No-ops instantly when it's still there.
@@ -1778,7 +1873,7 @@
         recordResult("skipped", fieldLabel, "Not the resume field — attach manually if required");
         return;
       }
-      const attached = await attachResumeFile(field);
+      const { attached, fileMissing } = await attachResumeFile(field);
       recordResult(
         attached ? "filled" : "skipped",
         "Resume/CV",
@@ -1786,9 +1881,14 @@
           ? resumeIsFallbackPrimary
             ? "Attached your primary resume (no customized version for this job)"
             : "Attached automatically"
-          : "Couldn't auto-attach — use the download link below"
+          : fileMissing
+            ? "Resume file is missing from storage — re-optimize this candidate's resume, then reload and try again"
+            : "Couldn't auto-attach — use the download link below"
       );
-      if (!attached) showManualResumePrompt();
+      // The manual download link points at this SAME broken URL — showing
+      // it when the file is confirmed missing would just hand the
+      // candidate a second dead link instead of the real fix.
+      if (!attached && !fileMissing) showManualResumePrompt();
       return;
     }
 
@@ -1805,6 +1905,34 @@
     // with either type, so just leave them alone rather than bailing out
     // for the wrong reason.
     if (field.type === "checkbox" || field.type === "radio") return;
+
+    // Confirmed real (a BrassRing "Create Profile" candidate portal): a
+    // real <input type="password"> is an unambiguous signal on its own —
+    // unlike almost everything else in this file, this doesn't need label
+    // text matching at all, and deliberately isn't routed through
+    // classify()/FIELD_MATCHERS, since an unrecognized password field
+    // falling through to the generic AI-classification queue would mean
+    // asking an AI to guess a login password, which is never appropriate.
+    // Same value fills BOTH "Password" and "Password Verification"/
+    // "Confirm Password" — both are type="password" inputs expecting the
+    // identical value, no separate matching needed for the second one.
+    if (field.type === "password") {
+      if (field.value) return;
+      const password = profile?.accountPassword;
+      if (!password) {
+        console.log("[AskJobs] password field found but no account password set for this candidate:", fieldLabel);
+        return;
+      }
+      attemptedSignatures.add(signature);
+      const filled = setNativeValue(field, password);
+      recordResult(
+        filled ? "filled" : "skipped",
+        fieldLabel,
+        filled ? "Filled with the stored account password" : "Couldn't confirm the account password was actually accepted",
+      );
+      return;
+    }
+
     // Confirmed real (Recruitee): a phone widget that auto-inserts the
     // selected country's dial code the moment it renders — this field's
     // value was already "+1" before the candidate had typed anything at
@@ -1927,6 +2055,39 @@
         fieldLabel,
         filled ? "Pasted your resume text" : "Couldn't confirm the resume text was actually accepted — please paste it directly",
       );
+      return;
+    }
+
+    // Same reasoning as resumeText above — never echo the actual password
+    // into the sidebar. Reached only for a password-shaped field that
+    // ISN'T a real type="password" input (those are handled earlier, see
+    // this function's dedicated type="password" branch) — confirmed real
+    // (Wellfound): "Set a Password"/"Confirm Password" fields built as
+    // something else entirely, invisible to that type check.
+    if (key === "accountPassword") {
+      const filled = setNativeValue(field, value);
+      attemptedSignatures.add(signature);
+      recordResult(
+        filled ? "filled" : "skipped",
+        fieldLabel,
+        filled ? "Filled with the stored account password" : "Couldn't confirm the account password was actually accepted",
+      );
+      return;
+    }
+
+    // Confirmed real (Wellfound's "Set Your Location*" — a searchable
+    // city-autocomplete input, not a plain text field): this generic
+    // fallback used to always setNativeValue regardless of widget shape,
+    // same bug already fixed for structured (education/experience) fields
+    // in fillStructuredField (see its own isComboboxField comment) but
+    // never applied here. A combobox-shaped field's own validation reverts
+    // a raw value set that wasn't actually selected through its real
+    // interaction (type, wait for a suggestion, click it) — fillCustomCombobox
+    // does that instead of just stuffing text in and hoping it sticks.
+    if (isComboboxField(field)) {
+      const filled = await fillCustomCombobox(field, value, fieldLabel);
+      attemptedSignatures.add(signature);
+      recordResult(filled ? "filled" : "skipped", fieldLabel, filled ? value : "Couldn't find a matching option");
       return;
     }
 
@@ -2910,10 +3071,20 @@
     return optionWords.some((w) => w.length > 3 && !COMBOBOX_MATCH_STOPWORDS.has(w) && targetWords.includes(w));
   }
 
-  function closeComboboxPopup(button) {
-    button.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true }));
-    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true }));
-  }
+  // Confirmed real (Wellfound's Apply modal): this dispatched Escape to
+  // BOTH the button and `document` whenever a combobox search found no
+  // match (e.g. "Set Your Location" searching for a bare test value like
+  // "abc") — exactly the same class of bug closeAnyOpenPopup above already
+  // documents fixing (Greenhouse's Radix UI Dialog closing on a bubbling
+  // Escape), just never applied here too. Wellfound's own "Apply" modal
+  // has its own Escape-to-close listener, which this bubbling keydown
+  // reached just as well, silently kicking the candidate back to the job
+  // search results with everything filled so far lost. Same reasoning,
+  // same fix: a deliberate no-op. A combobox left open after a failed
+  // search is a minor, later-cleaned-up annoyance; closing the candidate's
+  // in-progress application out from under them is not an acceptable
+  // trade for tidying that up.
+  function closeComboboxPopup() {}
 
   // Confirmed real via actual HTML (Remote's Greenhouse-hosted application
   // form): react-select's <input role="combobox"> opens its menu on
@@ -2989,13 +3160,20 @@
   // (Degree, School's "Other" option) but silently did nothing for Skills,
   // which is why it looked like it "found" the right option (highlighted)
   // without ever actually checking it.
+  // Confirmed real (Wellfound's "Years of experience" — an older
+  // react-select version): a bare option.click() left the matching option
+  // merely highlighted in the still-open menu, never actually selected —
+  // react-select's option rows commit the selection on mousedown (the same
+  // pattern already confirmed for OPENING these widgets, see
+  // clickComboboxTrigger's own comment), so a synthetic "click" alone,
+  // with no preceding mousedown/mouseup, never reached that handler.
   function clickMatchedOption(option) {
     const toggle = option.querySelector('input[type="checkbox"], input[type="radio"]');
-    if (toggle) {
-      toggle.click();
-    } else {
-      option.click();
-    }
+    const target = toggle || option;
+    const opts = { bubbles: true, cancelable: true, view: window };
+    target.dispatchEvent(new MouseEvent("mousedown", opts));
+    target.dispatchEvent(new MouseEvent("mouseup", opts));
+    target.click();
   }
 
   // Asks the backend which of the dropdown's ACTUAL rendered option texts
@@ -3058,6 +3236,16 @@
     // navigation menu's menuitem rows.
     const OPTION_ROLE_SELECTOR = '[role="option"]';
     const MENUITEM_ROLE_SELECTOR = '[role="menuitem"]';
+    // Confirmed real (Wellfound's "Years of experience" — an older
+    // react-select version, classNamePrefix "select"): its rendered rows
+    // carry no ARIA role at all — the diagnostic below showed 0 for both
+    // role="option" and role="menuitem" on a real open menu. Its BEM class
+    // convention ("select__control", "select__input", ...) means an
+    // individual option row is virtually always "<prefix>__option" —
+    // checked last since a bare "*__option" substring is a weaker signal
+    // than a real ARIA role, but a live, out-of-DOM-order menu portal has
+    // nothing else to go on here.
+    const CLASS_OPTION_SELECTOR = '[class*="__option"]';
     let options = [];
     for (let attempt = 0; attempt < 50; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -3067,6 +3255,11 @@
         let menuItems = deepQueryAll(scopeEl, MENUITEM_ROLE_SELECTOR).filter(isRealOptionCandidate);
         if (excludeOptions) menuItems = menuItems.filter((o) => !excludeOptions.has(o));
         options = menuItems;
+      }
+      if (options.length === 0) {
+        let classOptions = deepQueryAll(scopeEl, CLASS_OPTION_SELECTOR).filter(isRealOptionCandidate);
+        if (excludeOptions) classOptions = classOptions.filter((o) => !excludeOptions.has(o));
+        options = classOptions;
       }
       if (options.length > 0) break;
     }
@@ -3081,7 +3274,11 @@
     // that initial visible batch render before matching against it.
     if (options.length > 0) {
       await new Promise((resolve) => setTimeout(resolve, 250));
-      const settleSelector = options.every((o) => o.matches(MENUITEM_ROLE_SELECTOR)) ? MENUITEM_ROLE_SELECTOR : OPTION_ROLE_SELECTOR;
+      const settleSelector = options.every((o) => o.matches(MENUITEM_ROLE_SELECTOR))
+        ? MENUITEM_ROLE_SELECTOR
+        : options.every((o) => o.matches(CLASS_OPTION_SELECTOR))
+          ? CLASS_OPTION_SELECTOR
+          : OPTION_ROLE_SELECTOR;
       let settled = deepQueryAll(scopeEl, settleSelector).filter(isRealOptionCandidate);
       if (excludeOptions) settled = settled.filter((o) => !excludeOptions.has(o));
       if (settled.length >= options.length) options = settled;
@@ -3098,6 +3295,8 @@
         desiredText,
         "— menuitem count:",
         deepQueryAll(scopeEl, '[role="menuitem"]').length,
+        "class-option count:",
+        deepQueryAll(scopeEl, CLASS_OPTION_SELECTOR).length,
         "listitem count:",
         deepQueryAll(scopeEl, '[role="listitem"], li').length,
       );
@@ -3250,12 +3449,19 @@
 
     if (!match) {
       console.log("[AskJobs] combobox: no matching option found (checked existing + AI fallback) for target:", desiredText, "->", fieldLabel);
-      closeComboboxPopup(button);
+      closeComboboxPopup();
       return false;
     }
 
     console.log("[AskJobs] combobox picking option:", match.textContent?.trim(), "for target:", desiredText, "->", fieldLabel);
     clickMatchedOption(match);
+    // Confirmed real (Wellfound's react-select "Years of experience"):
+    // belt-and-suspenders on top of clickMatchedOption's own mousedown fix
+    // — an actual person confirmed Enter is what reliably commits the
+    // highlighted option on this widget. Only for the INPUT-as-trigger
+    // shape (react-select's own pattern here); harmless no-op on an
+    // already-closed dropdown for anything else.
+    if (button.tagName === "INPUT") dispatchEnterKey(button);
     await new Promise((resolve) => setTimeout(resolve, 150));
     return true;
   }
@@ -4057,7 +4263,14 @@
     // name (fab-SelectToggle) is the only reliable signal, since its paired
     // real <select> is an aria-hidden decoy with zero options (see
     // fillField's early skip for aria-hidden selects).
-    const buttons = deepQueryAll(root, 'button[aria-haspopup="listbox"], [role="combobox"], button.fab-SelectToggle[aria-haspopup]');
+    // Confirmed real (Wellfound's "Years of experience" — an older
+    // react-select version): no role/aria-haspopup at all, same gap
+    // isComboboxField documents — its internally-generated
+    // "react-select-<id>-input" id format is what's actually reliable here.
+    const buttons = deepQueryAll(
+      root,
+      'button[aria-haspopup="listbox"], [role="combobox"], button.fab-SelectToggle[aria-haspopup], input[id^="react-select-"][id$="-input"]',
+    );
     console.log("[AskJobs] generic comboboxes: found", buttons.length, "button(s) on this page");
 
     for (const button of buttons) {
@@ -4858,7 +5071,18 @@
     return (
       field.matches('[role="combobox"]') ||
       field.getAttribute("aria-haspopup") === "listbox" ||
-      field.matches("button.fab-SelectToggle[aria-haspopup]")
+      field.matches("button.fab-SelectToggle[aria-haspopup]") ||
+      // Confirmed real (Wellfound's "Years of experience" — an OLDER
+      // react-select version, class names "select__control"/"css-yk16xz-
+      // control"): its search <input> carries none of the ARIA attributes
+      // above at all (no role, no aria-haspopup) — newer react-select
+      // versions do set role="combobox", which is exactly why that check
+      // already existed, but it isn't universal across the library's own
+      // history. react-select generates this exact "react-select-<id>-
+      // input" id format internally regardless of version, so it's a more
+      // reliable signal here than any ARIA attribute this particular
+      // version happens to skip.
+      /^react-select-.*-input$/.test(field.id)
     );
   }
 
@@ -4982,7 +5206,10 @@
       });
     }
 
-    const comboButtons = deepQueryAll(root, 'button[aria-haspopup="listbox"], [role="combobox"], button.fab-SelectToggle[aria-haspopup]');
+    const comboButtons = deepQueryAll(
+      root,
+      'button[aria-haspopup="listbox"], [role="combobox"], button.fab-SelectToggle[aria-haspopup], input[id^="react-select-"][id$="-input"]',
+    );
     for (const button of comboButtons) {
       if (button.disabled) continue;
       const signature = fieldSignature(button);
@@ -5097,32 +5324,6 @@
     await runQualificationAnswerPass(items);
   }
 
-  // Every suggestion card gets a dismiss (✕) button, not just an Insert
-  // button — these can go stale across a multi-step form (a suggestion for
-  // "Middle Name" from the My Information step is still sitting there once
-  // you've moved on to Education), so there needs to be a way to clear one
-  // without inserting anything.
-  function createSuggestionItem(questionText) {
-    const item = document.createElement("div");
-    item.className = "ai-item";
-
-    const header = document.createElement("div");
-    header.className = "ai-item-header";
-    const q = document.createElement("div");
-    q.className = "ai-question";
-    q.textContent = questionText;
-    const dismissBtn = document.createElement("button");
-    dismissBtn.className = "ai-dismiss-btn";
-    dismissBtn.textContent = "✕";
-    dismissBtn.title = "Dismiss";
-    dismissBtn.addEventListener("click", () => item.remove());
-    header.appendChild(q);
-    header.appendChild(dismissBtn);
-    item.appendChild(header);
-
-    return item;
-  }
-
   // Relays a suggestion this (non-top) frame generated to the top frame's
   // sidebar for display, since there's no local sidebar to render into
   // here (see injectSidebar's top-frame-only guard). onInsert is kept
@@ -5158,42 +5359,26 @@
   // shared strategy here. Always awaited (harmless even if onInsert isn't
   // actually async) so the card stays visible until the action finishes,
   // not just until it starts.
+  // Directly fills instead of rendering a review-before-insert card, per
+  // explicit instruction: every category that used to wait for a manual
+  // "Insert" click (stored EEO/profile data, AI-guessed answers, best-
+  // effort date guesses) now inserts immediately. Kept as the single choke
+  // point every one of those ~20 call sites already went through, so this
+  // one change covers all of them without touching each call site — the
+  // surrounding "Suggested ... review above and click Insert" recordResult
+  // calls those sites still make are now suppressed in recordResultLocal
+  // instead (see its own comment), since the real "filled" outcome from
+  // this auto-invoke already supersedes them before those lines even run.
   function showSuggestionCard(questionText, previewText, editable, onInsert) {
     if (window.self !== window.top) {
       sendRemoteSuggestion(questionText, previewText, editable, onInsert);
       return;
     }
-    const container = sidebarShadow?.querySelector("#askjobs-ai-results");
-    if (!container) return;
-
-    const el = createSuggestionItem(questionText);
-    const btn = document.createElement("button");
-    btn.className = "ai-insert-btn";
-    btn.textContent = "Insert";
-
     if (editable) {
-      const textarea = document.createElement("textarea");
-      textarea.className = "ai-answer-box";
-      textarea.value = previewText;
-      btn.addEventListener("click", async () => {
-        const finalValue = textarea.value;
-        if (!finalValue) return;
-        await onInsert(finalValue);
-        el.remove();
-      });
-      el.appendChild(textarea);
+      if (previewText) onInsert(previewText);
     } else {
-      const preview = document.createElement("div");
-      preview.className = "ai-question";
-      preview.textContent = previewText;
-      btn.addEventListener("click", async () => {
-        await onInsert();
-        el.remove();
-      });
-      el.appendChild(preview);
+      onInsert();
     }
-    el.appendChild(btn);
-    container.appendChild(el);
   }
 
   // Bridges BOTH directions of the remote-suggestion flow over postMessage
@@ -5412,7 +5597,7 @@
     const { addedCount, unresolved } = renderClassifiedSuggestions(items, classifications);
     showAiStatus(
       addedCount > 0
-        ? `AI found ${addedCount} likely answer(s) below — review and click Insert.`
+        ? `AI auto-filled ${addedCount} answer(s) — check the results list below.`
         : ""
     );
 
@@ -5546,7 +5731,7 @@
     const addedCount = renderQualificationAnswers(unresolvedItems, answers);
     showAiStatus(
       addedCount > 0
-        ? `AI found ${addedCount} more likely answer(s) below — review and click Insert.`
+        ? `AI auto-filled ${addedCount} more answer(s) — check the results list below.`
         : "AI couldn't find enough on your resume to answer the remaining question(s)."
     );
   }

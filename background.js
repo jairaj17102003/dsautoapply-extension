@@ -109,8 +109,10 @@ async function fetchFileAsDataUrl(url) {
     // Every resume download URL this Backend actually issues uses the
     // former, which wasn't in this allowlist at all — resume auto-attach
     // was rejected before it ever reached the actual fetch. Also allows
-    // our own API host (local dev's STORAGE_DRIVER=local serves resume
-    // files from the Backend's own /uploads/... static route instead).
+    // our own API host — the Backend's now-removed STORAGE_DRIVER=local
+    // dev fallback used to serve resume files from its own /uploads/...
+    // static route this way; kept in case something else on this host
+    // ever needs a plain fetch, though nothing currently does.
     const allowedHostnames = [new URL(API_BASE).hostname, "storage.googleapis.com", "firebasestorage.googleapis.com"];
     if (!allowedHostnames.includes(parsed.hostname)) {
       return { ok: false, status: 0, error: "URL host not allowed" };
@@ -118,7 +120,23 @@ async function fetchFileAsDataUrl(url) {
 
     const response = await fetch(url);
     if (!response.ok) {
-      return { ok: false, status: response.status, error: `Fetch failed with status ${response.status}` };
+      // A GCS signed-URL failure (expired/invalid signature, wrong bucket,
+      // etc.) comes back with a specific error body (XML, usually a
+      // <Code>...</Code> like SignatureDoesNotMatch or InvalidArgument) —
+      // the bare status alone isn't enough to tell those apart. Bounded to
+      // a few KB since this is only ever an error page, never the real
+      // file.
+      let bodyText = "";
+      try {
+        bodyText = (await response.text()).slice(0, 2000);
+      } catch {
+        // Body already consumed or unreadable — status/statusText alone still returned below.
+      }
+      return {
+        ok: false,
+        status: response.status,
+        error: `Fetch failed with status ${response.status} (${response.statusText}): ${bodyText || "<no body>"}`,
+      };
     }
     const blob = await response.blob();
     const dataUrl = await blobToDataUrl(blob);
@@ -138,8 +156,17 @@ const HANDOFF_TTL_MS = 5 * 60 * 1000;
 // applying to two different companies back-to-back, the second tab to load
 // would steal the first one's handoff, leaving the first with nothing).
 // Each entry is claimed by hostname match instead of "whatever's there."
+// Confirmed real (this whole extension's own dev/test cycle): chrome.
+// storage.session is documented to clear on every extension reload/update,
+// not just on browser/profile restart — during active development that
+// means every single "reload extension to pick up a fix" wipes whatever
+// was already claimed for the currently-open tab, forcing a full redo of
+// the Consultant app's Apply flow just to get a fresh handoff. .local
+// persists across reloads (only cleared on uninstall), which is what this
+// was always meant to survive — a real end user isn't reloading the
+// extension mid-application, so this doesn't change their experience.
 async function getPendingHandoffs() {
-  const { pendingHandoffs } = await chrome.storage.session.get("pendingHandoffs");
+  const { pendingHandoffs } = await chrome.storage.local.get("pendingHandoffs");
   const now = Date.now();
   // Confirmed real gap: this used to expire EVERY entry after HANDOFF_TTL_MS
   // regardless of claimed status, so a multi-step application taking longer
@@ -199,7 +226,7 @@ async function claimPendingHandoff(hostname, tabId) {
 
   if (entry && tabId != null) entry.claimedByTabId = tabId;
 
-  await chrome.storage.session.set({ pendingHandoffs: queue });
+  await chrome.storage.local.set({ pendingHandoffs: queue });
   return entry || null;
 }
 
@@ -212,7 +239,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
 
     const queue = await getPendingHandoffs();
     queue.push({ candidateId, jobId, resumeVersionId, hostname, companyName, jobTitle, receivedAt: Date.now() });
-    await chrome.storage.session.set({ pendingHandoffs: queue });
+    await chrome.storage.local.set({ pendingHandoffs: queue });
 
     // Learn about ATS platforms we don't support yet without ever needing
     // broad host_permissions or running a content script on that domain.
@@ -313,7 +340,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           receivedAt: Date.now(),
           claimedByTabId: message.tabId,
         });
-        await chrome.storage.session.set({ pendingHandoffs: queue });
+        await chrome.storage.local.set({ pendingHandoffs: queue });
         sendResponse({ ok: true });
         break;
       }

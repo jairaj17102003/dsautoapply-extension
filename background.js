@@ -8,8 +8,9 @@
  *    never has to be passed into a content script's page-adjacent context)
  */
 
-// TODO: point at the production Backend URL once deployed.
-const API_BASE = "http://localhost:4000";
+// Production Backend, live on the dsautoapply GCP VM behind Nginx/TLS
+// (confirmed reachable: https://api.dsautoapply.ai/api/v1/health -> 200).
+const API_BASE = "https://api.dsautoapply.ai";
 
 let siteSupportList = null;
 

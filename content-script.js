@@ -88,9 +88,30 @@
       // tried to match the candidate's actual country name against a
       // Yes/No-only option list, instead of ever reaching the real
       // workAuthorized logic (see RADIO_MATCHERS' matching "eligible to
-      // work" pattern). None of these should get the candidate's
-      // addressCountry value.
-      excludePatterns: ["phone code", "country code", "citizenship", "eligible to work"],
+      // work" pattern). Confirmed real again (Builtin/Zscaler's form):
+      // "Do you have the legal right to work in the country..." and "...
+      // additional right to work support for the country..." both hit the
+      // exact same collision with their own phrasing. None of these should
+      // get the candidate's addressCountry value.
+      // Broadened further per the same collision class: any work-
+      // authorization/visa-sponsorship phrasing that happens to mention
+      // "country" (very common ATS phrasing, e.g. "...work in the country
+      // where this position is based" or "...require a visa for the
+      // country you're applying to") belongs to workAuthorized/
+      // visaSponsorshipNeeded, never to the address country field.
+      excludePatterns: [
+        "phone code",
+        "country code",
+        "citizenship",
+        "eligible to work",
+        "legal right to work",
+        "work permit",
+        "permitted to work",
+        "authorization to work",
+        "eligibility to work",
+        "sponsorship",
+        "visa",
+      ],
     },
     // Distinct from addressCountry above — a legal-status question ("are
     // you a citizen of...", "country of citizenship"), not a residence
@@ -111,6 +132,12 @@
     { key: "linkedin", patterns: ["linkedin"] },
     { key: "portfolio", patterns: ["portfolio", "website", "personal site"] },
     { key: "currentJobTitle", patterns: ["current title", "job title", "current role"] },
+    // Confirmed real (Builtin/Zscaler): a standalone "Current Company*"
+    // screening field, distinct from the repeated Work Experience section's
+    // own per-entry "company" field (EXPERIENCE_FIELD_MATCHERS, a different
+    // matcher list entirely) — see currentExperienceEntry() for where the
+    // value comes from.
+    { key: "currentCompany", patterns: ["current company", "current employer", "present employer", "presently employed at"] },
     // Confirmed real (Wellfound's "Years of experience" dropdown): computed
     // ONCE server-side from Candidate.experience whenever it's saved (see
     // Backend's experienceCalculator.util.js) — deliberately not left for
@@ -183,7 +210,15 @@
   const RADIO_MATCHERS = [
     {
       key: "atLeast18",
-      patterns: ["at least 18", "18 years of age", "18 years old"],
+      patterns: [
+        "at least 18",
+        "18 years of age",
+        "18 years old",
+        "18 or older",
+        "18 years or older",
+        "over the age of 18",
+        "age of majority",
+      ],
       // Confirmed real (Lever): "If you are under 18 years of age, do you
       // have a work permit if required by applicable state law?" contains
       // the literal substring "18 years of age" but asks a COMPLETELY
@@ -192,7 +227,9 @@
       // false-positive here and insert an answer computed for the wrong
       // question. Excluded whenever the question is conditionally framed
       // around being UNDER 18 or mentions a work permit specifically.
-      excludePatterns: ["under 18", "work permit"],
+      // "under the age of 18" is also excluded since it doesn't contain the
+      // literal substring "under 18" but is the same negatively-framed trap.
+      excludePatterns: ["under 18", "under the age of 18", "work permit"],
     },
     // Confirmed real (Nelnet's Workday form): "Are you eligible to work in
     // the country for which you are applying?" and "Upon hire, can you
@@ -202,9 +239,50 @@
     // so both fell through unrecognized (and one of them then got wrongly
     // hijacked by classify()'s own bare "country" addressCountry matcher —
     // see its excludePatterns for the fix on that side).
-    { key: "workAuthorized", patterns: ["authorized to work", "legally authorized", "work authorization", "legally eligible to work", "eligible to work"] },
-    { key: "visaSponsorshipNeeded", patterns: ["sponsorship", "sponsor your employment", "require sponsorship"] },
-    { key: "willingToRelocate", patterns: ["willing to relocate", "relocation"] },
+    // Confirmed real (Builtin/Zscaler's application form): "Do you have the
+    // legal right to work in the country where you are applying to work?"
+    // — yet another phrasing with neither "legally" nor "eligible", the
+    // same gap class "eligible to work" was added to fix before.
+    {
+      key: "workAuthorized",
+      patterns: [
+        "authorized to work",
+        "legally authorized",
+        "work authorization",
+        "legally eligible to work",
+        "eligible to work",
+        "legal right to work",
+        "permitted to work",
+        "authorization to work",
+        "eligibility to work",
+        "legally permitted to work",
+        "authorized to be employed",
+      ],
+    },
+    // Confirmed real (same form): "Do you require a work permit, visa or
+    // additional right to work support for the country where you are
+    // applying to work?" — "work permit" specifically, not covered by the
+    // existing sponsorship-only patterns.
+    {
+      key: "visaSponsorshipNeeded",
+      patterns: [
+        "sponsorship",
+        "sponsor your employment",
+        "require sponsorship",
+        "work permit",
+        "sponsor you",
+        "need sponsorship",
+        "visa sponsorship",
+        "require a visa",
+        "need a visa",
+        "sponsor an employment visa",
+        "immigration sponsorship",
+      ],
+    },
+    {
+      key: "willingToRelocate",
+      patterns: ["willing to relocate", "relocation", "open to relocation", "open to relocating", "able to relocate"],
+    },
     {
       key: "workedHereBefore",
       patterns: [
@@ -242,6 +320,10 @@
         // being applied to. Those bare phrases are too generic to assume
         // they're about "this employer" specifically.
         "ever employed by",
+        // "returning employee" is specific enough (self-referential,
+        // implies rejoining THIS employer) to keep unconditional, unlike the
+        // removed bare "employee of"/"former employee" phrases below.
+        "returning employee",
         // "prior employee"/"former employee" (bare, unqualified) were
         // REMOVED for the identical reason — confirmed real (RTX): "Are you
         // a CURRENT or FORMER EMPLOYEE of RTX's Independent Auditor,
@@ -287,10 +369,16 @@
     "voluntary self identification",
     "current age", // Ashby's demographic age-BRACKET question ("Under 30"/"30-39"/...), distinct from the atLeast18 legal-eligibility Yes/No question
     "age range",
+    "lgbtq", // covers "LGBTQ", "LGBTQ+", "LGBTQIA+" etc. without needing "transgender" wording
   ];
 
   function isSensitiveSelfIdQuestion(normalizedQuestionText) {
-    return SENSITIVE_SELF_ID_PATTERNS.some((p) => normalizedQuestionText.includes(p));
+    // Bare "race" needs a word-boundary check (not a plain SENSITIVE_SELF_ID_
+    // PATTERNS entry) to avoid matching inside "embrace"/"bracelet"/etc.
+    return (
+      SENSITIVE_SELF_ID_PATTERNS.some((p) => normalizedQuestionText.includes(p)) ||
+      matchesWholeWord(normalizedQuestionText, "race")
+    );
   }
 
   // Real, candidate-stated EEO answers for the categories above — still only
@@ -310,6 +398,20 @@
   function eeoHispanicOrLatinoText() {
     if (eeoProfile?.hispanicOrLatino === "yes") return "Hispanic or Latino";
     if (eeoProfile?.hispanicOrLatino === "no") return "Not Hispanic or Latino";
+    return null;
+  }
+
+  // Confirmed real gap: eeoProfile.lgbtq is a genuine stored field (see
+  // CandidateEeoProfile.model.js) but nothing anywhere ever read it — a
+  // question like "Do you identify as part of the LGBTQIA+ community?"
+  // was already correctly recognized as sensitive (via SENSITIVE_SELF_ID_
+  // PATTERNS' "transgender"/new "lgbtq" patterns below) but every reader
+  // function had no case for it, so it always silently fell through to
+  // "left for you to answer directly" despite real, stored data existing.
+  function eeoLgbtqText() {
+    if (eeoProfile?.lgbtq === "yes") return "Yes";
+    if (eeoProfile?.lgbtq === "no") return "No";
+    if (eeoProfile?.lgbtq === "decline_to_answer") return "Decline to answer";
     return null;
   }
 
@@ -333,7 +435,7 @@
   function sensitiveSelfIdFreeText(normalizedQuestionText) {
     if (!eeoProfile) return null;
     if (normalizedQuestionText.includes("veteran")) return eeoVeteranStatusText();
-    if (normalizedQuestionText.includes("ethnicit") || normalizedQuestionText.includes("hispanic") || normalizedQuestionText.includes("racial")) {
+    if (normalizedQuestionText.includes("ethnicit") || normalizedQuestionText.includes("hispanic") || normalizedQuestionText.includes("racial") || matchesWholeWord(normalizedQuestionText, "race")) {
       return [eeoProfile.race, eeoHispanicOrLatinoText()].filter(Boolean).join(", ") || null;
     }
     if (normalizedQuestionText.includes("sexual orientation")) {
@@ -341,6 +443,7 @@
         ? eeoProfile.sexualOrientation.join(", ")
         : null;
     }
+    if (normalizedQuestionText.includes("lgbtq") || normalizedQuestionText.includes("transgender")) return eeoLgbtqText();
     return null;
   }
 
@@ -352,12 +455,13 @@
   function sensitiveSelfIdSingleValue(normalizedQuestionText) {
     if (!eeoProfile) return null;
     if (normalizedQuestionText.includes("veteran")) return eeoVeteranStatusText();
-    if (normalizedQuestionText.includes("ethnicit") || normalizedQuestionText.includes("hispanic") || normalizedQuestionText.includes("racial")) {
+    if (normalizedQuestionText.includes("ethnicit") || normalizedQuestionText.includes("hispanic") || normalizedQuestionText.includes("racial") || matchesWholeWord(normalizedQuestionText, "race")) {
       return eeoProfile.race || null;
     }
     if (normalizedQuestionText.includes("sexual orientation") && eeoProfile.sexualOrientation?.length === 1) {
       return eeoProfile.sexualOrientation[0];
     }
+    if (normalizedQuestionText.includes("lgbtq") || normalizedQuestionText.includes("transgender")) return eeoLgbtqText();
     return null;
   }
 
@@ -374,8 +478,11 @@
     } else if (normalizedQuestionText.includes("veteran")) {
       const v = eeoVeteranStatusText();
       wantedValues = v ? [v] : [];
-    } else if (normalizedQuestionText.includes("ethnicit") || normalizedQuestionText.includes("hispanic") || normalizedQuestionText.includes("racial")) {
+    } else if (normalizedQuestionText.includes("ethnicit") || normalizedQuestionText.includes("hispanic") || normalizedQuestionText.includes("racial") || matchesWholeWord(normalizedQuestionText, "race")) {
       wantedValues = [eeoProfile.race, eeoHispanicOrLatinoText()].filter(Boolean);
+    } else if (normalizedQuestionText.includes("lgbtq") || normalizedQuestionText.includes("transgender")) {
+      const v = eeoLgbtqText();
+      wantedValues = v ? [v] : [];
     } else {
       return null;
     }
@@ -423,7 +530,16 @@
     // specific required, which correctly covers "Gender", "gender
     // identity", "what is your gender", and "what gender do you identify
     // with" all at once, without reopening the transgender collision.
-    return matchesWholeWord(normalizedQuestionText, "gender");
+    // Confirmed real (Builtin/Zscaler's form): a bare "Sex*" field asking
+    // the exact same EEO category, no "gender" wording anywhere. Excludes
+    // "sex offender"/"sex offense" defensively — a background-check
+    // question, not this one, if a form ever combines the two sections.
+    return (
+      matchesWholeWord(normalizedQuestionText, "gender") ||
+      (matchesWholeWord(normalizedQuestionText, "sex") &&
+        !normalizedQuestionText.includes("sex offender") &&
+        !normalizedQuestionText.includes("sex offense"))
+    );
   }
 
   // Bare "disability" (not "person with disability") — confirmed real miss:
@@ -433,7 +549,10 @@
   // "disability" pattern catches every real phrasing variant instead of
   // chasing each one.
   function isDisabilityQuestion(normalizedQuestionText) {
-    return normalizedQuestionText.includes("disability");
+    // Bare "disabled" (e.g. "Do you consider yourself disabled?") doesn't
+    // contain the substring "disability" at all — matched as a whole word
+    // to avoid unrelated UI copy like "this field is disabled".
+    return normalizedQuestionText.includes("disability") || matchesWholeWord(normalizedQuestionText, "disabled");
   }
 
   // Confirmed real (BambooHR): a country combobox labeled just "Country*"
@@ -467,7 +586,19 @@
       // the FIELD_MATCHERS addressCountry entry for the native-<select>/
       // plain-input path (classify()) — this is the standalone-function
       // equivalent for the combobox path, which classify() never sees.
-      !normalizedQuestionText.includes("eligible to work")
+      // Confirmed real again (Builtin/Zscaler's form): "legal right to
+      // work"/"work permit" phrasing hits the exact same collision.
+      !normalizedQuestionText.includes("eligible to work") &&
+      !normalizedQuestionText.includes("legal right to work") &&
+      !normalizedQuestionText.includes("work permit") &&
+      // Same broadening as the FIELD_MATCHERS addressCountry excludePatterns
+      // above — any work-authorization/visa phrasing mentioning "country"
+      // belongs to workAuthorized/visaSponsorshipNeeded, not this field.
+      !normalizedQuestionText.includes("permitted to work") &&
+      !normalizedQuestionText.includes("authorization to work") &&
+      !normalizedQuestionText.includes("eligibility to work") &&
+      !normalizedQuestionText.includes("sponsorship") &&
+      !normalizedQuestionText.includes("visa")
     );
   }
 
@@ -859,6 +990,21 @@
     return hasPlus ? `+${digits}` : digits;
   }
 
+  // Confirmed real gap: "Current Company"/"Current Title" screening fields
+  // ask for the SAME data QuikTrip's own "current: true" experience entry
+  // already holds (company/title are both required on that schema) — only
+  // the standalone profile.currentJobTitle field (a distinct, separately
+  // filled-in profile field) was ever checked, so a candidate who filled in
+  // their Experience section but never separately set that one field got
+  // left with an empty deterministic answer, silently falling back to a
+  // less reliable AI guess (or, until the fix above, no fallback at all).
+  // Deliberately only matches an entry explicitly marked current: true —
+  // guessing which of several past jobs is "current" from ordering alone
+  // isn't something this file does anywhere else.
+  function currentExperienceEntry() {
+    return profile?.experience?.find((exp) => exp.current) || null;
+  }
+
   function valueForKey(key) {
     if (!profile) return null;
 
@@ -897,7 +1043,9 @@
       case "portfolio":
         return profile.portfolioUrl || profile.githubUrl || null;
       case "currentJobTitle":
-        return profile.currentJobTitle || null;
+        return profile.currentJobTitle || currentExperienceEntry()?.title || null;
+      case "currentCompany":
+        return currentExperienceEntry()?.company || null;
       // Rounded to a whole number — real dropdowns overwhelmingly list
       // whole years ("5 Years", "8 Years"), and the existing generic
       // SELECT/combobox matching here already does substring matching, so
@@ -2005,7 +2153,21 @@
 
     const value = valueForKey(key);
     if (!value) {
-      console.log("[AskJobs] generic field recognized as", key, "but no data for it:", fieldLabel);
+      // Confirmed real (Builtin/Zscaler): "Current Title*" matched the
+      // currentJobTitle FIELD_MATCHER, but profile.currentJobTitle itself
+      // was empty (that's a distinct, separately-filled-in profile field,
+      // not derived from the resume/experience entries) — this branch used
+      // to just log and give up, WITHOUT calling maybeQueueFieldForClassification
+      // the way the "not recognized at all" branch above does. Since
+      // "AI-fill remaining questions" only ever considers fields that made
+      // it into pendingClassificationItems (populated solely by
+      // maybeQueueFieldForClassification), a recognized-but-empty field was
+      // silently orphaned from BOTH the deterministic and the AI fallback
+      // paths — even after clicking "AI-fill remaining questions", it stayed
+      // blank forever, unlike an unrecognized field (e.g. "Current Company"),
+      // which the AI could still infer correctly from resume context.
+      console.log("[AskJobs] generic field recognized as", key, "but no data for it, queueing for AI fallback:", fieldLabel);
+      maybeQueueFieldForClassification(field, signature);
       return;
     }
 

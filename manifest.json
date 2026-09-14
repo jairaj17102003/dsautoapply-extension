@@ -140,12 +140,13 @@
     "https://careers.teradata.com/*",
 
     "http://localhost:4000/*",
+    "https://api.dsautoapply.ai/*",
     "https://firebasestorage.googleapis.com/*",
     "https://storage.googleapis.com/*"
   ],
   "optional_host_permissions": ["<all_urls>"],
   "externally_connectable": {
-    "matches": ["http://localhost:3000/*"]
+    "matches": ["http://localhost:3000/*", "https://dsautoapply.ai/*", "https://www.dsautoapply.ai/*"]
   },
   "content_scripts": [
     {

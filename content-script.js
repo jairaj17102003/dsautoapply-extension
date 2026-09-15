@@ -4863,6 +4863,42 @@
     styleEl.textContent = `:host { position: fixed !important; z-index: 2147483647 !important; ${rules.join("; ")}; }`;
   }
 
+  // Confirmed real: the bubble (44x44) can be dragged into a corner (e.g.
+  // bottom-right) with no issue, since it's small enough to always fit —
+  // but restoring the full panel (300px wide, up to 100vh-32px tall) at
+  // that SAME top/left corner pushed most of it off-screen, since nothing
+  // re-clamped position for the new, much larger size. Reuses the same
+  // clamp math the drag handler already does, just against the CURRENT
+  // position instead of a live mouse coordinate.
+  function clampHostToViewport(host, positionStyle) {
+    const rect = host.getBoundingClientRect();
+    const maxX = Math.max(0, window.innerWidth - host.offsetWidth);
+    const maxY = Math.max(0, window.innerHeight - host.offsetHeight);
+    const x = Math.max(0, Math.min(maxX, rect.left));
+    const y = Math.max(0, Math.min(maxY, rect.top));
+    setHostPosition(host, positionStyle, { top: `${y}px`, left: `${x}px` });
+  }
+
+  // On minimize, snaps the bubble to whichever SIDE (left or right) the
+  // panel was closer to when minimized — never to the top/bottom edge,
+  // per explicit instruction, so it never ends up straddling content near
+  // the very top or bottom of the page. Only decides the initial spot;
+  // the bubble is still freely draggable anywhere (including top/bottom)
+  // afterward. previousRect is the panel's own rect, captured BEFORE
+  // shrinking to bubble size — host.offsetWidth/Height by the time this
+  // runs already reflect the new, smaller bubble.
+  function snapBubbleToSide(host, positionStyle, previousRect) {
+    const margin = 16;
+    const previousCenterX = previousRect.left + previousRect.width / 2;
+    const x =
+      previousCenterX < window.innerWidth / 2
+        ? margin
+        : Math.max(margin, window.innerWidth - host.offsetWidth - margin);
+    const maxY = Math.max(0, window.innerHeight - host.offsetHeight);
+    const y = Math.max(0, Math.min(maxY, previousRect.top));
+    setHostPosition(host, positionStyle, { top: `${y}px`, left: `${x}px` });
+  }
+
   function injectSidebar() {
     // Re-creates itself if the previously-injected host was ripped out of
     // the DOM — confirmed real on React-hydrated ATS pages (Greenhouse's
@@ -4933,6 +4969,29 @@
         .panel, .panel * { line-height: 1.4; box-sizing: border-box; }
         .title { font-weight: 700; font-size: 14px; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; cursor: move; user-select: none; color: #111827; }
         .dot { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; flex: 0 0 auto; }
+        #askjobs-minimize-btn {
+          margin: 0 0 0 auto; width: auto; padding: 2px 8px; font-size: 16px; line-height: 1;
+          background: transparent; color: #9ca3af; box-shadow: none; border-radius: 6px;
+        }
+        #askjobs-minimize-btn:hover { background: #f3f4f6; color: #374151; opacity: 1; }
+        /* Collapsed form of the whole sidebar — a small draggable circle that
+           stays out of the way of the actual application form underneath,
+           while still being one click away instead of gone entirely (the
+           only other way to get the panel back is re-clicking the browser
+           toolbar icon, which most people won't think to do mid-application). */
+        #askjobs-bubble {
+          position: relative;
+          width: 44px; height: 44px; border-radius: 50%; cursor: default; user-select: none;
+          background: #C02C2A; box-shadow: 0 8px 20px rgba(15,23,42,0.28), 0 2px 6px rgba(15,23,42,0.12);
+          display: flex; align-items: center; justify-content: center;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+          font-weight: 700; font-size: 13px; color: #fff;
+        }
+        #askjobs-bubble:hover { opacity: 0.92; }
+        #askjobs-bubble .dot {
+          position: absolute; top: -1px; right: -1px;
+          width: 10px; height: 10px; border: 2px solid #fff;
+        }
         #askjobs-counter {
           display: inline-flex; align-items: center; font-size: 12px; font-weight: 600;
           color: #166534; background: #ecfdf5; border: 1px solid #bbf7d0; border-radius: 999px;
@@ -4976,8 +5035,11 @@
         .field-label { font-size: 12px; font-weight: 500; color: #1f2937; word-break: break-word; }
         .field-detail { font-size: 11px; color: #9ca3af; margin-top: 1px; word-break: break-word; }
       </style>
-      <div class="panel">
-        <div class="title"><span class="dot"></span> AskJobs Autofill</div>
+      <div class="panel" id="askjobs-panel">
+        <div class="title">
+          <span class="dot"></span> AskJobs Autofill
+          <button id="askjobs-minimize-btn" title="Minimize">–</button>
+        </div>
         <div id="askjobs-counter" title="Click to show/hide details">Ready</div>
         <button id="askjobs-fill-btn">Fill this application</button>
         <button id="askjobs-ai-fill-btn">AI-fill remaining questions</button>
@@ -4990,6 +5052,7 @@
           and attach it manually.
         </div>
       </div>
+      <div id="askjobs-bubble" class="hidden" title="Click to restore AskJobs Autofill">AJ<span class="dot"></span></div>
     `;
 
     sidebarShadow = shadow;
@@ -5001,7 +5064,36 @@
       const details = shadow.querySelector("#askjobs-field-results");
       details.classList.toggle("hidden");
     });
-    makeDraggable(host, shadow.querySelector(".title"), shadow.querySelector("#askjobs-position-style"));
+    // Minimize/restore — collapses the whole panel into a small draggable
+    // bubble instead of the candidate having no way to get the form
+    // underneath fully visible again short of closing the tab. Toggling
+    // which of the two elements is hidden is enough on its own; nothing
+    // about their content needs to change between states.
+    const panel = shadow.querySelector("#askjobs-panel");
+    const bubble = shadow.querySelector("#askjobs-bubble");
+    const minimizeBtn = shadow.querySelector("#askjobs-minimize-btn");
+    // Sits inside .title, which is the drag handle below — its own
+    // mousedown would otherwise bubble up and start a drag the instant
+    // someone tries to click this button, since bubbling happens
+    // independently of the click handler underneath.
+    minimizeBtn.addEventListener("mousedown", (e) => e.stopPropagation());
+    const positionStyle = shadow.querySelector("#askjobs-position-style");
+    minimizeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const panelRect = host.getBoundingClientRect(); // still the full panel here, before hiding it
+      panel.classList.add("hidden");
+      bubble.classList.remove("hidden");
+      snapBubbleToSide(host, positionStyle, panelRect);
+    });
+    bubble.addEventListener("click", () => {
+      bubble.classList.add("hidden");
+      panel.classList.remove("hidden");
+      // The bubble can sit in a corner it fits fine in (44x44) that the
+      // much larger restored panel wouldn't — re-clamp to the new size.
+      clampHostToViewport(host, positionStyle);
+    });
+    makeDraggable(host, shadow.querySelector(".title"), positionStyle);
+    makeDraggable(host, bubble, positionStyle);
   }
 
   // Drags by the title bar — updates the host's own top/left (switching off
@@ -5011,17 +5103,61 @@
     let dragging = false;
     let offsetX = 0;
     let offsetY = 0;
+    // Confirmed real (the minimize bubble, which is both the drag handle
+    // AND a click-to-restore target — .title has no click behavior of its
+    // own, so this never mattered there): mouseup still fires a native
+    // "click" on the handle afterward even after a real drag, as long as
+    // mousedown and mouseup landed on the same element — which they always
+    // do here, since the whole point is dragging the bubble without
+    // letting go over something else. Without distinguishing the two, any
+    // drag ended in the panel silently popping back open right after.
+    let moved = false;
+    let startX = 0;
+    let startY = 0;
 
     handle.addEventListener("mousedown", (e) => {
       dragging = true;
+      moved = false;
+      startX = e.clientX;
+      startY = e.clientY;
       const rect = host.getBoundingClientRect();
       offsetX = e.clientX - rect.left;
       offsetY = e.clientY - rect.top;
       e.preventDefault();
     });
 
+    // Capture phase: needs to run and decide whether to suppress the click
+    // BEFORE the handle's own click listener (e.g. the bubble's
+    // restore-the-panel handler) gets a chance to react to it.
+    handle.addEventListener(
+      "click",
+      (e) => {
+        if (moved) {
+          e.stopImmediatePropagation();
+          e.preventDefault();
+          // Confirmed real: capture-phase listeners on an ANCESTOR
+          // (.title) also fire for clicks that start on a DESCENDANT
+          // (the minimize button lives inside .title) — including ones
+          // whose own mousedown never reaches .title at all (it's stopped
+          // via stopPropagation there). Left at true, one single real
+          // drag of the title bar would silently swallow every future
+          // click on the minimize button forever, since nothing else
+          // ever resets it back to false. Consumed here as a one-shot: it
+          // only ever suppresses the exact click immediately following a
+          // real drag, never an unrelated later one.
+          moved = false;
+        }
+      },
+      { capture: true },
+    );
+
     document.addEventListener("mousemove", (e) => {
       if (!dragging) return;
+      // A few pixels of jitter on an intended plain click shouldn't count
+      // as "moved" — only real dragging should suppress the click.
+      if (Math.abs(e.clientX - startX) > 3 || Math.abs(e.clientY - startY) > 3) {
+        moved = true;
+      }
       // Confirmed real: the sidebar's content (title + buttons + AI
       // suggestion cards + field results) can easily run 700-800px tall —
       // taller than a non-maximized browser window. window.innerHeight -

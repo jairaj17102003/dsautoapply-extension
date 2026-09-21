@@ -35,7 +35,7 @@
     // since it's usually the field right before them on the page, though
     // matcher order doesn't actually matter here (the patterns don't overlap).
     { key: "prefix", patterns: ["prefix", "salutation", "honorific"] },
-    { key: "firstName", patterns: ["first name", "firstname", "given name"] },
+    { key: "firstName", patterns: ["first name", "firstname", "given name", "preferred name"] },
     { key: "lastName", patterns: ["last name", "lastname", "surname", "family name"] },
     { key: "email", patterns: ["email"] },
     // Confirmed real (a BrassRing "Create Profile" candidate portal): a
@@ -133,6 +133,9 @@
     // unambiguous "notice period" wording only, to avoid fighting over
     // the same field.
     { key: "noticePeriod", patterns: ["notice period", "notice required"] },
+    // "Where are you currently located?" — city and country side by side
+    // (see valueForKey), checked before the bare "location" below.
+    { key: "currentLocation", patterns: ["currently located", "where are you located", "where are you based", "current location"] },
     { key: "location", patterns: ["location"] },
     { key: "linkedin", patterns: ["linkedin"] },
     { key: "portfolio", patterns: ["portfolio", "website", "personal site"] },
@@ -206,7 +209,9 @@
     // matched fields like "Middle Name" or "Nickname", filling them with
     // the user's full name. "full name"/"your name" are specific enough to
     // stay safe while still covering the common single-field-name case.
-    { key: "fullName", patterns: ["full name", "your name"] },
+    // "Legal Name" — confirmed real (Ashby): a single-field name box that
+    // reached "generic field not recognized".
+    { key: "fullName", patterns: ["full name", "your name", "legal name", "full legal name"] },
   ];
 
   // Radio-button screening questions — matched at the GROUP level (the
@@ -306,6 +311,14 @@
     // by" pattern would otherwise claim "were you ever employed by the
     // United States government" and answer it from the candidate's company
     // history, which has nothing to do with government employment.
+    // Confirmed real (Ashby): "Interview Recording Consent" — Yes, I
+    // consent to be recorded / Opt out of recording. Consent is always Yes
+    // here (see radioAnswerForKey); the Yes option is picked by its "Yes..."
+    // wording like any other Yes/No group.
+    {
+      key: "consentToRecording",
+      patterns: ["recording consent", "consent to be recorded", "consent to recording", "consent to the recording", "consent to being recorded"],
+    },
     {
       key: "relativeEmployedHere",
       patterns: [
@@ -625,6 +638,18 @@
       normalizedQuestionText.includes("phone device type") ||
       normalizedQuestionText.includes("phone type") ||
       normalizedQuestionText.includes("type of phone")
+    );
+  }
+
+  // "Where are you currently located?" — the candidate's own city/address,
+  // answered as a review-before-insert suggestion (autocomplete pickers only
+  // accept one of their own suggestions, so it's typed and matched, not set).
+  function isCurrentLocationQuestion(normalizedQuestionText) {
+    return (
+      normalizedQuestionText.includes("currently located") ||
+      normalizedQuestionText.includes("where are you located") ||
+      normalizedQuestionText.includes("where are you based") ||
+      normalizedQuestionText.includes("current location")
     );
   }
 
@@ -1019,6 +1044,15 @@
     const prevSibling = field.previousElementSibling;
     const prevText = prevSibling && !prevSibling.matches("input, select, textarea, button") ? prevSibling.textContent?.trim() : "";
     if (prevText && prevText.length < 40) return prevText;
+    // Confirmed real (Ashby): each question sits in a
+    // .ashby-application-form-field-entry whose <label for="..."> title points
+    // at an id the actual input never carries (the location autocomplete and
+    // the react-datepicker box have no id at all), so the `for` lookup above
+    // finds nothing and the field was only ever seen by its placeholder
+    // ("Start typing...", "Pick date...") — never as "Where are you currently
+    // located?" / "ideal start-date".
+    const ashbyTitle = field.closest(".ashby-application-form-field-entry")?.querySelector(".ashby-application-form-question-title");
+    if (ashbyTitle?.textContent?.trim()) return ashbyTitle.textContent;
     return "";
   }
 
@@ -1129,6 +1163,13 @@
       // addressCity field specifically.
       case "location":
         return profile.addressCity || profile.address || null;
+      // City and country side by side ("Tampa, United States"). Falls back to
+      // the free-text address, then to where the current job is based, when
+      // no structured city/country is stored.
+      case "currentLocation": {
+        const cityAndCountry = [profile.addressCity, profile.addressCountry].filter(Boolean).join(", ");
+        return cityAndCountry || profile.address || currentExperienceEntry()?.location || null;
+      }
       case "addressStreet":
         return profile.addressStreet || null;
       case "addressCity":
@@ -1265,6 +1306,9 @@
   // everywhere else.
   function isDateShapedField(field) {
     if (field.type === "date") return true;
+    // A react-datepicker box (Ashby's "Pick date...") — its placeholder
+    // carries no MM/DD/YYYY hint to detect, but the widget itself is a date.
+    if (field.closest(".react-datepicker-wrapper") || field.classList.contains("ashby-application-form-input-date")) return true;
     const hint = normalize(field.getAttribute("placeholder") || "");
     return /\bmm\b.*\byyyy\b|\byyyy\b.*\bmm\b|\bdd\b.*\byyyy\b/.test(hint);
   }
@@ -1855,6 +1899,11 @@
     // never-actionable "review above and click Insert" line with nothing
     // left to review or click.
     if (/review (above and click Insert|and click Insert)/.test(detail || "")) return;
+    // One console line per outcome — many answers (Yes/No buttons, radio
+    // groups, checkboxes) otherwise leave no trace at all, so a form that
+    // "didn't fill" could not be told apart from one that filled and was
+    // then reset by the page.
+    console.log("[AskJobs] result:", status, "|", label, "|", detail);
     // Cheap check (isConnected) on every result — self-heals the sidebar if
     // an SPA re-render wiped it since injectSidebar()'s own initial call
     // (see that function's comment). No-ops instantly when it's still there.
@@ -2495,6 +2544,8 @@
     fieldResults.length = 0;
     filledCount = 0;
     skippedCount = 0;
+    suggestRows.clear();
+    renderSuggestList();
     const resultsContainer = sidebarShadow?.querySelector("#askjobs-ai-results");
     if (resultsContainer) resultsContainer.innerHTML = "";
     renderFieldResults();
@@ -2552,10 +2603,59 @@
   // entries is a normal, expected part of every fill pass.
   let fillInProgress = false;
 
+  // Confirmed real (Ashby): attaching the resume makes Ashby run its OWN
+  // "Autofill from resume" parse a few seconds later, which then re-applies
+  // its parsed values over the form — phone came back empty and the Yes/No
+  // answers (visa sponsorship, hybrid schedule) went back to unselected,
+  // right after this extension had filled them. Attaching the resume FIRST
+  // and waiting for that parse to finish means everything filled afterward
+  // sticks, and the fields Ashby itself filled (name, email, location) are
+  // simply left alone.
+  // Held as a promise (not a boolean) so a second "Fill" click, or the
+  // page-load pass racing a manual one, WAITS for the same step instead of
+  // skipping straight to filling while the parse is still pending.
+  let ashbyResumeStepPromise = null;
+  function attachResumeFirstAndWaitForAshbyAutofill() {
+    if (ashbyResumeStepPromise) return ashbyResumeStepPromise;
+    if (!document.querySelector(".ashby-application-form-autofill-input-root")) return Promise.resolve();
+    const resumeInput = document.getElementById("_systemfield_resume");
+    if (!resumeInput) return Promise.resolve();
+
+    ashbyResumeStepPromise = (async () => {
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      const alreadyAttached = Boolean(resumeInput.closest(".ashby-application-form-field-entry")?.querySelector(".ashby-application-form-input-file-item"));
+      if (!alreadyAttached) await fillField(resumeInput);
+
+      const pendingLayer = () => document.querySelector(".ashby-application-form-autofill-input-pending-layer");
+      const isParsing = () => {
+        const layer = pendingLayer();
+        return Boolean(layer) && layer.getAttribute("data-state") !== "hidden";
+      };
+      // Ashby shows its "Autofill completed!" alert once the parse has been
+      // applied — that is the signal to wait for. Upload + parse can take
+      // well over 5 seconds, so waiting only for the "parsing" layer to
+      // appear (the first attempt) ended too early and Ashby then overwrote
+      // everything filled in the meantime. Capped so a resume Ashby can't
+      // parse at all never stalls the form for more than ~25s.
+      showAiStatus("Waiting for the site's own resume autofill to finish before filling...");
+      const started = Date.now();
+      while (Date.now() - started < 25000) {
+        const done = Boolean(document.querySelector(".ashby-application-form-autofill-input-form-alert")) && !isParsing();
+        if (done) break;
+        await sleep(500);
+      }
+      await sleep(1500);
+      showAiStatus("");
+      console.log("[AskJobs] Ashby resume autofill finished (or timed out after", Math.round((Date.now() - started) / 1000), "s) — filling the rest of the form now");
+    })();
+    return ashbyResumeStepPromise;
+  }
+
   async function scanAndFill(root) {
     fillInProgress = true;
     try {
       resetFillStateIfNewContext(deepQueryAll(root, "input, select, textarea, button"));
+      await attachResumeFirstAndWaitForAshbyAutofill();
 
       // Runs before the generic per-field loop below so that, by the time it
       // reaches an education/experience field, it already has a value and is
@@ -2707,7 +2807,7 @@
     // Never used for skills/experience/credential questions (the model is
     // told to return null for those, which go to the resume-reading pass).
     if (key === "defaultNoDisclosure") return false;
-    if (key === "defaultYesEligibility") return true;
+    if (key === "defaultYesEligibility" || key === "consentToRecording") return true;
 
     const prefs = jobPreferences || {};
 
@@ -3234,6 +3334,11 @@
     for (const heading of headings) {
       const text = normalize(heading.textContent || "");
       if (!patterns.some((p) => matchesWholeWord(text, p))) continue;
+      // Confirmed real (Ashby's job-posting sidebar): an "Employment Type"
+      // heading ("Full time") matched the experience pattern "employment"
+      // and was scanned as a Work Experience section — 0 fields, a hunt for
+      // an "Add" button that doesn't exist, and repeated work on every pass.
+      if (/\bemployment (type|status)\b/.test(text)) continue;
       const candidate = heading.closest("fieldset, section") || findFlatSectionContent(heading);
       if (candidate && isPlausibleSectionContainer(candidate, sectionKey, "heading", text)) {
         return candidate;
@@ -4822,6 +4927,22 @@
         continue;
       }
 
+      if (isCurrentLocationQuestion(questionText)) {
+        attemptedSignatures.add(signature);
+        const stored = valueForKey("currentLocation");
+        console.log("[AskJobs] generic combobox recognized as current location, stored value:", stored, "->", fieldLabel);
+        if (stored) {
+          renderStoredValueSuggestion(fieldLabel, stored, async () => {
+            const result = await fillCustomComboboxBestEffort(button, stored, fieldLabel);
+            recordResult(result.filled ? "filled" : "skipped", fieldLabel, result.filled ? `${result.value} (from your profile, reviewed)` : "Couldn't find a matching option");
+          });
+          recordResult("skipped", fieldLabel, "Suggested from your profile — review above and click Insert");
+        } else {
+          recordResult("skipped", fieldLabel, "Recognized as a location question, but no address/city is set in the profile — please answer directly");
+        }
+        continue;
+      }
+
       if (isPhoneDeviceTypeQuestion(questionText)) {
         attemptedSignatures.add(signature);
         const filled = await fillCustomCombobox(button, "Mobile", fieldLabel);
@@ -5517,6 +5638,15 @@
         .field-text { flex: 1 1 auto; min-width: 0; }
         .field-label { font-size: 12px; font-weight: 500; color: #1f2937; word-break: break-word; }
         .field-detail { font-size: 11px; color: #9ca3af; margin-top: 1px; word-break: break-word; }
+        #askjobs-suggest-list { margin-top: 10px; border-top: 1px solid #f1f2f4; padding-top: 8px; }
+        .suggest-heading { font-size: 11px; font-weight: 600; color: #6b7280; margin-bottom: 4px; }
+        .suggest-row { display: flex; align-items: flex-start; gap: 8px; padding: 6px 0; border-bottom: 1px solid #f6f7f8; }
+        .suggest-row:last-child { border-bottom: none; }
+        .suggest-text { flex: 1 1 auto; min-width: 0; }
+        .suggest-label { font-size: 12px; color: #1f2937; word-break: break-word; }
+        .suggest-note { font-size: 11px; color: #9ca3af; margin-top: 1px; }
+        .suggest-btn { flex: 0 0 auto; width: auto !important; margin: 0 !important; padding: 5px 10px !important;
+                       font-size: 11.5px !important; background: #eef2ff; color: #4338ca; border: 1px solid #c7d2fe; }
       </style>
       <div class="panel" id="askjobs-panel">
         <div class="title">
@@ -5528,6 +5658,7 @@
         <button id="askjobs-ai-fill-btn">AI-fill remaining questions</button>
         <div id="askjobs-ai-status" class="hidden"></div>
         <div id="askjobs-ai-results"></div>
+        <div id="askjobs-suggest-list"></div>
         <div id="askjobs-field-results"></div>
         <div id="askjobs-resume-link" class="hidden">
           Couldn't auto-attach your resume —
@@ -5866,6 +5997,7 @@
         isDisabilityQuestion(normalizedLabel) ||
         isCountryQuestion(normalizedLabel) ||
         isPhoneDeviceTypeQuestion(normalizedLabel) ||
+        isCurrentLocationQuestion(normalizedLabel) ||
         isReferralSourceQuestion(normalizedLabel) ||
         isCitizenshipQuestion(normalizedLabel)
       ) continue;
@@ -6161,7 +6293,9 @@
         if (!target) return;
 
         showSuggestionCard(item.questionText, `Suggested answer: ${answer ? "Yes" : "No"}`, false, () => {
-          target.click();
+          // Ashby's Yes/No buttons toggle OFF when the active one is clicked
+          // again — leave an already-selected answer alone.
+          if (target.getAttribute("aria-pressed") !== "true") target.click();
           recordResult("filled", item.questionText, `${answer ? "Yes" : "No"} (AI-classified, reviewed)`);
         });
         addedCount += 1;
@@ -6244,10 +6378,102 @@
     );
 
     // Still-unrecognized items (not one of the fixed personal-info/screening
-    // categories) go to the broader qualification-answering pass, which
-    // reasons over the actual resume instead of matching against a fixed
-    // category list — e.g. "Do you have 2+ years of Java experience?".
-    await runQualificationAnswerPass(unresolved);
+    // categories) need the broader qualification-answering pass, which
+    // reasons over the resume/profile — e.g. "Why are you interested in
+    // this role?" or "Do you have 2+ years of Java experience?". In the top
+    // frame these become a "Suggest" button per question in the sidebar,
+    // used AFTER the rest of the form is filled (so a site's own autofill
+    // can't wipe the answer, and the candidate chooses when to spend an AI
+    // call). Child frames have no sidebar of their own, so they keep the
+    // old immediate behavior.
+    if (window.self === window.top) registerSuggestableQuestions(unresolved);
+    else await runQualificationAnswerPass(unresolved);
+  }
+
+  // ---- On-demand "Suggest" list --------------------------------------
+  const suggestRows = new Map(); // normalized question text -> { item, state, note }
+
+  function registerSuggestableQuestions(items) {
+    for (const item of items || []) {
+      const key = normalize(item.questionText || "").slice(0, 200);
+      if (!key || suggestRows.has(key)) continue;
+      suggestRows.set(key, { item, state: "idle", note: "" });
+    }
+    renderSuggestList();
+  }
+
+  // Whether the question already holds an answer (filled by the extension,
+  // the site, or the user) — Suggest never overwrites one.
+  function suggestItemAlreadyAnswered(item) {
+    if (item.kind === "radioGroup") return item.radios.some((r) => r.checked);
+    if (item.kind === "checkboxGroup") return item.boxes.some((b) => b.checked);
+    if (item.kind === "buttonToggleGroup") return item.buttons.some((b) => b.getAttribute("aria-pressed") === "true");
+    if (item.kind === "field") {
+      if (item.field.tagName === "SELECT") return Boolean(item.field.value) && !PLACEHOLDER_OPTION_TEXT.test(normalize(item.field.selectedOptions?.[0]?.textContent || ""));
+      return Boolean((item.field.value || "").trim());
+    }
+    return false;
+  }
+
+  function renderSuggestList() {
+    if (window.self !== window.top) return;
+    injectSidebar();
+    const host = sidebarShadow?.querySelector("#askjobs-suggest-list");
+    if (!host) return;
+    host.textContent = "";
+    if (suggestRows.size === 0) return;
+
+    const heading = document.createElement("div");
+    heading.className = "suggest-heading";
+    heading.textContent = "Needs an answer — use Suggest once the rest is filled";
+    host.appendChild(heading);
+
+    for (const [key, row] of suggestRows) {
+      const wrap = document.createElement("div");
+      wrap.className = "suggest-row";
+
+      const text = document.createElement("div");
+      text.className = "suggest-text";
+      const label = document.createElement("div");
+      label.className = "suggest-label";
+      const question = (row.item.questionText || "").trim();
+      label.textContent = question.length > 110 ? `${question.slice(0, 107)}...` : question;
+      text.appendChild(label);
+      if (row.note) {
+        const note = document.createElement("div");
+        note.className = "suggest-note";
+        note.textContent = row.note;
+        text.appendChild(note);
+      }
+
+      const button = document.createElement("button");
+      button.className = "suggest-btn";
+      button.textContent = row.state === "busy" ? "Thinking..." : "Suggest";
+      button.disabled = row.state === "busy";
+      button.addEventListener("click", async () => {
+        if (row.state === "busy") return;
+        if (suggestItemAlreadyAnswered(row.item)) {
+          suggestRows.delete(key);
+          renderSuggestList();
+          return;
+        }
+        row.state = "busy";
+        row.note = "";
+        renderSuggestList();
+        const added = await runQualificationAnswerPass([row.item]);
+        if (added > 0) {
+          suggestRows.delete(key);
+        } else {
+          row.state = "idle";
+          row.note = added < 0 ? "Couldn't reach the AI — try again" : "Not enough in the resume or profile to suggest an answer";
+        }
+        renderSuggestList();
+      });
+
+      wrap.appendChild(text);
+      wrap.appendChild(button);
+      host.appendChild(wrap);
+    }
   }
 
   // Renders one review-before-insert card per question the resume-reading
@@ -6277,7 +6503,7 @@
         showSuggestionCard(item.questionText, `Suggested answer: ${answer}`, false, () => {
           const target = item.buttons.find((b) => normalize(b.textContent || "") === normalize(answer));
           if (target) {
-            target.click();
+            if (target.getAttribute("aria-pressed") !== "true") target.click();
             recordResult("filled", item.questionText, `${answer} (AI-answered from resume, reviewed)`);
           } else {
             recordResult("skipped", item.questionText, "Couldn't find a matching option");
@@ -6340,11 +6566,17 @@
   // you have 2+ years of Java experience?" that no keyword list could
   // anticipate. Covers any of the three item shapes uniformly; always
   // review-before-insert, same as every other AI-sourced value in this file.
+  // Returns how many answers were added, or -1 when the AI couldn't be
+  // reached at all (so the on-demand Suggest button can say which it was).
   async function runQualificationAnswerPass(unresolvedItems) {
-    if (!unresolvedItems || unresolvedItems.length === 0) return;
-    if (!pendingHandoff?.candidateId) return;
+    if (!unresolvedItems || unresolvedItems.length === 0) return 0;
+    if (!pendingHandoff?.candidateId) return -1;
 
     showAiStatus(`Reading the candidate's resume to answer ${unresolvedItems.length} more question(s)...`);
+
+    // Lets the AI ground a "why are you interested in this role?" answer in
+    // what the posting actually says (title, description, listed skills).
+    const jobDescription = ((await getJobDescriptionText()) || "").slice(0, 1500);
 
     const response = await sendMessage({
       type: "API_FETCH",
@@ -6355,6 +6587,10 @@
           candidateId: pendingHandoff.candidateId,
           jobTitle: pendingHandoff?.jobTitle,
           company: pendingHandoff?.companyName,
+          jobDescription,
+          // Resume text first, the candidate's profile fields second (the
+          // Backend adds those itself) — see answerQualificationQuestions.
+          resumeText: (resumeRawText || "").slice(0, 6000),
           questions: unresolvedItems.map((item) => ({
             questionText: item.questionText,
             options: item.options,
@@ -6366,7 +6602,7 @@
     if (!response?.ok) {
       console.warn("[AskJobs] answer-qualification-questions failed:", response);
       showAiStatus(response?.status === 429 ? "AI rate limit reached — try again later." : "Couldn't reach AI for the remaining question(s).");
-      return;
+      return -1;
     }
 
     const answers = response.data?.answers || [];
@@ -6376,6 +6612,7 @@
         ? `AI auto-filled ${addedCount} more answer(s) — check the results list below.`
         : "AI couldn't find enough on your resume to answer the remaining question(s)."
     );
+    return addedCount;
   }
 
   // EDUCATION_FIELD_MATCHERS/CERTIFICATION_FIELD_MATCHERS/WEBSITE_FIELD_MATCHERS

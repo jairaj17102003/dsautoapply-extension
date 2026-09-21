@@ -49,6 +49,9 @@
       patterns: ["username", "user name", "user id", "login id", "account username", "create a username", "choose a username"],
       excludePatterns: ["github username", "linkedin username", "twitter username", "slack username"],
     },
+    // Checked before "phone" below — "Phone Device Type" contains the bare
+    // word "phone" too. See isPhoneDeviceTypeQuestion for the combobox path.
+    { key: "phoneDeviceType", patterns: ["phone device type", "phone type", "type of phone"] },
     {
       key: "phone",
       patterns: ["phone", "mobile", "contact number"],
@@ -57,7 +60,7 @@
       // filled all three with the raw phone digits. Neither is something
       // we have real data for (no stored calling code, no extension), so
       // excluded rather than guessed.
-      excludePatterns: ["phone code", "country code", "extension"],
+      excludePatterns: ["phone code", "country code", "extension", "device type", "phone type", "type of phone"],
     },
     // Structured address sub-fields — checked BEFORE the generic "location"
     // fallback below. The old bare "address"/"city" patterns lived under a
@@ -108,6 +111,8 @@
         "work permit",
         "permitted to work",
         "authorization to work",
+        "authorisation to work",
+        "authorised to work",
         "eligibility to work",
         "sponsorship",
         "visa",
@@ -257,6 +262,15 @@
         "eligibility to work",
         "legally permitted to work",
         "authorized to be employed",
+        // British spelling — confirmed real (AstraZeneca's Workday form):
+        // "Are you legally authorised to work in the country(ies) in which
+        // this role is based?" matched none of the "authorized" patterns
+        // above, and then got claimed as a country field instead.
+        "authorised to work",
+        "legally authorised",
+        "authorisation to work",
+        "work authorisation",
+        "authorised to be employed",
       ],
     },
     // Confirmed real (same form): "Do you require a work permit, visa or
@@ -282,6 +296,39 @@
     {
       key: "willingToRelocate",
       patterns: ["willing to relocate", "relocation", "open to relocation", "open to relocating", "able to relocate"],
+    },
+    // Disclosure-style questions where "No" is the answer for virtually every
+    // candidate (see radioAnswerForKey) — confirmed real (3M's Workday form):
+    // "Do you have a relative presently employed at or retired from 3M?" and
+    // the two "Are you / have you or a household member ... employed by a
+    // State government or the United States government ..." questions.
+    // Deliberately placed BEFORE workedHereBefore: its bare "ever employed
+    // by" pattern would otherwise claim "were you ever employed by the
+    // United States government" and answer it from the candidate's company
+    // history, which has nothing to do with government employment.
+    {
+      key: "relativeEmployedHere",
+      patterns: [
+        "relative presently employed",
+        "relative currently employed",
+        "relative employed",
+        "relatives employed",
+        "family member employed",
+        "family member who is employed",
+        "related to anyone employed",
+        "related to any employee",
+      ],
+    },
+    {
+      key: "governmentEmployment",
+      patterns: [
+        "employed by a state government",
+        "employed by the united states government",
+        "employed by the federal government",
+        "employed by a government",
+        "government official",
+        "public official",
+      ],
     },
     {
       key: "workedHereBefore",
@@ -568,6 +615,46 @@
   // equivalent of this same category): "country code"/"phone code" belong
   // to a dial-code selector, not an address; "citizenship" is a distinct,
   // more sensitive legal-status question.
+  // Confirmed real (3M's Workday form): "Phone Device Type" is a dropdown
+  // (Business/Campus/Fax/Mobile/Mobile-Business/...) sitting right next to the
+  // phone number. The bare "phone" FIELD_MATCHER used to claim it and try to
+  // put the digits into it. There's no stored per-candidate value for it —
+  // "Mobile" is the fixed default for every candidate.
+  function isPhoneDeviceTypeQuestion(normalizedQuestionText) {
+    return (
+      normalizedQuestionText.includes("phone device type") ||
+      normalizedQuestionText.includes("phone type") ||
+      normalizedQuestionText.includes("type of phone")
+    );
+  }
+
+  // "How did you hear about us?" — answered with the company's Careers
+  // site when the list offers it, otherwise LinkedIn, otherwise left alone
+  // (never a guess at some other source). Any option STARTING with "career"
+  // counts as Careers, except "career fair"/"career event" wordings, which
+  // are different sources entirely.
+  function isReferralSourceQuestion(normalizedQuestionText) {
+    return (
+      normalizedQuestionText.includes("how did you hear") ||
+      normalizedQuestionText.includes("where did you hear") ||
+      normalizedQuestionText.includes("how did you find out") ||
+      normalizedQuestionText.includes("how did you learn about") ||
+      normalizedQuestionText.includes("hear about us") ||
+      normalizedQuestionText.includes("referral source")
+    );
+  }
+
+  function pickReferralSourceOption(optionTexts) {
+    const careers = optionTexts.find((t) => {
+      const n = normalize(t);
+      return n.startsWith("career") && !/(fair|event)/.test(n);
+    });
+    if (careers) return careers;
+    const companySite = optionTexts.find((t) => /^(company|corporate) (career |careers )?(web ?site|site|page)$/.test(normalize(t)));
+    if (companySite) return companySite;
+    return optionTexts.find((t) => normalize(t).includes("linkedin")) || null;
+  }
+
   function isCountryQuestion(normalizedQuestionText) {
     return (
       matchesWholeWord(normalizedQuestionText, "country") &&
@@ -598,7 +685,11 @@
       !normalizedQuestionText.includes("authorization to work") &&
       !normalizedQuestionText.includes("eligibility to work") &&
       !normalizedQuestionText.includes("sponsorship") &&
-      !normalizedQuestionText.includes("visa")
+      !normalizedQuestionText.includes("visa") &&
+      // Catch-all for this whole collision class: any question one of the
+      // fixed Yes/No screening categories already owns (whatever spelling or
+      // phrasing) is never a country field, even if it mentions "country".
+      !matchRadioQuestion(normalizedQuestionText)
     );
   }
 
@@ -741,6 +832,16 @@
   // were the tailored one.
   let resumeIsFallbackPrimary = false;
   let resumeSkills = [];
+  // The resume version carries the candidate's WHOLE skill list, so what
+  // actually gets typed into a skills field is narrowed to the ones the job
+  // description mentions (see skillsForJob). Cached against the exact
+  // resumeSkills array it was computed from, so a later re-fetch recomputes.
+  let jobDescriptionText = null;
+  let jobDescriptionFetched = false;
+  let filteredSkillsCache = null;
+  let filteredSkillsSource = null;
+  const MAX_SKILLS_TO_FILL = 15;
+  const MIN_JD_MATCHED_SKILLS = 5;
   // Pre-generated at optimization time (ResumeVersion.coverLetter) — fetched
   // alongside the resume file/skills in getResumeFileUrl(), not generated
   // on demand like OG's version.
@@ -1046,6 +1147,8 @@
         return profile.currentJobTitle || currentExperienceEntry()?.title || null;
       case "currentCompany":
         return currentExperienceEntry()?.company || null;
+      case "phoneDeviceType":
+        return "Mobile";
       // Rounded to a whole number — real dropdowns overwhelmingly list
       // whole years ("5 Years", "8 Years"), and the existing generic
       // SELECT/combobox matching here already does substring matching, so
@@ -1204,11 +1307,46 @@
   // so a false success here is worse than reporting nothing. A native
   // type="date" input has no such mask to corrupt — setNativeValue sets
   // it directly and that's authoritative.
+  // Confirmed real (Paylocity's "Available to Start"): the widget's own
+  // value handling mangled typed keystrokes into "0900-01-01/21/2026" — no
+  // letters in it, so the old "no letters means fine" check reported success
+  // on a visibly garbage date. A date now only counts as filled when it's
+  // either the exact digits asked for or one clean three-part date.
+  function looksLikeCleanDate(value) {
+    return /^\d{1,4}[/.-]\d{1,2}[/.-]\d{1,4}$/.test((value || "").trim());
+  }
+
+  // Reverses formatDateForField's own ordering detection (same placeholder
+  // rules) to get a plain yyyy-MM-dd back out of the formatted string.
+  function isoFromFormattedDate(field, formatted) {
+    const parts = (formatted.match(/\d+/g) || []).map((p) => p);
+    if (parts.length !== 3) return null;
+    const hint = normalize(field.getAttribute("placeholder") || "");
+    const ddIndex = hint.indexOf("dd");
+    const mmIndex = hint.indexOf("mm");
+    const yyyyIndex = hint.indexOf("yyyy");
+    let y, m, d;
+    if (yyyyIndex !== -1 && mmIndex !== -1 && yyyyIndex < mmIndex) {
+      [y, m, d] = ddIndex !== -1 && ddIndex < mmIndex ? [parts[0], parts[2], parts[1]] : parts;
+    } else if (ddIndex !== -1 && mmIndex !== -1 && ddIndex < mmIndex) {
+      [d, m, y] = parts;
+    } else {
+      [m, d, y] = parts;
+    }
+    return `${y.padStart(4, "0")}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
+  }
+
   async function fillDateField(field, formattedValue) {
     if (field.type === "date") {
       setNativeValue(field, formattedValue);
       return true;
     }
+
+    const wantedDigits = formattedValue.replace(/\D/g, "");
+    const holdsWantedDate = () => {
+      const current = field.value || "";
+      return current.replace(/\D/g, "") === wantedDigits || looksLikeCleanDate(current);
+    };
 
     // Confirmed real (BambooHR's "Date Available" field): its live input
     // mask mangled character-by-character keystrokes into a garbled mix of
@@ -1225,9 +1363,21 @@
     if (field.value === formattedValue) return true;
 
     typeCharacterByCharacter(field, formattedValue);
-    if (field.value.length > 0 && !/[a-zA-Z]/.test(field.value)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    if (holdsWantedDate()) return true;
 
-    // Neither approach produced a clean result — leave the field empty
+    // Some date widgets (the console showed Paylocity's complaining that the
+    // value "does not conform to the required format, yyyy-MM-dd") only
+    // accept an ISO string handed to them whole — one last attempt that way.
+    const iso = isoFromFormattedDate(field, formattedValue);
+    if (iso) {
+      setNativeValue(field, "");
+      setNativeValue(field, iso);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      if (holdsWantedDate()) return true;
+    }
+
+    // None of the approaches produced a clean result — leave the field empty
     // rather than a half-typed, visibly broken mix of digits and leftover
     // mask placeholder letters, which reads as real (wrong) data instead
     // of an obviously still-unfilled field.
@@ -1759,6 +1909,55 @@
   // skill pickers (type, click a suggestion, no free typing accepted) are
   // out of scope — if neither shape is detected, this reports failure and
   // the caller flags it as "need attention" rather than claiming success.
+  async function getJobDescriptionText() {
+    if (jobDescriptionFetched) return jobDescriptionText;
+    jobDescriptionFetched = true;
+    if (!pendingHandoff?.jobId) return null;
+    const jobResult = await sendMessage({ type: "API_FETCH", path: `/api/v1/jobs/${pendingHandoff.jobId}` });
+    if (jobResult?.ok) {
+      jobDescriptionText = [jobResult.data?.title, jobResult.data?.description, ...(jobResult.data?.skills || [])]
+        .filter(Boolean)
+        .join("\n");
+    }
+    return jobDescriptionText;
+  }
+
+  function skillAppearsIn(skill, haystack) {
+    const escaped = skill.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (!escaped) return false;
+    return new RegExp(`(?<![A-Za-z0-9])${escaped}(?![A-Za-z0-9])`, "i").test(haystack);
+  }
+
+  // Skills the job description actually mentions, in the resume's own order,
+  // capped at MAX_SKILLS_TO_FILL. If fewer than MIN_JD_MATCHED_SKILLS match
+  // (wording differences like "Node" vs "Node.js", or no description on
+  // file), the matches still come first but the rest of the resume's skills
+  // pad the list, so the field is never left nearly empty.
+  async function skillsForJob(allSkills) {
+    if (filteredSkillsCache && filteredSkillsSource === allSkills) return filteredSkillsCache;
+    const jd = await getJobDescriptionText();
+    let chosen;
+    if (!jd) {
+      chosen = allSkills.slice(0, MAX_SKILLS_TO_FILL);
+    } else {
+      const matched = allSkills.filter((s) => skillAppearsIn(s, jd));
+      const rest = allSkills.filter((s) => !matched.includes(s));
+      chosen = (matched.length >= MIN_JD_MATCHED_SKILLS ? matched : [...matched, ...rest]).slice(0, MAX_SKILLS_TO_FILL);
+      console.log("[AskJobs] skills:", matched.length, "of", allSkills.length, "appear in the job description; filling", chosen.length);
+    }
+    filteredSkillsCache = chosen;
+    filteredSkillsSource = allSkills;
+    return chosen;
+  }
+
+  // Synchronous view for suggestion previews — the real filtered list once
+  // fillSkillsField has computed it, otherwise the same cap on the raw list.
+  function skillsPreview() {
+    return filteredSkillsSource === resumeSkills && filteredSkillsCache
+      ? filteredSkillsCache
+      : resumeSkills.slice(0, MAX_SKILLS_TO_FILL);
+  }
+
   async function fillSkillsField(field) {
     if (!resumeSkills || resumeSkills.length === 0) {
       resumeSkills = await refetchResumeSkills();
@@ -1767,18 +1966,19 @@
       console.log("[AskJobs] skills: nothing to fill — resumeSkills is empty (no resume handoff/data for this session)");
       return false;
     }
+    const skills = await skillsForJob(resumeSkills);
 
     // Workday's "Type to Add Skills" is the same multiselect-search widget
     // as School/Field of Study — typing opens a checkbox-option dropdown
     // that must actually be clicked, Enter doesn't commit anything there.
     if (isMultiselectSearchBox(field)) {
-      return fillMultiselectSearch(field, resumeSkills, labelForField(field) || "skills");
+      return fillMultiselectSearch(field, skills, labelForField(field) || "skills");
     }
 
     field.focus();
     field.dispatchEvent(new Event("focus", { bubbles: true, composed: true }));
 
-    typeStringInto(field, resumeSkills[0]);
+    typeStringInto(field, skills[0]);
     dispatchEnterKey(field);
     field.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
 
@@ -1787,8 +1987,8 @@
     const isTagInput = !field.value || field.value.trim() === "";
 
     if (isTagInput) {
-      for (let i = 1; i < resumeSkills.length; i++) {
-        typeStringInto(field, resumeSkills[i], { clearFirst: false });
+      for (let i = 1; i < skills.length; i++) {
+        typeStringInto(field, skills[i], { clearFirst: false });
         dispatchEnterKey(field);
         field.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
         await new Promise((resolve) => setTimeout(resolve, 100));
@@ -1799,7 +1999,7 @@
       const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(field), "value");
       descriptor.set.call(field, "");
       field.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
-      typeStringInto(field, resumeSkills.join(", "), { clearFirst: false });
+      typeStringInto(field, skills.join(", "), { clearFirst: false });
       field.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
     }
 
@@ -2118,6 +2318,14 @@
       if (field.tagName === "SELECT" && (await fillScreeningSelect(field, signature, fieldLabel))) {
         return;
       }
+      // A plain text box asking "How did you hear about us?" — no option
+      // list to choose from, so LinkedIn is the fixed answer.
+      if (field.tagName !== "SELECT" && isReferralSourceQuestion(normalize(fieldLabel))) {
+        attemptedSignatures.add(signature);
+        const filled = setNativeValue(field, "LinkedIn");
+        recordResult(filled ? "filled" : "skipped", fieldLabel, filled ? "LinkedIn" : `Couldn't confirm "LinkedIn" was actually accepted — please check and fill directly`);
+        return;
+      }
       console.log("[AskJobs] generic field not recognized:", fieldLabel);
       maybeQueueFieldForClassification(field, signature);
       return;
@@ -2129,7 +2337,7 @@
       recordResult(
         filled ? "filled" : "skipped",
         fieldLabel,
-        filled ? resumeSkills.join(", ") : "Couldn't fill — check the field manually"
+        filled ? skillsPreview().join(", ") : "Couldn't fill — check the field manually"
       );
       console.log("[AskJobs] generic field (skills)", filled ? "filled" : "fill failed", ":", fieldLabel);
       return;
@@ -2467,10 +2675,16 @@
 
     // Computed straight from the profile, not a stored preference — the
     // question is really "is the candidate's age >= 18", and we already
-    // have the one piece of data that answers it directly.
+    // have the one piece of data that answers it directly. Confirmed real
+    // bug: this read profile.dateOfBirth (the old AskJobs platform's field
+    // name), but Candidate.model.js stores it as `dob` — valueForKey's own
+    // "dateOfBirth" case already reads profile.dob correctly — so this
+    // returned null for every candidate, even one with a DOB set, and every
+    // "Are you 18 years of age or older?" came back "Recognized, but no
+    // stored preference set yet" (Workday/3M).
     if (key === "atLeast18") {
-      if (!profile?.dateOfBirth) return null;
-      const dob = new Date(profile.dateOfBirth);
+      if (!profile?.dob) return null;
+      const dob = new Date(profile.dob);
       if (Number.isNaN(dob.getTime())) return null;
       const now = new Date();
       let age = now.getFullYear() - dob.getFullYear();
@@ -2480,6 +2694,20 @@
       if (!hadBirthdayThisYear) age -= 1;
       return age >= 18;
     }
+
+    // Disclosure questions where "No" is the answer for virtually every
+    // candidate — a fixed default, not derived from profile data.
+    if (key === "relativeEmployedHere" || key === "governmentEmployment") return false;
+
+    // Categories the AI classifier (Backend's classify-fields) assigns to a
+    // yes/no question no fixed matcher above recognized — see
+    // KNOWN_FIELD_KEYS there for exactly what qualifies. Restrictive
+    // covenants, conflicts of interest and similar disclosures answer No;
+    // eligibility/consent/acceptance-of-conditions questions answer Yes.
+    // Never used for skills/experience/credential questions (the model is
+    // told to return null for those, which go to the resume-reading pass).
+    if (key === "defaultNoDisclosure") return false;
+    if (key === "defaultYesEligibility") return true;
 
     const prefs = jobPreferences || {};
 
@@ -2611,6 +2839,21 @@
       return true;
     }
 
+    if (isReferralSourceQuestion(questionText)) {
+      const optionTexts = Array.from(field.options).map((o) => o.textContent.trim()).filter(Boolean);
+      const choice = pickReferralSourceOption(optionTexts);
+      const option = choice ? Array.from(field.options).find((o) => o.textContent.trim() === choice) : null;
+      if (!option) {
+        recordResult("skipped", fieldLabel, "No Careers or LinkedIn option offered — please choose directly");
+        return true;
+      }
+      field.value = option.value;
+      field.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      attemptedSignatures.add(signature);
+      recordResult("filled", fieldLabel, choice);
+      return true;
+    }
+
     const matcher = matchRadioQuestion(questionText);
     if (!matcher) return false;
 
@@ -2698,10 +2941,21 @@
     // shape, so this exact question was never even attempted for any
     // entry, current or not (QuikTrip's own "current: true" entry was
     // left on "— Make a Selection —" despite the data being right there).
-    { key: "isCurrentJob", patterns: ["current job", "currently work here", "current position", "still work here", "presently employed"] },
+    { key: "isCurrentJob", patterns: ["current job", "currently work here", "currently working here", "current position", "still work here", "still working here", "presently employed"] },
   ];
 
-  const CURRENT_POSITION_PATTERNS = ["currently work here", "current position", "i currently work", "present"];
+  // "currently working here" is the -ing wording ("I'm currently working
+  // here") — the plain "currently work here" pattern never matches it.
+  const CURRENT_POSITION_PATTERNS = [
+    "currently work here",
+    "currently working here",
+    "currently working",
+    "current position",
+    "i currently work",
+    "still work here",
+    "still working here",
+    "present",
+  ];
 
   // Certifications and Websites both render zero entry fields until "Add"
   // is clicked (confirmed via real HTML, same shape as Work Experience) —
@@ -3098,6 +3352,16 @@
       if (!finalValue) return false;
       return fillDateField(field, finalValue);
     }
+    // A plain text box masked as MM/DD/YYYY (Paylocity's Work History
+    // From/To) — none of the date-specific branches above match it, so the
+    // raw ISO value ("2024-09-01T00:00:00.000Z") fell through to the bottom
+    // of this function and got written in verbatim. Format it the way the
+    // field's own placeholder asks, like every other date-shaped field.
+    if ((key === "startDate" || key === "endDate") && isDateShapedField(field)) {
+      const finalValue = formatDateForField(field, stringValue);
+      if (!finalValue) return false;
+      return fillDateField(field, finalValue);
+    }
     if (isMultiselectSearchBox(field)) {
       return fillMultiselectSearch(field, [stringValue], fieldLabel, { fallbackToOther: key === "institution" });
     }
@@ -3188,9 +3452,27 @@
     { synonyms: ["associate", "associates", "diploma", "polytechnic"] },
   ];
 
+  // Dotted abbreviations lose their meaning in normalize(): "B.Sc." becomes
+  // "b sc" (two words), which never equals the one-word synonym "bsc" — so
+  // Workday needed an AI round-trip to map B.Sc. -> Bachelor of Science, and
+  // a native <select> (Paylocity's "Degree Obtained": Bachelor/Master/...)
+  // has no AI fallback at all. Matched here by the whole text collapsed to
+  // one word, exact equality only, so it can't fire on ordinary sentences.
+  const DEGREE_ABBREVIATIONS = [
+    ["bs", "bsc", "ba", "be", "btech", "bcom", "bca", "beng"],
+    ["ms", "msc", "ma", "me", "mtech", "mcom", "mca", "mba", "meng"],
+    ["phd", "dphil"],
+  ];
+
   function findDegreeSynonymGroup(text) {
     const normalized = normalize(text);
-    return DEGREE_LEVEL_SYNONYMS.find((group) => group.synonyms.some((s) => matchesWholeWord(normalized, s)));
+    const bySynonym = DEGREE_LEVEL_SYNONYMS.find((group) => group.synonyms.some((s) => matchesWholeWord(normalized, s)));
+    if (bySynonym) return bySynonym;
+    const collapsed = normalized.replace(/ /g, "");
+    const abbreviationIndex = DEGREE_ABBREVIATIONS.findIndex((list) => list.includes(collapsed));
+    // The first three synonym groups (bachelor, master, doctoral) line up
+    // with DEGREE_ABBREVIATIONS by position; doctoral is group index 2.
+    return abbreviationIndex === -1 ? undefined : DEGREE_LEVEL_SYNONYMS[abbreviationIndex];
   }
 
   function degreeSynonymsMatch(optionText, targetText) {
@@ -3465,19 +3747,29 @@
       return null;
     }
 
+    // Confirmed real (Paylocity's "Degree Obtained": the first option is
+    // a bare "--" placeholder): normalize("--") is the empty string, and
+    // `target.includes("")` is true for every target — so the substring
+    // check below matched the placeholder row before any real option was
+    // even considered. Empty-text and "Select..."-style rows are never a
+    // valid answer, so they're excluded from matching entirely.
+    const matchable = options.filter((o) => {
+      const text = normalize(o.textContent);
+      return text && !PLACEHOLDER_OPTION_TEXT.test(text);
+    });
     const heuristicMatch =
-      options.find((o) => normalize(o.textContent) === target) ||
-      options.find((o) => normalize(o.textContent).includes(target) || target.includes(normalize(o.textContent))) ||
-      options.find((o) => comboboxTextsMatch(o.textContent, target)) ||
-      options.find((o) => degreeSynonymsMatch(o.textContent, target));
+      matchable.find((o) => normalize(o.textContent) === target) ||
+      matchable.find((o) => normalize(o.textContent).includes(target) || target.includes(normalize(o.textContent))) ||
+      matchable.find((o) => comboboxTextsMatch(o.textContent, target)) ||
+      matchable.find((o) => degreeSynonymsMatch(o.textContent, target));
     if (heuristicMatch) return heuristicMatch;
 
     console.log("[AskJobs] dropdown: no heuristic match among", options.length, "option(s) for", desiredText, "— asking AI");
-    const optionTexts = options.map((o) => o.textContent.trim());
+    const optionTexts = matchable.map((o) => o.textContent.trim());
     const aiPick = await aiPickBestOption(fieldLabel, desiredText, optionTexts);
     if (!aiPick) return null;
 
-    return options.find((o) => o.textContent.trim() === aiPick) || null;
+    return matchable.find((o) => o.textContent.trim() === aiPick) || null;
   }
 
   // Opens a custom dropdown purely to read its real option texts (not to
@@ -3571,7 +3863,13 @@
   // generically, rather than one-off per field.
   async function fillCustomCombobox(button, desiredText, fieldLabel) {
     closeAnyOpenPopup();
-    const existingOptions = new Set(deepQueryAll(null, '[role="option"]'));
+    // Only options VISIBLE before opening count as "already there" (stale
+    // selected chips). Confirmed real (Paylocity's react-widgets dropdowns —
+    // "Have you applied/worked with us before?"): the list's <li
+    // role="option"> rows sit permanently in the DOM inside a hidden popup,
+    // so snapshotting every role="option" excluded the real options too and
+    // the search always ended "zero options rendered".
+    const existingOptions = new Set(deepQueryAll(null, '[role="option"]').filter(isVisible));
     clickComboboxTrigger(button);
 
     // Confirmed real (a react-select country picker — ~195 entries):
@@ -4506,6 +4804,29 @@
         } else {
           recordResult("skipped", fieldLabel, "Voluntary demographic question — no disability status set in the candidate's EEO profile, please answer directly");
         }
+        continue;
+      }
+
+      if (isReferralSourceQuestion(questionText)) {
+        attemptedSignatures.add(signature);
+        const options = await gatherComboboxOptions(button);
+        const choice = pickReferralSourceOption(options);
+        if (!choice) {
+          console.log("[AskJobs] generic combobox recognized as referral source, but no Careers/LinkedIn option among:", options, "->", fieldLabel);
+          recordResult("skipped", fieldLabel, "No Careers or LinkedIn option offered — please choose directly");
+          continue;
+        }
+        const filled = await fillCustomCombobox(button, choice, fieldLabel);
+        console.log("[AskJobs] generic combobox recognized as referral source ->", filled ? "filled" : "fill failed", choice, ":", fieldLabel);
+        recordResult(filled ? "filled" : "skipped", fieldLabel, filled ? choice : `Couldn't select "${choice}"`);
+        continue;
+      }
+
+      if (isPhoneDeviceTypeQuestion(questionText)) {
+        attemptedSignatures.add(signature);
+        const filled = await fillCustomCombobox(button, "Mobile", fieldLabel);
+        console.log("[AskJobs] generic combobox recognized as phone device type ->", filled ? "filled Mobile" : "fill failed", ":", fieldLabel);
+        recordResult(filled ? "filled" : "skipped", fieldLabel, filled ? "Mobile" : `Couldn't find a matching option for "Mobile"`);
         continue;
       }
 
@@ -5472,6 +5793,7 @@
           isGenderIdentityQuestion(normalizedLabel) ||
           isDisabilityQuestion(normalizedLabel) ||
           isSensitiveSelfIdQuestion(normalizedLabel) ||
+          isReferralSourceQuestion(normalizedLabel) ||
           matchRadioQuestion(normalizedLabel)
         ) {
           continue;
@@ -5543,6 +5865,8 @@
         isGenderIdentityQuestion(normalizedLabel) ||
         isDisabilityQuestion(normalizedLabel) ||
         isCountryQuestion(normalizedLabel) ||
+        isPhoneDeviceTypeQuestion(normalizedLabel) ||
+        isReferralSourceQuestion(normalizedLabel) ||
         isCitizenshipQuestion(normalizedLabel)
       ) continue;
 
@@ -5777,8 +6101,28 @@
         return;
       }
 
+      if (item.kind === "field" && item.field.tagName === "SELECT" && radioAnswerForKey(key) !== null) {
+        // A native <select> classified into a Yes/No screening category —
+        // radio groups and comboboxes already handle these below; this is
+        // the same treatment for the plain-select shape.
+        const answer = radioAnswerForKey(key);
+        const wanted = answer ? "yes" : "no";
+        const option = Array.from(item.field.options).find((o) => {
+          const label = normalize(o.textContent);
+          return label === wanted || label.startsWith(wanted);
+        });
+        if (!option) return;
+        showSuggestionCard(item.questionText, `Suggested answer: ${answer ? "Yes" : "No"}`, false, () => {
+          item.field.value = option.value;
+          item.field.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+          recordResult("filled", item.questionText, `${answer ? "Yes" : "No"} (AI-classified, reviewed)`);
+        });
+        addedCount += 1;
+        return;
+      }
+
       if (item.kind === "field") {
-        const value = key === "skills" ? resumeSkills.join(", ") : valueForKey(key);
+        const value = key === "skills" ? skillsPreview().join(", ") : valueForKey(key);
         if (!value) return; // Recognized, but no stored data — a known category with genuinely nothing to answer with, not a candidate for resume-reading AI either.
 
         showSuggestionCard(item.questionText, value, true, async (finalValue) => {
@@ -5841,7 +6185,7 @@
               ? "Yes"
               : "No"
             : key === "skills"
-              ? resumeSkills.join(", ")
+              ? skillsPreview().join(", ")
               : valueForKey(key);
         if (!wantedText) return;
 

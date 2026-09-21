@@ -3,6 +3,7 @@
   "name": "AskJobs Recruiter — Apply with Autofill",
   "version": "0.1.0",
   "description": "Autofill job application forms using a candidate's profile and their AI-optimized resume, for recruiters applying on their behalf.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqfB8SyR4SAwwRuFWYerUoCgZDYobcVOX/+4+FW6ZMnjY33KIIqVnxZF3dKdZ3aRPHp1+CoDpVB+7h2RlQJQTcgLqyd7DFAXS9heD5spaaidV9nSJvX3venCbDn2qVUrAnXVY18saipfhywRcJxguutLLqQGyThYcS4FZ9nodKHw2nS5MdElpEnFJrA52fN1Nfy5eRXe1tWcMMKVaR64z/huyp2E1tDDMYMS+ydRMfOXl5ooVYZz+iWsYB95OPZjqepy4bEK1JgU29nt3jLK0dmU0tQQulCWJdnl4rWhFsWlaWhK87umil5dfao51a/PR/bYb7OeBM9FuqQ39mX0arwIDAQAB",
   "action": {
     "default_popup": "popup.html",
     "default_title": "AskJobs Autofill"

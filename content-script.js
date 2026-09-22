@@ -2603,59 +2603,10 @@
   // entries is a normal, expected part of every fill pass.
   let fillInProgress = false;
 
-  // Confirmed real (Ashby): attaching the resume makes Ashby run its OWN
-  // "Autofill from resume" parse a few seconds later, which then re-applies
-  // its parsed values over the form — phone came back empty and the Yes/No
-  // answers (visa sponsorship, hybrid schedule) went back to unselected,
-  // right after this extension had filled them. Attaching the resume FIRST
-  // and waiting for that parse to finish means everything filled afterward
-  // sticks, and the fields Ashby itself filled (name, email, location) are
-  // simply left alone.
-  // Held as a promise (not a boolean) so a second "Fill" click, or the
-  // page-load pass racing a manual one, WAITS for the same step instead of
-  // skipping straight to filling while the parse is still pending.
-  let ashbyResumeStepPromise = null;
-  function attachResumeFirstAndWaitForAshbyAutofill() {
-    if (ashbyResumeStepPromise) return ashbyResumeStepPromise;
-    if (!document.querySelector(".ashby-application-form-autofill-input-root")) return Promise.resolve();
-    const resumeInput = document.getElementById("_systemfield_resume");
-    if (!resumeInput) return Promise.resolve();
-
-    ashbyResumeStepPromise = (async () => {
-      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-      const alreadyAttached = Boolean(resumeInput.closest(".ashby-application-form-field-entry")?.querySelector(".ashby-application-form-input-file-item"));
-      if (!alreadyAttached) await fillField(resumeInput);
-
-      const pendingLayer = () => document.querySelector(".ashby-application-form-autofill-input-pending-layer");
-      const isParsing = () => {
-        const layer = pendingLayer();
-        return Boolean(layer) && layer.getAttribute("data-state") !== "hidden";
-      };
-      // Ashby shows its "Autofill completed!" alert once the parse has been
-      // applied — that is the signal to wait for. Upload + parse can take
-      // well over 5 seconds, so waiting only for the "parsing" layer to
-      // appear (the first attempt) ended too early and Ashby then overwrote
-      // everything filled in the meantime. Capped so a resume Ashby can't
-      // parse at all never stalls the form for more than ~25s.
-      showAiStatus("Waiting for the site's own resume autofill to finish before filling...");
-      const started = Date.now();
-      while (Date.now() - started < 25000) {
-        const done = Boolean(document.querySelector(".ashby-application-form-autofill-input-form-alert")) && !isParsing();
-        if (done) break;
-        await sleep(500);
-      }
-      await sleep(1500);
-      showAiStatus("");
-      console.log("[AskJobs] Ashby resume autofill finished (or timed out after", Math.round((Date.now() - started) / 1000), "s) — filling the rest of the form now");
-    })();
-    return ashbyResumeStepPromise;
-  }
-
   async function scanAndFill(root) {
     fillInProgress = true;
     try {
       resetFillStateIfNewContext(deepQueryAll(root, "input, select, textarea, button"));
-      await attachResumeFirstAndWaitForAshbyAutofill();
 
       // Runs before the generic per-field loop below so that, by the time it
       // reaches an education/experience field, it already has a value and is
@@ -6227,6 +6178,7 @@
     const unresolved = [];
 
     items.forEach((item, i) => {
+      refreshItemElements(item);
       const key = classifications[i];
       if (!key) {
         unresolved.push(item);
@@ -6481,10 +6433,52 @@
   // field/select, native radio group, custom combobox button), always
   // editable before insert since this is a genuine judgment call, not a
   // simple lookup.
+  // A React form (Ashby) can replace a field's DOM node while the AI is
+  // still thinking — the element captured when the question was scanned is
+  // then a detached copy, so typing into it (or clicking a button in it)
+  // "succeeds" and is reported as filled while the page shows nothing.
+  // Confirmed real: the "Why are you interested…" answer was recorded as
+  // filled with the textarea on screen still empty. Re-resolves each element
+  // to its live twin (same id/name, or the same slot inside the same
+  // data-field-path entry) right before it's used.
+  function liveEquivalent(el) {
+    if (!el || el.isConnected) return el;
+    const tag = el.tagName.toLowerCase();
+    if (el.id) {
+      const byId = document.getElementById(el.id);
+      if (byId && byId.tagName === el.tagName) return byId;
+    }
+    if (el.name) {
+      const byName = Array.from(document.getElementsByName(el.name)).filter((n) => n.tagName === el.tagName);
+      if (byName.length === 1) return byName[0];
+      const sameValue = byName.find((n) => n.value === el.value);
+      if (sameValue) return sameValue;
+    }
+    const path = el.closest?.("[data-field-path]")?.getAttribute("data-field-path");
+    if (path) {
+      const liveEntry = document.querySelector(`[data-field-path="${CSS.escape(path)}"]`);
+      if (liveEntry) {
+        const sameTag = Array.from(liveEntry.querySelectorAll(tag));
+        const sameText = sameTag.find((n) => (n.textContent || "").trim() && (n.textContent || "").trim() === (el.textContent || "").trim());
+        return sameText || sameTag[0] || el;
+      }
+    }
+    return el;
+  }
+
+  function refreshItemElements(item) {
+    if (item.field) item.field = liveEquivalent(item.field);
+    if (item.button) item.button = liveEquivalent(item.button);
+    if (item.radios) item.radios = item.radios.map(liveEquivalent);
+    if (item.boxes) item.boxes = item.boxes.map(liveEquivalent);
+    if (item.buttons) item.buttons = item.buttons.map(liveEquivalent);
+  }
+
   function renderQualificationAnswers(items, answers) {
     let addedCount = 0;
 
     items.forEach((item, i) => {
+      refreshItemElements(item);
       const answer = answers[i];
       if (!answer) return; // Not enough evidence in the resume — left unanswered, not guessed.
 
@@ -6546,7 +6540,19 @@
             }
           } else if (item.field.tagName === "TEXTAREA") {
             typeCharacterByCharacter(item.field, finalValue);
-            recordResult("filled", item.questionText, `${finalValue} (AI-answered from resume, reviewed)`);
+            // Only report success once the box actually holds the text — a
+            // controlled React textarea can drop typed input, and the
+            // sidebar used to say "filled" regardless.
+            await new Promise((resolve) => setTimeout(resolve, 200));
+            if ((item.field.value || "").trim() !== finalValue.trim()) {
+              setNativeValue(item.field, finalValue);
+              await new Promise((resolve) => setTimeout(resolve, 200));
+            }
+            if ((item.field.value || "").trim() === finalValue.trim()) {
+              recordResult("filled", item.questionText, `${finalValue} (AI-answered from resume, reviewed)`);
+            } else {
+              recordResult("skipped", item.questionText, "The page didn't keep the answer — please type or paste it in directly");
+            }
           } else {
             setNativeValue(item.field, finalValue);
             recordResult("filled", item.questionText, `${finalValue} (AI-answered from resume, reviewed)`);

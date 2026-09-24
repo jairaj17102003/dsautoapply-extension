@@ -6331,15 +6331,27 @@
 
     // Still-unrecognized items (not one of the fixed personal-info/screening
     // categories) need the broader qualification-answering pass, which
-    // reasons over the resume/profile — e.g. "Why are you interested in
-    // this role?" or "Do you have 2+ years of Java experience?". In the top
-    // frame these become a "Suggest" button per question in the sidebar,
-    // used AFTER the rest of the form is filled (so a site's own autofill
-    // can't wipe the answer, and the candidate chooses when to spend an AI
-    // call). Child frames have no sidebar of their own, so they keep the
-    // old immediate behavior.
-    if (window.self === window.top) registerSuggestableQuestions(unresolved);
-    else await runQualificationAnswerPass(unresolved);
+    // reasons over the resume/profile. Only genuine paragraph-style
+    // questions ("Why are you interested in this role?", a cover-letter-
+    // style textarea) go into the on-demand Suggest list — everything else
+    // (Yes/No dropdowns, security-clearance/consent selects, short text
+    // answers) is auto-answered immediately, same as before the Suggest
+    // list existed, since those are single-choice/short lookups a wrong
+    // guess is cheap to notice and fix, not worth an extra click for.
+    const paragraphItems = unresolved.filter(isParagraphQuestion);
+    const immediateItems = unresolved.filter((item) => !isParagraphQuestion(item));
+    if (immediateItems.length > 0) await runQualificationAnswerPass(immediateItems);
+    if (paragraphItems.length === 0) return;
+    if (window.self === window.top) registerSuggestableQuestions(paragraphItems);
+    else await runQualificationAnswerPass(paragraphItems);
+  }
+
+  // A genuine "write a few sentences" question — a plain <textarea> is the
+  // one widget shape that's reliably long-form; every other shape (select,
+  // combobox, radio/checkbox group, single-line text input) is answered
+  // with a short pick, not composed prose.
+  function isParagraphQuestion(item) {
+    return item.kind === "field" && item.fieldType === "textarea";
   }
 
   // ---- On-demand "Suggest" list --------------------------------------

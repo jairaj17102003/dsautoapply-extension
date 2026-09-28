@@ -125,7 +125,18 @@
     { key: "citizenshipCountry", patterns: ["citizenship", "country of citizenship", "citizen of"] },
     // Free text on the profile — matched against however a given ATS
     // phrases it, same pattern-list approach as everything else here.
-    { key: "expectedSalary", patterns: ["expected salary", "desired salary", "salary expectation", "salary expectations", "compensation expectation", "compensation expectations"] },
+    // Confirmed real (Akina/CATS): a bare "Salary" label — no "expected"/
+    // "desired" qualifier — fell through to the generic AI-fallback path,
+    // which drops any label under 10 characters as likely noise ("Salary"
+    // is 6), so a candidate's real, already-stored expectedSalary never got
+    // used even though it existed. excludePatterns keeps this off a
+    // "Current Salary"/"Current Compensation" field, which asks what they
+    // make NOW, a different question from what they want.
+    {
+      key: "expectedSalary",
+      patterns: ["expected salary", "desired salary", "salary expectation", "salary expectations", "compensation expectation", "compensation expectations", "salary"],
+      excludePatterns: ["current salary", "current compensation"],
+    },
     // Deliberately NOT matching "available to start"/"date available" —
     // isStartDateQuestion already owns that phrasing for the "suggest
     // today's date" default, and some ATS forms genuinely want a DATE
@@ -1323,6 +1334,14 @@
     return (
       normalizedQuestionText.includes("date available") ||
       normalizedQuestionText.includes("available to start") ||
+      // Confirmed real (evlo.ai): "What is the earliest date you are
+      // available to WORK?" — same question, "work" instead of "start",
+      // which none of the patterns above catch. Safe to add broadly since
+      // this function only ever runs on a field isDateShapedField() already
+      // confirmed is a real date input (see its one caller above) — a
+      // Yes/No "are you available to work nights?" radio question can never
+      // reach here regardless of wording.
+      normalizedQuestionText.includes("available to work") ||
       normalizedQuestionText.includes("start date") ||
       normalizedQuestionText.includes("availability date") ||
       (normalizedQuestionText.includes("when") && normalizedQuestionText.includes("start"))
@@ -1704,6 +1723,55 @@
   async function attachResumeFile(input) {
     let fileUrl = await getResumeFileUrl();
     if (!fileUrl) return { attached: false, fileMissing: false };
+
+    // Confirmed real (evlo.ai): every generated resume is a .docx (see the
+    // comment below), but some ATS upload fields declare accept=".pdf" and
+    // reject anything else outright — the site showed "Invalid file type.
+    // Please upload pdf files only." even though the simulated drop itself
+    // "succeeded." Rather than only switching formats for fields that
+    // visibly demand it, always attach the PDF export when a job-specific
+    // resume version is available — a PDF opens the same everywhere a docx
+    // does, so there's no downside to preferring it universally. Falls
+    // through to the docx path below on any failure (network issue, or no
+    // resumeVersionId at all — the master-resume fallback has no PDF
+    // export) rather than giving up.
+    if (pendingHandoff?.resumeVersionId) {
+      try {
+        const pdfResult = await sendMessage({
+          type: "API_FETCH_FILE",
+          path: `/api/v1/resume-versions/${pendingHandoff.resumeVersionId}/pdf`,
+        });
+        if (pdfResult?.ok) {
+          const pdfBlob = await (await fetch(pdfResult.dataUrl)).blob();
+          const pdfFileName = (resumeFileName || "resume.pdf").replace(/\.docx?$/i, ".pdf");
+          const pdfFile = new File([pdfBlob], pdfFileName, { type: "application/pdf" });
+          const pdfDataTransfer = new DataTransfer();
+          pdfDataTransfer.items.add(pdfFile);
+          input.files = pdfDataTransfer.files;
+          // Confirmed real (evlo.ai): checked AFTER dispatch, not before —
+          // this site's react-dropzone-style widget reads the file in its
+          // own change handler and then clears the native input's .files
+          // back to empty synchronously (so it can accept the same filename
+          // again later), which made a fully successful attach read as
+          // input.files.length === 0 right after dispatchEvent() returned.
+          // Confirmed via console: the site's own pipeline logged
+          // "Starting to process file: ...pdf" and "Resume validation
+          // successful" for an attach this code was reporting as failed.
+          // Checking right after assignment instead reflects what this
+          // check actually exists for — whether the browser accepted the
+          // simulated drop at all (some sites' inputs reject it outright) —
+          // not whatever a framework does with it afterward.
+          const pdfAssigned = input.files.length > 0;
+          input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+          if (pdfAssigned) return { attached: true, fileMissing: false };
+        } else {
+          console.warn("AskJobs Autofill: PDF resume export failed, falling back to the original file", pdfResult);
+        }
+      } catch (error) {
+        console.warn("AskJobs Autofill: PDF resume attach failed, falling back to the original file", error);
+      }
+    }
+
     try {
       // Fetching the file directly here would run in this page's origin
       // (e.g. barclays.wd3.myworkdayjobs.com) and get blocked by Firebase
@@ -1744,8 +1812,13 @@
       const dataTransfer = new DataTransfer();
       dataTransfer.items.add(file);
       input.files = dataTransfer.files;
+      // Same false-negative this file's PDF branch above hit and documents
+      // in detail — checked before dispatch, not after, since some sites'
+      // own change handlers clear .files back to empty as part of normal
+      // handling, which isn't a failure.
+      const assigned = input.files.length > 0;
       input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-      return { attached: input.files.length > 0, fileMissing: false };
+      return { attached: assigned, fileMissing: false };
     } catch (error) {
       console.warn("AskJobs Autofill: resume auto-attach failed", error);
       return { attached: false, fileMissing: false };
@@ -6492,7 +6565,18 @@
     items.forEach((item, i) => {
       refreshItemElements(item);
       const answer = answers[i];
-      if (!answer) return; // Not enough evidence in the resume — left unanswered, not guessed.
+      // Confirmed real (evlo.ai): "Are you currently a US government
+      // employee...?" and "...able to obtain a DoD security clearance?" —
+      // genuinely unanswerable from a resume, so the AI correctly returned
+      // nothing rather than guessing. But this used to just `return` here
+      // with no recordResult call at all, unlike every other skip path in
+      // this file — the question vanished from the sidebar entirely (not
+      // filled, not skipped, not in the Suggest list), leaving no sign it
+      // still needed a manual answer.
+      if (!answer) {
+        recordResult("skipped", item.questionText, "AI couldn't find enough in the resume to answer this — please answer directly");
+        return;
+      }
 
       if (item.kind === "radioGroup" || item.kind === "checkboxGroup") {
         const boxes = item.kind === "radioGroup" ? item.radios : item.boxes;

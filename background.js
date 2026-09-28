@@ -58,6 +58,40 @@ async function apiFetch(path, options = {}) {
   }
 }
 
+// Same auth as apiFetch, but for a binary response (e.g. GET
+// /resume-versions/:id/pdf) instead of JSON — apiFetch's response.json()
+// would fail on a PDF body. Returns a data URL like fetchFileAsDataUrl,
+// just against our own authenticated API instead of a pre-signed storage
+// URL.
+async function apiFetchFile(path) {
+  const token = await getToken();
+  if (!token) {
+    return { ok: false, status: 401, error: "Not connected — no extension token saved." };
+  }
+  try {
+    const response = await fetch(`${API_BASE}${path}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!response.ok) {
+      let bodyText = "";
+      try {
+        bodyText = (await response.text()).slice(0, 2000);
+      } catch {
+        // Body already consumed or unreadable — status/statusText alone still returned below.
+      }
+      return {
+        ok: false,
+        status: response.status,
+        error: `Fetch failed with status ${response.status} (${response.statusText}): ${bodyText || "<no body>"}`,
+      };
+    }
+    const blob = await response.blob();
+    return { ok: true, status: response.status, dataUrl: await blobToDataUrl(blob) };
+  } catch (error) {
+    return { ok: false, status: 0, error: error.message };
+  }
+}
+
 async function recordUnsupportedSite(hostname) {
   await apiFetch("/api/v1/extension/telemetry/unsupported-site", {
     method: "POST",
@@ -231,6 +265,21 @@ async function claimPendingHandoff(hostname, tabId) {
   return entry || null;
 }
 
+// Remembered so the popup's manual candidate picker (setUpManualCandidatePicker
+// in popup.js) can default to whichever candidate was actually applied for
+// most recently, instead of a bare "Select a candidate..." every time — the
+// common real case this serves is a LinkedIn-sourced job.url, where Apply
+// opens LinkedIn first and the automatic handoff's tab/hostname tracking
+// never reaches the real career site, so the consultant reaches for this
+// picker on every single one of that candidate's applications in a row.
+// Updated from both ways a handoff is ever created (below, and
+// SET_MANUAL_CANDIDATE_HANDOFF) so it reflects reality regardless of which
+// path last ran.
+async function setLastUsedCandidate(candidateId) {
+  if (!candidateId) return;
+  await chrome.storage.local.set({ lastUsedCandidateId: candidateId });
+}
+
 // Handoff from the Consultant app when a consultant clicks "Apply".
 chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => {
   if (message?.type !== "ASKJOBS_APPLY_HANDOFF") return;
@@ -241,6 +290,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     const queue = await getPendingHandoffs();
     queue.push({ candidateId, jobId, resumeVersionId, hostname, companyName, jobTitle, receivedAt: Date.now() });
     await chrome.storage.local.set({ pendingHandoffs: queue });
+    await setLastUsedCandidate(candidateId);
 
     // Learn about ATS platforms we don't support yet without ever needing
     // broad host_permissions or running a content script on that domain.
@@ -284,6 +334,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       case "API_FETCH": {
         sendResponse(await apiFetch(message.path, message.options));
+        break;
+      }
+      case "API_FETCH_FILE": {
+        sendResponse(await apiFetchFile(message.path));
         break;
       }
       case "FETCH_FILE_AS_DATA_URL": {
@@ -342,7 +396,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           claimedByTabId: message.tabId,
         });
         await chrome.storage.local.set({ pendingHandoffs: queue });
+        await setLastUsedCandidate(message.candidateId);
         sendResponse({ ok: true });
+        break;
+      }
+      case "GET_LAST_USED_CANDIDATE": {
+        const { lastUsedCandidateId } = await chrome.storage.local.get("lastUsedCandidateId");
+        sendResponse({ lastUsedCandidateId: lastUsedCandidateId || null });
         break;
       }
       default:

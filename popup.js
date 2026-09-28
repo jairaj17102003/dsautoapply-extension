@@ -80,11 +80,35 @@ document.addEventListener("DOMContentLoaded", async () => {
       candidateSelect.innerHTML = '<option value="">No candidates found</option>';
       return;
     }
+
+    // Whichever candidate was actually applied for most recently (via this
+    // exact popup OR the normal Consultant-app Apply flow — see
+    // setLastUsedCandidate in background.js) — defaulting to them instead of
+    // a bare placeholder matters because a LinkedIn-sourced job routinely
+    // sends the SAME candidate through this picker for every single one of
+    // their applications in a row (Apply opens LinkedIn first, which this
+    // picker exists to work around), so re-selecting them by hand every time
+    // is pure repeated friction.
+    const { lastUsedCandidateId } = await chrome.runtime.sendMessage({ type: "GET_LAST_USED_CANDIDATE" });
+    const lastUsed = lastUsedCandidateId ? candidates.find((c) => c._id === lastUsedCandidateId) : null;
+
     candidateSelect.innerHTML =
       '<option value="">Select a candidate…</option>' +
       candidates
-        .map((c) => `<option value="${c._id}">${c.firstName} ${c.lastName} (${c.email})</option>`)
+        .map((c) => {
+          const label = `${c.firstName} ${c.lastName} (${c.email})${c._id === lastUsedCandidateId ? " — most recent" : ""}`;
+          return `<option value="${c._id}"${c._id === lastUsedCandidateId ? " selected" : ""}>${label}</option>`;
+        })
         .join("");
+
+    // <select> doesn't fire "change" for a programmatic `selected` attribute
+    // (only real user interaction does), so the resume-version load and
+    // button enable that normally follow a candidate pick have to be done
+    // here explicitly for this pre-selected default.
+    if (lastUsed) {
+      manualCandidateBtn.disabled = !tab?.id;
+      await loadResumeVersionsFor(lastUsed._id);
+    }
   }
 
   // Confirmed real gap: the picker used to only ever send candidateId, with
@@ -122,6 +146,12 @@ document.addEventListener("DOMContentLoaded", async () => {
     resumeVersionSelect.innerHTML =
       '<option value="">Use master resume (no specific version)</option>' +
       versions.map((v) => `<option value="${v._id}">${v.fileName}</option>`).join("");
+    // listResumeVersionsForCandidate sorts createdAt DESC, so versions[0] is
+    // the most recently optimized one — defaulting to it instead of "use
+    // master resume" means the common path (pick the recent candidate this
+    // picker already defaults to, click Fill) uses their latest job-specific
+    // resume without an extra manual pick every time.
+    if (versions.length > 0) resumeVersionSelect.value = versions[0]._id;
   }
 
   candidateSelect.addEventListener("change", () => {

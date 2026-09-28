@@ -443,6 +443,22 @@
     "lgbtq", // covers "LGBTQ", "LGBTQ+", "LGBTQIA+" etc. without needing "transgender" wording
   ];
 
+  // User's explicit choice: race/ethnicity auto-fills directly from the
+  // candidate's stored EEO answer, same as work authorization, instead of
+  // requiring a manual "Insert" click the way every OTHER category under
+  // isSensitiveSelfIdQuestion still does (veteran status, sexual
+  // orientation, LGBTQ, age range, diversity survey) — those still stop for
+  // explicit confirmation. Same condition sensitiveSelfIdSingleValue/
+  // sensitiveSelfIdFreeText already use to recognize this specific category.
+  function isRaceOrEthnicityQuestion(normalizedQuestionText) {
+    return (
+      normalizedQuestionText.includes("ethnicit") ||
+      normalizedQuestionText.includes("hispanic") ||
+      normalizedQuestionText.includes("racial") ||
+      matchesWholeWord(normalizedQuestionText, "race")
+    );
+  }
+
   function isSensitiveSelfIdQuestion(normalizedQuestionText) {
     // Bare "race" needs a word-boundary check (not a plain SENSITIVE_SELF_ID_
     // PATTERNS entry) to avoid matching inside "embrace"/"bracelet"/etc.
@@ -853,8 +869,11 @@
   let jobPreferences = null;
   // Raw CandidateEeoProfile doc, kept separately from jobPreferences —
   // sensitiveSelfIdFreeText/SingleValue/CheckboxTargets below read this
-  // directly to suggest (never auto-fill) real answers for the sensitive
-  // self-ID categories isSensitiveSelfIdQuestion otherwise blocks outright.
+  // directly to answer isSensitiveSelfIdQuestion's categories. Race/
+  // ethnicity auto-fills directly from it (user's explicit choice); every
+  // other category here (veteran status, sexual orientation, LGBTQ, age
+  // range, diversity survey) still only ever suggests, requiring the
+  // consultant's own "Insert" click before anything is actually filled.
   let eeoProfile = null;
   let resumeFileUrl = null;
   // The actual ResumeVersion/MasterResume fileName (e.g.
@@ -2229,15 +2248,20 @@
       queuedFieldSignatures.add(signature);
       const stored = sensitiveSelfIdFreeText(questionText);
       if (stored) {
-        renderStoredValueSuggestion(label, stored, () => {
+        const insertValue = () => {
           if (field.tagName === "TEXTAREA") {
             typeCharacterByCharacter(field, stored);
           } else {
             setNativeValue(field, stored);
           }
           recordResult("filled", label, `${stored} (from the candidate's EEO profile, reviewed)`);
-        });
-        recordResult("skipped", label, "Suggested from the candidate's EEO profile — review above and click Insert");
+        };
+        if (isRaceOrEthnicityQuestion(questionText)) {
+          insertValue();
+        } else {
+          renderStoredValueSuggestion(label, stored, insertValue);
+          recordResult("skipped", label, "Suggested from the candidate's EEO profile — review above and click Insert");
+        }
       } else {
         recordResult("skipped", label, "Voluntary demographic question — left for you to answer directly");
       }
@@ -2807,9 +2831,16 @@
     // "Are you 18 years of age or older?" came back "Recognized, but no
     // stored preference set yet" (Workday/3M).
     if (key === "atLeast18") {
-      if (!profile?.dob) return null;
+      // No DOB on file defaults true rather than leaving it unanswered —
+      // every candidate on this platform is placed as an experienced
+      // professional (years of real work history on their resume), so
+      // "under 18" is not a realistic case here, unlike questions (visa
+      // sponsorship, security clearance) where the true answer genuinely
+      // varies per candidate. Still overridden by a real DOB below when one
+      // exists.
+      if (!profile?.dob) return true;
       const dob = new Date(profile.dob);
-      if (Number.isNaN(dob.getTime())) return null;
+      if (Number.isNaN(dob.getTime())) return true;
       const now = new Date();
       let age = now.getFullYear() - dob.getFullYear();
       const hadBirthdayThisYear =
@@ -2948,15 +2979,20 @@
         : null;
       const matchedOption = await resolveOptionMatch(fieldLabel, stored, optionTexts, quickMatch);
       if (matchedOption) {
-        renderStoredValueSuggestion(fieldLabel, matchedOption, () => {
+        const insertOption = () => {
           const option = Array.from(field.options).find((o) => o.textContent.trim() === matchedOption);
           if (option) {
             field.value = option.value;
             field.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
             recordResult("filled", fieldLabel, `${matchedOption} (from the candidate's EEO profile, reviewed)`);
           }
-        });
-        recordResult("skipped", fieldLabel, "Suggested from the candidate's EEO profile — review above and click Insert");
+        };
+        if (isRaceOrEthnicityQuestion(questionText)) {
+          insertOption();
+        } else {
+          renderStoredValueSuggestion(fieldLabel, matchedOption, insertOption);
+          recordResult("skipped", fieldLabel, "Suggested from the candidate's EEO profile — review above and click Insert");
+        }
         return true;
       }
       recordResult("skipped", fieldLabel, "Voluntary demographic question — left for you to answer directly");
@@ -3193,18 +3229,36 @@
     // "certification" as a whole word even though the field is a
     // completely unrelated Specialty, not a certification name. Same
     // excludePatterns convention matchRadioQuestion already uses.
+    //
+    // Confirmed real, serious (Ashby/WRITER): startDate/endDate's bare
+    // "from"/"to" patterns exist for genuinely short field labels (RTX/
+    // Phenom's plain "From"/"To" — see EXPERIENCE_FIELD_MATCHERS' own
+    // comment), but matchesWholeWord only checks the word appears somewhere
+    // standalone, not that the label IS that word. WRITER's cultural-values
+    // essay question — "Please give an example FROM your professional
+    // experience..." — happened to sit inside the same detected Experience
+    // section and matched bare "from", getting filled with a job's raw ISO
+    // startDate instead of being left as the free-text question it actually
+    // is. A genuine "From"/"To" field label is always short; a full
+    // sentence containing that common word as connective tissue isn't one,
+    // whatever the word happens to be.
+    const RISKY_SHORT_WORD_PATTERNS = ["from", "to"];
+    const isShortLabel = strongText.length <= 20;
+    const patternIsSafe = (p) => isShortLabel || !RISKY_SHORT_WORD_PATTERNS.includes(p);
     for (const matcher of matchers) {
       if (
-        matcher.patterns.some((p) => matchesWholeWord(strongText, p)) &&
+        matcher.patterns.some((p) => patternIsSafe(p) && matchesWholeWord(strongText, p)) &&
         !(matcher.excludePatterns || []).some((p) => matchesWholeWord(strongText, p))
       ) {
         return matcher.key;
       }
     }
     const placeholderText = normalize(field.getAttribute("placeholder") || "");
+    const placeholderIsShort = placeholderText.length <= 20;
+    const placeholderPatternIsSafe = (p) => placeholderIsShort || !RISKY_SHORT_WORD_PATTERNS.includes(p);
     for (const matcher of matchers) {
       if (
-        matcher.patterns.some((p) => matchesWholeWord(placeholderText, p)) &&
+        matcher.patterns.some((p) => placeholderPatternIsSafe(p) && matchesWholeWord(placeholderText, p)) &&
         !(matcher.excludePatterns || []).some((p) => matchesWholeWord(placeholderText, p))
       ) {
         return matcher.key;
@@ -4788,14 +4842,19 @@
           : null;
         const matchedOption = await resolveOptionMatch(label, stored, optionTexts, quickMatch);
         if (matchedOption) {
-          renderStoredValueSuggestion(label, matchedOption, () => {
+          const insertOption = () => {
             const target = groupRadios.find((r) => (labelForField(r) || r.value || "").trim() === matchedOption);
             if (target) {
               setNativeChecked(target);
               recordResult("filled", label, `${matchedOption} (from the candidate's EEO profile, reviewed)`);
             }
-          });
-          recordResult("skipped", label, "Suggested from the candidate's EEO profile — review above and click Insert");
+          };
+          if (isRaceOrEthnicityQuestion(questionText)) {
+            insertOption();
+          } else {
+            renderStoredValueSuggestion(label, matchedOption, insertOption);
+            recordResult("skipped", label, "Suggested from the candidate's EEO profile — review above and click Insert");
+          }
         } else {
           recordResult("skipped", label, "Voluntary demographic question — left for you to answer directly");
         }
@@ -5019,15 +5078,20 @@
         const stored = sensitiveSelfIdSingleValue(questionText);
         console.log("[AskJobs] generic combobox recognized as sensitive self-ID question, stored value:", stored, "->", fieldLabel);
         if (stored) {
-          renderStoredValueSuggestion(fieldLabel, stored, async () => {
+          const insertValue = async () => {
             const result = await fillCustomComboboxBestEffort(button, stored, fieldLabel);
             recordResult(
               result.filled ? "filled" : "skipped",
               fieldLabel,
               result.filled ? `${result.value} (from the candidate's EEO profile, reviewed)` : "Couldn't find a matching option",
             );
-          });
-          recordResult("skipped", fieldLabel, "Suggested from the candidate's EEO profile — review above and click Insert");
+          };
+          if (isRaceOrEthnicityQuestion(questionText)) {
+            await insertValue();
+          } else {
+            renderStoredValueSuggestion(fieldLabel, stored, insertValue);
+            recordResult("skipped", fieldLabel, "Suggested from the candidate's EEO profile — review above and click Insert");
+          }
         } else {
           recordResult("skipped", fieldLabel, "Voluntary demographic question — left for you to answer directly");
         }
@@ -5152,11 +5216,16 @@
         const label = rawQuestionText || "Demographic question";
         const suggestion = sensitiveSelfIdCheckboxTargets(questionText, groupBoxes);
         if (suggestion) {
-          renderStoredValueSuggestion(label, suggestion.displayText, () => {
+          const insertTargets = () => {
             suggestion.targets.forEach((box) => setNativeChecked(box));
             recordResult("filled", label, `${suggestion.displayText} (from the candidate's EEO profile, reviewed)`);
-          });
-          recordResult("skipped", label, "Suggested from the candidate's EEO profile — review above and click Insert");
+          };
+          if (isRaceOrEthnicityQuestion(questionText)) {
+            insertTargets();
+          } else {
+            renderStoredValueSuggestion(label, suggestion.displayText, insertTargets);
+            recordResult("skipped", label, "Suggested from the candidate's EEO profile — review above and click Insert");
+          }
         } else {
           recordResult("skipped", label, "Voluntary demographic question — left for you to answer directly");
         }
@@ -6390,7 +6459,15 @@
 
     if (!response?.ok) {
       console.warn("[AskJobs] classify-fields failed:", response);
-      showAiStatus("");
+      // Confirmed real: generating a new extension token (Consultant app's
+      // Extension page) silently revokes whatever token this tab already
+      // has cached — every subsequent AI call then 401s, which used to show
+      // nothing here at all (an empty status looks identical to "nothing to
+      // do" — no sign anything's actually wrong). A 401 specifically means
+      // the token itself is stale, not that the AI/network failed, so it
+      // gets its own actionable message instead of silence or the generic
+      // "couldn't reach" wording used for real connectivity failures below.
+      showAiStatus(response?.status === 401 ? "Extension disconnected — generate a new token and reconnect (see Settings)." : "");
       return;
     }
 
@@ -6703,7 +6780,17 @@
 
     if (!response?.ok) {
       console.warn("[AskJobs] answer-qualification-questions failed:", response);
-      showAiStatus(response?.status === 429 ? "AI rate limit reached — try again later." : "Couldn't reach AI for the remaining question(s).");
+      // A 401 here means the extension's own token is stale (see the
+      // matching comment in runClassificationPass) — not a network/AI
+      // problem, so it gets a distinct, actionable message instead of
+      // lumping it in with a genuine connectivity failure.
+      showAiStatus(
+        response?.status === 401
+          ? "Extension disconnected — generate a new token and reconnect (see Settings)."
+          : response?.status === 429
+            ? "AI rate limit reached — try again later."
+            : "Couldn't reach AI for the remaining question(s).",
+      );
       return -1;
     }
 
@@ -6796,15 +6883,15 @@
       return;
     }
 
-    // Real, candidate opt-in EEO answers (CandidateEeoProfile) — used only
-    // for the narrow set of categories this file already treats as safe to
-    // suggest from stored data (workAuthorized/visaSponsorshipNeeded via
-    // radioAnswerForKey, gender/disability via bestGenderOptionText/
-    // bestDisabilityOptionText — all still review-before-insert, never
-    // auto-inserted, same as OG). Race, ethnicity, sexual orientation, and
-    // veteran status are deliberately NEVER auto-filled regardless of
-    // whether real data exists here — isSensitiveSelfIdQuestion blocks
-    // those categories outright by design, not because the data's missing.
+    // Real, candidate opt-in EEO answers (CandidateEeoProfile). workAuthorized/
+    // visaSponsorshipNeeded (via radioAnswerForKey) auto-fill directly, same
+    // as any other known-good stored value. gender/disability/veteran status/
+    // sexual orientation/LGBTQ (via isGenderIdentityQuestion/
+    // isDisabilityQuestion/isSensitiveSelfIdQuestion) only ever suggest,
+    // requiring the consultant's own "Insert" click. Race/ethnicity is the
+    // one exception within isSensitiveSelfIdQuestion's otherwise-suggest-only
+    // categories — user's explicit choice — and auto-fills directly too (see
+    // isRaceOrEthnicityQuestion).
     const eeoResult = await sendMessage({ type: "API_FETCH", path: `/api/v1/candidates/${candidateId}/eeo` });
     console.log("[AskJobs] candidate EEO fetch result:", eeoResult);
     const eeo = eeoResult?.ok ? eeoResult.data || {} : {};

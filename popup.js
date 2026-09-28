@@ -48,7 +48,23 @@ document.addEventListener("DOMContentLoaded", async () => {
   let resumeVersionsById = {};
 
   const { token } = await chrome.runtime.sendMessage({ type: "GET_TOKEN" });
-  const connected = !!token;
+  let connected = !!token;
+  // Confirmed real: this used to stop at "is some token cached locally",
+  // which stays true even after that token's been silently revoked —
+  // generating a new one anywhere (Consultant app's Extension page) revokes
+  // whatever this popup already has, one active token per user. A stale
+  // token showed a green "Connected" here right up until a fill attempt
+  // failed deep into an application with a vague "couldn't reach AI" error.
+  // Verifying against a real, cheap authenticated endpoint catches that
+  // upfront instead.
+  let staleToken = false;
+  if (connected) {
+    const check = await chrome.runtime.sendMessage({ type: "API_FETCH", path: "/api/v1/users/me" });
+    if (check?.status === 401) {
+      connected = false;
+      staleToken = true;
+    }
+  }
   optionsBtn.addEventListener("click", () => chrome.runtime.openOptionsPage());
 
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -223,7 +239,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   if (!connected) {
-    statusEl.textContent = "Not connected — add your token in Settings";
+    statusEl.textContent = staleToken
+      ? "Token expired or replaced — generate a new one and reconnect in Settings"
+      : "Not connected — add your token in Settings";
     statusEl.className = "status disconnected";
   }
 

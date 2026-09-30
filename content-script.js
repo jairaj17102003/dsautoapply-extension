@@ -35,8 +35,11 @@
     // since it's usually the field right before them on the page, though
     // matcher order doesn't actually matter here (the patterns don't overlap).
     { key: "prefix", patterns: ["prefix", "salutation", "honorific"] },
-    { key: "firstName", patterns: ["first name", "firstname", "given name", "preferred name"] },
-    { key: "lastName", patterns: ["last name", "lastname", "surname", "family name"] },
+    // Confirmed real (Mattel/SmartRecruiters signature block): "First and
+    // Last Name:" matched "last name" and got ONLY the surname — it's the
+    // fullName field (see its patterns below).
+    { key: "firstName", patterns: ["first name", "firstname", "given name", "preferred name"], excludePatterns: ["first and last name"] },
+    { key: "lastName", patterns: ["last name", "lastname", "surname", "family name"], excludePatterns: ["first and last name"] },
     { key: "email", patterns: ["email"] },
     // Confirmed real (a BrassRing "Create Profile" candidate portal): a
     // bare "Username" field under its own "Security Information" section,
@@ -163,7 +166,17 @@
     // the AI-answering pass to re-derive from the resume on every single
     // application, which is exactly what the "AI-answered ... reviewed"
     // result this replaces was doing every time before.
-    { key: "totalExperience", patterns: ["years of experience", "years experience", "experience level"] },
+    // Confirmed real (Mattel/SmartRecruiters): "What is your experience
+    // level WITH Apache Airflow or Google Cloud Composer...?" matched
+    // "experience level" and got the candidate's TOTAL career years ("7"),
+    // which fits none of its options. A question about a specific tool or
+    // skill isn't asking for total experience — leave those to the AI pass,
+    // which sees the real options.
+    {
+      key: "totalExperience",
+      patterns: ["years of experience", "years experience", "experience level"],
+      excludePatterns: ["experience level with", "experience with", "years of experience with", "years of experience using", "experience level in"],
+    },
     { key: "dateOfBirth", patterns: ["date of birth", "birth date", "dob"] },
     { key: "skills", patterns: ["skills", "key skills", "skill set"] },
     // Confirmed real (Johns Hopkins APL's iCIMS form): a bare single text
@@ -222,7 +235,7 @@
     // stay safe while still covering the common single-field-name case.
     // "Legal Name" — confirmed real (Ashby): a single-field name box that
     // reached "generic field not recognized".
-    { key: "fullName", patterns: ["full name", "your name", "legal name", "full legal name"] },
+    { key: "fullName", patterns: ["full name", "your name", "legal name", "full legal name", "first and last name"] },
   ];
 
   // Radio-button screening questions — matched at the GROUP level (the
@@ -788,7 +801,7 @@
   // every other native-select/custom-combobox field in this file, rather
   // than anything specific to one site's widget.
   async function fillNearbyCountrySelector(phoneField) {
-    const country = profile?.address?.country;
+    const country = countryForPhoneSelector(profile?.phone);
     if (!country) {
       console.log("[AskJobs] phone country selector skipped — no country set in your profile");
       return;
@@ -1014,6 +1027,28 @@
     return (text || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
   }
 
+  // "Today's Date", "Current Date", "Date (today)", or a bare "Date" /
+  // "Date Signed" on a signature block — all mean the date of filling.
+  function isTodaysDateLabel(label) {
+    const text = normalize(label);
+    return /\b(today s date|todays date|today date|current date|date today|date signed|signature date|date of signature)\b/.test(text) || text === "date";
+  }
+
+  // Formats the current date the way the field expects: ISO for a native
+  // date input, otherwise following any placeholder hint (DD/MM/YYYY,
+  // YYYY-MM-DD), defaulting to US MM/DD/YYYY.
+  function formatTodayForField(field) {
+    const now = new Date();
+    const yyyy = String(now.getFullYear());
+    const mm = String(now.getMonth() + 1).padStart(2, "0");
+    const dd = String(now.getDate()).padStart(2, "0");
+    if (field.type === "date") return `${yyyy}-${mm}-${dd}`;
+    const hint = (field.getAttribute("placeholder") || "").toLowerCase();
+    if (/^y{2,4}\W?m{1,2}\W?d{1,2}$/.test(hint)) return `${yyyy}-${mm}-${dd}`;
+    if (/^d{1,2}\W?m{1,2}\W?y{2,4}$/.test(hint)) return `${dd}/${mm}/${yyyy}`;
+    return `${mm}/${dd}/${yyyy}`;
+  }
+
   // Like `el.textContent`, but excludes non-visible text nodes. Originally
   // just stripped <title>/<style>/<script> tags (SVG <title> was the first
   // confirmed offender — flag icons pair an accessibility <title> with a
@@ -1042,10 +1077,151 @@
     return el.innerText || "";
   }
 
+  // Walks the FLAT tree (what's actually rendered): into shadow roots, and
+  // through <slot>s to whatever is assigned to them — the parts plain
+  // .textContent never follows.
+  function deepText(node) {
+    if (!node) return "";
+    if (node.nodeType === Node.TEXT_NODE) return node.textContent;
+    if (node.nodeType !== Node.ELEMENT_NODE && node.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) return "";
+    if (node.tagName === "STYLE" || node.tagName === "SCRIPT" || node.tagName === "TEMPLATE") return "";
+    if (node.tagName === "SLOT") return node.assignedNodes({ flatten: true }).map(deepText).join(" ");
+    const children = node.shadowRoot ? node.shadowRoot.childNodes : node.childNodes;
+    return Array.from(children).map(deepText).join(" ");
+  }
+
+  // Confirmed real, serious (Mattel/SmartRecruiters' Race, Gender and
+  // years-of-experience dropdowns): every rendered option is a <div
+  // role="option"> whose .textContent is whitespace only — the visible
+  // label ("Male", "Asian (Not Hispanic or Latino)", "7-10") lives in shadow
+  // DOM. Reading options with .textContent filtered every one of them out
+  // as empty, so matching compared "Male" against nothing, and the AI
+  // fallback was sent an EMPTY option list and correctly answered null —
+  // every /match-dropdown-options response that day was the same 18-byte
+  // {"matches":[null]}. Plain .textContent still wins when it has real
+  // text (every other site), then label attributes, then the flat-tree walk.
+  function optionText(el) {
+    if (!el) return "";
+    const direct = (el.textContent || "").trim();
+    if (direct) return direct.replace(/\s+/g, " ");
+    const attr = el.getAttribute("aria-label") || el.getAttribute("label") || el.getAttribute("title");
+    if (attr && attr.trim()) return attr.trim();
+    const flat = deepText(el).replace(/\s+/g, " ").trim();
+    // Confirmed real (Mattel/SmartRecruiters): the shadow DOM renders each
+    // label twice ("Male Male", "Asian (Not Hispanic or Latino) Asian (Not
+    // Hispanic or Latino)"), which broke exact matching. Collapse an exact
+    // repeated half back to one copy.
+    const words = flat.split(" ");
+    if (words.length % 2 === 0) {
+      const half = words.length / 2;
+      const first = words.slice(0, half).join(" ");
+      if (first === words.slice(half).join(" ")) return first;
+    }
+    return flat;
+  }
+
+  // Whole-word containment on normalize()d text. Raw substring matching
+  // picked "Female" for target "Male" ("female".includes("male")).
+  function containsWholeWords(haystack, needle) {
+    return !!needle && ` ${haystack} `.includes(` ${needle} `);
+  }
+
+  // Confirmed real, serious (KKR/Greenhouse Education section): for a
+  // react-select-shaped combobox trigger, the element every caller here
+  // passes around as "button" is often the internal filter/search <input>
+  // itself (see scanAndFillGenericComboboxes' own selector, which matches
+  // `input[id^="react-select-"][id$="-input"]` directly) — an <input> has
+  // no rendered text-node children at all, so visibleText(button) is
+  // ALWAYS "" for it, and its .value gets reset back to "" by the widget
+  // the instant a real selection commits (the chosen label is shown in a
+  // sibling "single value" div instead, not the input). Checking
+  // visibleText(button)/button.value straight on that input therefore
+  // reads as "empty" both before AND after a genuinely successful
+  // selection — School correctly matched and clicked "Indiana Wesleyan
+  // University" (visible, highlighted, in the open dropdown) yet every
+  // check reading the bare input reported it as unanswered/failed.
+  // Climbing a few ancestor levels to read the sibling display text
+  // instead works the same way a human eye would, without hard-coding any
+  // one site's specific class names (react-select's own generated prefix
+  // varies per integration) — stopping at the first ancestor that shows
+  // ANY text at all keeps this from accidentally sweeping up an unrelated
+  // wider container's content.
+  //
+  // Confirmed real, serious (KKR/Greenhouse's phone/country-code widget):
+  // that "first ancestor with any text" rule isn't safe on its own — this
+  // field pairs its <input> with a PERMANENTLY-present, only-visually-
+  // hidden 244-country option list sitting a couple of ancestors up (the
+  // exact same "closed but not actually excluded from innerText" fragility
+  // already documented on isolved's State/Province combobox above, just a
+  // phone widget instead of a state picker). Climbing straight into it read
+  // the entire concatenated country list ("244 results found...afghanistan
+  // 93...zimbabwe 263") as if it were the field's own selected value,
+  // wrongly marking Phone as "already answered" and skipping it outright.
+  // A genuine single selected value (a school, degree, or country name) is
+  // always short; anything this long is almost certainly a leaked option
+  // list, not a real answer, and climbing further would only ever find
+  // MORE of the same list, never less — so this stops outright rather than
+  // trying the next ancestor up.
+  const VALIDATION_MESSAGE_TEXT = /^(this field is required|required|this is a required field|please (select|choose|enter|make a selection)\b.*|field is required)\.?$/i;
+
+  function comboboxDisplayText(button) {
+    if (button.tagName !== "INPUT") {
+      return normalize(visibleText(button) || button.value || "");
+    }
+    let container = button.parentElement;
+    for (let i = 0; i < 3 && container; i++) {
+      // Confirmed real (Mattel/SmartRecruiters): once the site flags an
+      // empty required dropdown, its red "This field is required." message
+      // sits in the same container and was read back as the CURRENT VALUE
+      // — every later pass then skipped the field as "already answered".
+      // Also drop the field's OWN label line — confirmed real (Mattel's
+      // City autocomplete): its "City*" label shares this container, and
+      // "city" was read back as the current value, so the field was
+      // skipped as "already answered" while visibly empty. A line ending in
+      // the required-marker "*" is a label, never a selected value.
+      const ownLabel = normalize(labelForField(button));
+      const raw = visibleText(container)
+        .split("\n")
+        .filter((line) => {
+          const trimmed = line.trim();
+          if (VALIDATION_MESSAGE_TEXT.test(trimmed)) return false;
+          if (/\*$/.test(trimmed)) return false;
+          if (ownLabel && normalize(trimmed) === ownLabel) return false;
+          return true;
+        })
+        .join("\n")
+        .trim();
+      if (raw) return raw.length <= 100 ? normalize(raw) : "";
+      container = container.parentElement;
+    }
+    return normalize(button.value || "");
+  }
+
   function labelForOne(field) {
     if (field.id) {
       const byFor = document.querySelector(`label[for="${CSS.escape(field.id)}"]`);
-      if (byFor?.textContent) return byFor.textContent;
+      // Confirmed real, serious (SmartRecruiters' "spl-form" Web Components,
+      // via actual HTML): this label's own light-DOM subtree is often just
+      // a chain of nested custom elements ending in an EMPTY
+      // <slot name="label-content"> — the real, visible question text
+      // ("Are you at least 18 years of age?") lives in a completely
+      // separate SIBLING <span slot="label-content"> (a direct child of the
+      // same custom element the label's `for` points to), which only the
+      // browser's own shadow-DOM slot projection connects to this label at
+      // render time — .textContent never follows that, so it read back as
+      // whitespace-only Lit-template padding (truthy as a bare string,
+      // which is why the plain `if (byFor?.textContent)` check here used to
+      // accept it) instead of empty. Every field on that form fell through
+      // to the same generic ancestor heading ("Preliminary questions") as
+      // a result, making every AI-answered question indistinguishable from
+      // every other and their answers unrecoverably mismatched to the
+      // wrong fields. `.trim()` catches the whitespace-only case properly,
+      // and the labeled element's own [slot="label-content"] descendant is
+      // exactly where this shape's real text lives when that happens.
+      const ownText = byFor?.textContent?.trim();
+      if (ownText) return ownText;
+      const slotted = field.querySelector?.('[slot="label-content"]');
+      if (slotted?.textContent?.trim()) return slotted.textContent.trim();
     }
     const closestLabel = field.closest("label");
     if (closestLabel?.textContent) return closestLabel.textContent;
@@ -1065,6 +1241,20 @@
     const group = field.closest(".form-group, [class*='form-group']");
     const groupLabel = group?.querySelector("label");
     if (groupLabel?.textContent) return groupLabel.textContent;
+    // Confirmed real (Mattel/SmartRecruiters "Message to the Hiring Team"):
+    // the real <textarea> sits in the shadow root of <spl-textarea
+    // label="Let the company know about your interest working there"> —
+    // the question text is a plain `label` ATTRIBUTE on that custom-element
+    // host, with no <label> element anywhere, so the field went unlabeled
+    // and was silently dropped before ever reaching the AI. Checked only
+    // after every real-<label> strategy above (so the screening page's
+    // slot-based labels resolve exactly as before), and only on custom
+    // elements (hyphenated tag), so native <option label>/<track label>
+    // can't be mistaken for a question.
+    if (field.tagName?.includes("-")) {
+      const attrLabel = field.getAttribute("label");
+      if (attrLabel?.trim()) return attrLabel.trim();
+    }
     // Plain-text sibling immediately before the field, with no <label>
     // element, no `for`, and no fieldset/legend at all — confirmed real on
     // Breezy: <span class="date-label">Start date</span><input .../>. Only
@@ -1092,12 +1282,36 @@
   // for the common case (no shadow DOM at all): the chain is just
   // [field], identical to the old single-element behavior.
   function labelForField(field) {
+    // A custom ARIA radio (SmartRecruiters' <spl-radio label="Yes">) is its
+    // own option label — climbing its shadow-host chain would return the
+    // surrounding QUESTION's label instead.
+    if (isAriaRadio(field)) {
+      return field.getAttribute("label") || field.getAttribute("aria-label") || optionText(field);
+    }
     for (const el of shadowHostChain(field)) {
       const label = labelForOne(el);
       if (label?.trim()) return label;
     }
     return "";
   }
+
+  // Confirmed real, serious (KKR/Greenhouse, all three on the SAME form):
+  // "location"/"city"/"portfolio" are real, common English words that show
+  // up as ordinary connective text inside long, unrelated questions, not
+  // just as short field labels — matchesWholeWord correctly requires a word
+  // boundary, but that only rules out matching as a FRAGMENT of another
+  // word (the "ethnicity" bug below), not matching a genuine whole word
+  // sitting inside a full sentence about something else entirely.
+  // "If yes, please provide details of the role, location and date" (a
+  // KKR-interview-history question) got filled with the candidate's home
+  // city; "...office/location (city, country)" (a Deloitte-employment
+  // question) got filled with it too; "...any of its portfolio companies"
+  // (KKR is a PE firm — "portfolio companies" is standard terminology, nothing
+  // to do with a personal portfolio site) got misclassified the same way.
+  // A genuine short field label ("Location", "City", "Portfolio URL") is
+  // always short; a full question that happens to use one of these words
+  // as ordinary grammar isn't, whatever it's actually asking about.
+  const RISKY_SHORT_WORD_PATTERNS = ["location", "city", "portfolio", "website"];
 
   function classify(field) {
     const haystack = normalize(
@@ -1109,6 +1323,13 @@
         labelForField(field),
       ].join(" ")
     );
+    // The visible label alone counts too — confirmed real (Mattel): label
+    // "City" plus an auto-generated id ("spl-form-element_58") made the
+    // combined haystack too long, so a genuine "City" field was treated as
+    // a long sentence and its "city" pattern was refused.
+    const visibleLabel = normalize(labelForField(field));
+    const isShortLabel = haystack.length <= 20 || (visibleLabel.length > 0 && visibleLabel.length <= 20);
+    const patternIsSafe = (p) => isShortLabel || !RISKY_SHORT_WORD_PATTERNS.includes(p);
 
     for (const matcher of FIELD_MATCHERS) {
       if (
@@ -1122,7 +1343,7 @@
         // phrase, for multi-word patterns like "first name" — a phrase
         // boundary works the same way), so a short pattern can no longer
         // silently match as a fragment of an unrelated, longer word.
-        matcher.patterns.some((p) => matchesWholeWord(haystack, p)) &&
+        matcher.patterns.some((p) => patternIsSafe(p) && matchesWholeWord(haystack, p)) &&
         !(matcher.excludePatterns || []).some((p) => matchesWholeWord(haystack, p))
       ) {
         return matcher.key;
@@ -1153,6 +1374,41 @@
     const hasPlus = phone.trim().startsWith("+");
     const digits = phone.replace(/\D/g, "");
     return hasPlus ? `+${digits}` : digits;
+  }
+
+  // Confirmed real (Workday's phone widget): a candidate's own phone
+  // number is the only reliable signal for which dial code belongs in a
+  // "Country Phone Code" selector — a candidate can live in India and
+  // still hold a US phone number (this exact case: address country
+  // "India", phone "+15135109003"), and picking the mailing address's
+  // country there put "India (+91)" next to a "+1" number, wrong for what
+  // the field is actually asking. A mailing address answers "where do
+  // they live", not "what's the calling code of THIS number" — the two
+  // can diverge for anyone with an international number, so this never
+  // falls back to it; only recognizes a US/Canada-shaped "+1" + 10-digit
+  // number (the only case actually confirmed) and leaves the field alone
+  // rather than guessing when the phone doesn't match that shape.
+  function countryForPhoneSelector(phone) {
+    if (phone && phone.trim().startsWith("+")) {
+      const digits = phone.replace(/\D/g, "");
+      if (digits.length === 11 && digits.startsWith("1")) return "United States";
+    }
+    return null;
+  }
+
+  // Confirmed real (same Workday widget): a nearby "Country Phone Code"
+  // selector means the calling code has somewhere else to live — leaving
+  // it baked into the plain Phone Number field too produced "+15135109003"
+  // in a field whose own validation expects just the national number,
+  // rejecting it outright ("Enter a valid format for Phone Number").
+  // Scoped to the exact same US/Canada shape as countryForPhoneSelector
+  // above, for the same reason: it's the only case actually confirmed.
+  function stripUsCallingCodeIfPresent(value) {
+    const digits = value.replace(/\D/g, "");
+    if (value.trim().startsWith("+") && digits.length === 11 && digits.startsWith("1")) {
+      return digits.slice(1);
+    }
+    return value;
   }
 
   // Confirmed real gap: "Current Company"/"Current Title" screening fields
@@ -1291,8 +1547,18 @@
     // Native date inputs require exactly YYYY-MM-DD regardless of the
     // browser's/locale's display format.
     if (field.type === "date") return `${yyyy}-${mm}-${dd}`;
+    if (field.type === "month") return `${yyyy}-${mm}`;
 
     const hint = normalize(field.getAttribute("placeholder") || "");
+    // Month-year fields ("MM/YYYY", "mm-yyyy", "YYYY-MM", or a 7-char
+    // maxlength) — confirmed real on Mattel/SmartRecruiters' experience
+    // From/To, which take "08/2024". A day must never be added to these.
+    const rawHint = (field.getAttribute("placeholder") || "").toLowerCase();
+    const monthYearHint = /^(mm|m)\s*[/\-.]\s*(yyyy|yy)$|^(yyyy|yy)\s*[/\-.]\s*(mm|m)$/.test(rawHint.trim());
+    if (monthYearHint || field.maxLength === 7) {
+      const sep = rawHint.match(/[/\-.]/)?.[0] || "/";
+      return /^y/.test(rawHint.trim()) ? `${yyyy}${sep}${mm}` : `${mm}${sep}${yyyy}`;
+    }
     // Confirmed real, two bugs found while verifying this actually handles
     // all three real-world orderings (month-first, day-first, year-first):
     // 1. The year-first branch hardcoded a "-" separator regardless of what
@@ -1591,16 +1857,21 @@
       field.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
     }
 
+    // composed: true on every event — confirmed real (Mattel/SmartRecruiters
+    // Confirm email + flatpickr From/To): the input lives in a shadow root
+    // and the form framework listens on the host, so non-composed key/input
+    // events never reached it. Typing with composed events is what stuck in
+    // the live console test.
     for (const char of value) {
-      field.dispatchEvent(new KeyboardEvent("keydown", { key: char, bubbles: true }));
+      field.dispatchEvent(new KeyboardEvent("keydown", { key: char, bubbles: true, composed: true }));
       const current = field.value || "";
       descriptor.set.call(field, current + char);
       field.dispatchEvent(
         typeof InputEvent === "function"
-          ? new InputEvent("input", { data: char, inputType: "insertText", bubbles: true })
+          ? new InputEvent("input", { data: char, inputType: "insertText", bubbles: true, composed: true })
           : new Event("input", { bubbles: true, composed: true })
       );
-      field.dispatchEvent(new KeyboardEvent("keyup", { key: char, bubbles: true }));
+      field.dispatchEvent(new KeyboardEvent("keyup", { key: char, bubbles: true, composed: true }));
     }
   }
 
@@ -1616,6 +1887,38 @@
   // string at once (like setNativeValue does) bypasses that entirely and
   // produces garbage (confirmed: got "10/10/0010" for a real DOB). This
   // simulates actual character-by-character typing instead.
+  // Whether the field itself says what date format it wants (native
+  // date/month type, a format placeholder, or a date-sized maxlength).
+  function hasDateFormatHint(field) {
+    if (field.type === "date" || field.type === "month") return true;
+    if (/(mm|dd|yyyy|yy)/i.test(field.getAttribute("placeholder") || "")) return true;
+    return field.maxLength === 7 || field.maxLength === 10;
+  }
+
+  // Types a date in the format the field asks for; when it gives no hint
+  // at all (Mattel/SmartRecruiters' flatpickr "Pick a date"), tries
+  // month-year first, reads the value back, and falls back to a full
+  // MM/DD/YYYY date if the widget rejected or cleared it. Returns the value
+  // that stuck, or null.
+  async function typeDateWithFormatFallback(field, isoDate) {
+    const date = new Date(isoDate);
+    if (Number.isNaN(date.getTime())) return null;
+    const mm = String(date.getMonth() + 1).padStart(2, "0");
+    const dd = String(date.getDate()).padStart(2, "0");
+    const yyyy = String(date.getFullYear());
+    const attempts = hasDateFormatHint(field)
+      ? [formatDateForField(field, isoDate)]
+      : [`${mm}/${yyyy}`, `${mm}/${dd}/${yyyy}`];
+    for (const attempt of attempts) {
+      if (!attempt) continue;
+      typeCharacterByCharacter(field, attempt);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      if ((field.value || "").includes(yyyy)) return field.value;
+      typeStringInto(field, "");
+    }
+    return null;
+  }
+
   function typeCharacterByCharacter(field, value) {
     field.focus();
     field.dispatchEvent(new Event("focus", { bubbles: true, composed: true }));
@@ -1973,8 +2276,23 @@
   // there's no local sidebar to render into at all, so the result is
   // relayed to the top frame over postMessage instead, where
   // recordResultLocal runs exactly the same rendering code.
+  // Confirmed real, serious (KKR/Greenhouse): postMessage isn't queued —
+  // if the top frame's script (and its "message" listener below) hasn't
+  // actually run yet at the moment this fires, the message is just gone,
+  // not delayed. A cross-origin iframe (the real form) routinely finishes
+  // its ENTIRE fill pass and sends a dozen+ of these before the outer
+  // page's own content script has even loaded, since Chrome doesn't
+  // guarantee injection order across frames — the sidebar showed "0
+  // filled" while the iframe's own console proved most of the form had
+  // actually been filled correctly. Keeping every sent result here lets
+  // this frame replay its whole history on request (see the
+  // "remote-request-resend" handler below) once the top frame is
+  // confirmed ready, instead of a one-shot send that can silently vanish.
+  const localResultHistory = [];
+
   function recordResult(status, label, detail) {
     if (window.self !== window.top) {
+      localResultHistory.push({ status, label, detail });
       window.top.postMessage({ source: "askjobs-extension", type: "remote-field-result", status, label, detail }, "*");
       return;
     }
@@ -2023,9 +2341,17 @@
       // once per education) can have several simultaneous pending entries
       // sharing the same generic label, and guessing which one a later
       // result belongs to would risk silently erasing the wrong one.
+      // A later SUCCESS also supersedes an earlier failed attempt on the
+      // same field (confirmed real, Mattel: a dropdown that visibly filled
+      // on a later attempt still listed "Couldn't find a matching option").
+      // Same exactly-one-entry safety rule as above.
       const pendingIndexes = [];
       fieldResults.forEach((r, i) => {
-        if (r.label === resolvedLabel && r.status === "skipped" && /review above and click Insert/.test(r.detail)) {
+        if (
+          r.label === resolvedLabel &&
+          r.status === "skipped" &&
+          (/review above and click Insert/.test(r.detail) || status === "filled")
+        ) {
           pendingIndexes.push(i);
         }
       });
@@ -2052,6 +2378,9 @@
   // the caller flags it as "need attention" rather than claiming success.
   async function getJobDescriptionText() {
     if (jobDescriptionFetched) return jobDescriptionText;
+    // Picked job belongs to a different company than this page (see
+    // reconcileJobWithPage) — its description describes the wrong role.
+    if (pendingHandoff?.jobMismatch) return null;
     jobDescriptionFetched = true;
     if (!pendingHandoff?.jobId) return null;
     const jobResult = await sendMessage({ type: "API_FETCH", path: `/api/v1/jobs/${pendingHandoff.jobId}` });
@@ -2155,7 +2484,7 @@
   // to plausibly be a real question (same >=10-char heuristic already used
   // by collectUnansweredQuestions, to avoid scooping up stray cosmetic
   // fields with no label).
-  function maybeQueueFieldForClassification(field, signature) {
+  async function maybeQueueFieldForClassification(field, signature) {
     if (queuedFieldSignatures.has(signature)) return;
     const label = (
       labelForField(field) ||
@@ -2269,14 +2598,33 @@
     }
 
     queuedFieldSignatures.add(signature);
+    // Confirmed real, serious (Mattel/SmartRecruiters' "What best describes
+    // your SQL proficiency and BigQuery experience?"): a plain <input> can
+    // still be a combobox-shaped field with a live dropdown of real,
+    // pre-written answer choices (the same isComboboxField shape
+    // fillField's own recognized-field path already knows to route through
+    // fillCustomCombobox instead of a raw value) — but this "unrecognized"
+    // path only ever gathered options for an actual <select>, leaving
+    // options undefined for everything else regardless of whether a real
+    // option list existed. The AI then had no way to know those 4 exact
+    // phrased choices were on screen, and composed its own free-text
+    // sentence instead of picking one of them — which this exact widget's
+    // own validation is very likely to reject outright (same class of bug
+    // already fixed for Wellfound's "Set Your Location" above). Opening it
+    // once here (gatherComboboxOptions already closes it again afterward)
+    // costs nothing when it isn't combobox-shaped at all — this only runs
+    // for fields isComboboxField recognizes.
     const options = field.tagName === "SELECT"
       ? Array.from(field.options)
           .map((o) => o.textContent.trim())
           .filter((t) => t && !PLACEHOLDER_OPTION_TEXT.test(normalize(t)))
-      : undefined;
+      : isComboboxField(field)
+        ? await gatherComboboxOptions(field)
+        : undefined;
     pendingClassificationItems.push({
-      kind: "field",
+      kind: field.tagName !== "SELECT" && isComboboxField(field) ? "combobox" : "field",
       field,
+      button: field.tagName !== "SELECT" && isComboboxField(field) ? field : undefined,
       questionText: label,
       fieldType: field.tagName === "SELECT" ? "select" : field.type || "text",
       options,
@@ -2285,6 +2633,16 @@
 
   async function fillField(field) {
     const signature = fieldSignature(field);
+    // Experience From/To date pickers belong to scanAndFillExperienceDatePickers
+    // (matched to the right profile job, month-year format) — never the
+    // generic path, which could queue them for a free-text AI answer.
+    if (
+      field.tagName === "INPUT" &&
+      EXPERIENCE_DATE_LABEL.test((field.getAttribute("aria-label") || "").trim()) &&
+      experienceEntryFor(field)
+    ) {
+      return;
+    }
     // placeholder sits before the final "Unlabeled field" fallback, not
     // before name/id/aria-label — those are still stronger signals when
     // present, but a field with none of them (confirmed real on Breezy:
@@ -2472,8 +2830,53 @@
         recordResult(filled ? "filled" : "skipped", fieldLabel, filled ? "LinkedIn" : `Couldn't confirm "LinkedIn" was actually accepted — please check and fill directly`);
         return;
       }
+      // Confirmed real (KKR/Greenhouse): "Company name"/"Title" are plain
+      // text inputs for the first Employment entry, same shape/scope as
+      // fillRepeatedEntries' own "first entry only" convention — but the
+      // structured Experience-section scanner found the WRONG container on
+      // this page (matched via an unrelated non-compete question's heading
+      // instead of the real Employment section), so it never reached them.
+      // classify()'s own generic FIELD_MATCHERS has no company/title keys
+      // at all (those live only in EXPERIENCE_FIELD_MATCHERS, used only by
+      // the structured scanner), so with that scanner missing them too,
+      // real, already-known experience data went completely unused. Scoped
+      // to just company/title — not location/startDate/endDate/description,
+      // which either need combobox-specific handling (dates) or already
+      // have their own dedicated, safer path (location's bare-word risk is
+      // handled in classify() itself, not needed again here).
+      if (field.tagName !== "SELECT") {
+        const rawExperienceKey = classifyStructured(field, EXPERIENCE_FIELD_MATCHERS);
+        const experienceKey = ["title", "company"].includes(rawExperienceKey) ? rawExperienceKey : null;
+        if (experienceKey) {
+          const stored = profile?.experience?.[0]?.[experienceKey];
+          console.log("[AskJobs] generic field recognized as experience field", experienceKey, "stored value:", stored, "->", fieldLabel);
+          if (stored) {
+            attemptedSignatures.add(signature);
+            const filled = setNativeValue(field, stored);
+            recordResult(filled ? "filled" : "skipped", fieldLabel, filled ? stored : `Couldn't confirm "${stored}" was actually accepted — please check and fill directly`);
+            return;
+          }
+          // Same "recognized but empty" reasoning as the block above (for
+          // FIELD_MATCHERS-level keys) — queue for AI rather than silently
+          // giving up, so "AI-fill remaining questions" gets a real shot at
+          // inferring the candidate's most recent employer/title from the
+          // resume text even with no structured experience entry on file.
+          await maybeQueueFieldForClassification(field, signature);
+          return;
+        }
+      }
+      // Confirmed real (Mattel/SmartRecruiters signature block): "Today's
+      // Date:" went to the AI, which correctly said the resume can't answer
+      // it — it's just the current date, known locally.
+      if (field.tagName === "INPUT" && isTodaysDateLabel(fieldLabel)) {
+        attemptedSignatures.add(signature);
+        const today = formatTodayForField(field);
+        const filled = setNativeValue(field, today);
+        recordResult(filled ? "filled" : "skipped", fieldLabel, filled ? today : `Couldn't confirm "${today}" was actually accepted — please check and fill directly`);
+        return;
+      }
       console.log("[AskJobs] generic field not recognized:", fieldLabel);
-      maybeQueueFieldForClassification(field, signature);
+      await maybeQueueFieldForClassification(field, signature);
       return;
     }
 
@@ -2521,7 +2924,7 @@
       // blank forever, unlike an unrecognized field (e.g. "Current Company"),
       // which the AI could still infer correctly from resume context.
       console.log("[AskJobs] generic field recognized as", key, "but no data for it, queueing for AI fallback:", fieldLabel);
-      maybeQueueFieldForClassification(field, signature);
+      await maybeQueueFieldForClassification(field, signature);
       return;
     }
 
@@ -2600,6 +3003,17 @@
     // a raw value set that wasn't actually selected through its real
     // interaction (type, wait for a suggestion, click it) — fillCustomCombobox
     // does that instead of just stuffing text in and hoping it sticks.
+    // Confirmed real (Mattel/SmartRecruiters): the country dial-code picker
+    // beside the phone number carries the SAME "Phone number" label — the
+    // full number got typed into its country search and failed, then went
+    // to the AI too. A combobox classified as "phone" is that picker, never
+    // the number itself; the dial code is handled separately
+    // (fillNearbyCountrySelector), so leave it alone here.
+    if (key === "phone" && isComboboxField(field)) {
+      attemptedSignatures.add(signature);
+      queuedFieldSignatures.add(signature);
+      return;
+    }
     if (isComboboxField(field)) {
       const filled = await fillCustomCombobox(field, value, fieldLabel);
       attemptedSignatures.add(signature);
@@ -2611,9 +3025,51 @@
     // something to overwrite — setNativeValue with just the digits would
     // silently drop the country code the widget had already set up.
     // Preserving it and appending the digits keeps the field as
-    // "+1XXXXXXXXXX" instead of losing the "+1" entirely.
-    const finalValue = key === "phone" && isBareDialCodePrefix ? `${field.value.trim()}${value}` : value;
-    const filled = setNativeValue(field, finalValue);
+    // "+1XXXXXXXXXX" instead of losing the "+1" entirely. Confirmed real
+    // (Recruitee): the ONLY case this was built for — one combined field,
+    // no separate country control anywhere else on the form, so the dial
+    // code has nowhere else to live.
+    //
+    // Confirmed real, serious (KKR/Greenhouse): NOT every bare-prefix phone
+    // widget is that shape — this form pairs the number field with its OWN
+    // separate, visible "Country" dial-code selector right next to it
+    // (findNearbyCountrySelector below already detects and fills that
+    // selector on its own). Appending onto the field's bare "+1" here too
+    // produced a visibly duplicated "+1 813-604-0929" sitting right next to
+    // a Country dropdown that already reads "+1" — and the widget then
+    // rejected the resulting value outright ("didn't stick", confirmed via
+    // console log), consistent with this specific widget expecting its
+    // number input to hold just the raw national digits, with the dial
+    // code owned entirely by the separate selector. Skip the preserve-and-
+    // append behavior whenever a nearby selector already exists to own the
+    // dial code — only the single-field shape actually needs it.
+    // Confirmed real, serious (Workday): the append-onto-a-bare-prefix case
+    // above isn't the only way a nearby country selector's dial code ends
+    // up duplicated — here the field started EMPTY (no bare prefix to
+    // append onto at all), but the STORED value itself already carried a
+    // leading "+1" (profile.phone was saved with the country code), and
+    // that went straight into a plain "Phone Number" field whose own
+    // validation expects just the national number — rejected outright
+    // ("Enter a valid format for Phone Number"). Stripping a recognized
+    // leading country code from the value itself, not just from the
+    // append path, covers both shapes with the same nearby-selector check.
+    const hasNearbyCountrySelector = key === "phone" && !!findNearbyCountrySelector(field);
+    const phoneValue = key === "phone" && hasNearbyCountrySelector ? stripUsCallingCodeIfPresent(value) : value;
+    const finalValue = key === "phone" && isBareDialCodePrefix && !hasNearbyCountrySelector ? `${field.value.trim()}${value}` : phoneValue;
+    // Confirmed real (Mattel/SmartRecruiters "Confirm your email"): a
+    // one-shot value set read back fine at that moment, but the field was
+    // empty (and flagged invalid) afterwards — while real key-by-key typing
+    // (tested live) stuck. Confirmation fields are the classic place for
+    // anti-paste guards, so type these like a person and re-check shortly.
+    const isConfirmationField = key === "email" && /\b(confirm|re ?enter|retype|repeat|verify|verification)\b/.test(normalize(fieldLabel));
+    let filled;
+    if (isConfirmationField) {
+      typeCharacterByCharacter(field, finalValue);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      filled = (field.value || "").trim() === finalValue.trim();
+    } else {
+      filled = setNativeValue(field, finalValue);
+    }
     attemptedSignatures.add(signature);
     if (filled) {
       console.log("[AskJobs] generic field filled:", key, "=", finalValue, "->", fieldLabel);
@@ -2699,8 +3155,30 @@
   // "New fields detected — click Fill again" prompt, since revealing
   // entries is a normal, expected part of every fill pass.
   let fillInProgress = false;
+  // Confirmed real, serious (KKR/Greenhouse): scanAndFill had no
+  // reentrancy guard at all — the candidate profile, EEO, and
+  // resume-version fetches each independently call scanAndFill(document)
+  // the moment they resolve, and if an earlier call was still deep inside
+  // a slow combobox's search poll (School/Degree/Discipline can each wait
+  // up to 5 seconds) when a later one fired, both ran FULLY IN PARALLEL
+  // over the exact same fields — two independent passes clicking/typing/
+  // searching the same combobox at once, stepping on each other's open/
+  // close/search state. This is why the identical interaction worked
+  // reliably in an isolated standalone test (guaranteed to run exactly
+  // once) but failed unpredictably here, and why it was a DIFFERENT field
+  // each time (whichever one happened to be mid-search when a second pass
+  // started was the one that got corrupted that run). Queuing at most one
+  // pending rerun — instead of either dropping it or letting it run
+  // immediately alongside the current pass — means new data that arrives
+  // mid-fill still gets picked up once the current pass actually finishes,
+  // without ever running two passes at the same time.
+  let rerunQueued = false;
 
   async function scanAndFill(root) {
+    if (fillInProgress) {
+      rerunQueued = true;
+      return;
+    }
     fillInProgress = true;
     try {
       resetFillStateIfNewContext(deepQueryAll(root, "input, select, textarea, button"));
@@ -2737,12 +3215,17 @@
       }
       await scanAndFillRadioGroups(root);
       await scanAndFillCheckboxGroups(root);
+      await scanAndFillExperienceDatePickers(root);
       await scanAndFillGenericComboboxes(root);
       await scanAndFillButtonToggleGroups(root);
       await runClassificationPass();
       await flagUnreachableResumeUploadIfNeeded();
     } finally {
       fillInProgress = false;
+      if (rerunQueued) {
+        rerunQueued = false;
+        scanAndFill(root);
+      }
     }
   }
 
@@ -2774,24 +3257,30 @@
     function strippedText(container) {
       if (!container) return "";
       let text = normalize(container.textContent || "");
+      // Whole words only — a raw substring replace turned "will you now or
+      // in the future require sponsorship" into "will you w or ..." by
+      // stripping the "no" option out of "now" (confirmed on Mattel).
       for (const opt of optionTexts) {
-        if (opt) text = text.replace(opt, "");
+        if (opt) text = ` ${text} `.replace(` ${opt} `, " ").trim();
       }
       return text.trim();
     }
 
-    let container = items[0].parentElement;
-    while (container && !items.every((r) => container.contains(r))) {
-      container = container.parentElement;
+    // composedParent/composedContains (not parentElement/contains) so this
+    // also climbs out of shadow roots — SmartRecruiters' <spl-radio>s sit
+    // inside one, with the question text outside it.
+    let container = composedParent(items[0]);
+    while (container && !items.every((r) => composedContains(container, r))) {
+      container = composedParent(container);
     }
     let text = strippedText(container);
     if (text.length >= 10) return text;
 
-    let outer = container?.parentElement;
+    let outer = container ? composedParent(container) : null;
     for (let i = 0; i < 3 && outer; i++) {
       text = strippedText(outer);
       if (text.length >= 10) return text;
-      outer = outer.parentElement;
+      outer = composedParent(outer);
     }
 
     return text;
@@ -3040,10 +3529,73 @@
     return true;
   }
 
+  // Confirmed real, serious (Mattel/SmartRecruiters): every Yes/No question
+  // on the form is a Web Component — <spl-radio role="radio" label="Yes"
+  // aria-checked="false"> inside shadow DOM — not an <input type="radio">.
+  // Every radio scan here only queried input[type="radio"], so all of them
+  // (18+, sponsorship, work authorization, disability, veteran...) were
+  // invisible. These helpers let the existing radio flow treat both shapes
+  // the same way.
+  function isAriaRadio(el) {
+    return !!el && el.tagName !== "INPUT" && el.getAttribute?.("role") === "radio";
+  }
+
+  function isRadioChecked(radio) {
+    return radio.checked === true || radio.getAttribute("aria-checked") === "true";
+  }
+
+  function composedParent(node) {
+    return node.parentElement || node.getRootNode?.()?.host || null;
+  }
+
+  function composedContains(container, node) {
+    for (let n = node; n; n = composedParent(n)) {
+      if (n === container) return true;
+    }
+    return false;
+  }
+
+  const ariaRadioGroupIds = new WeakMap();
+  let nextAriaRadioGroupId = 1;
+
+  // Native radios grouped by `name` (as before), plus custom ARIA radios
+  // grouped by their nearest role="radiogroup" (or, failing that, their
+  // shared parent) — given a stable synthetic name so the existing
+  // attempted/queued bookkeeping (keyed by name) works unchanged.
+  function collectRadioGroups(root) {
+    const groups = new Map();
+    for (const radio of deepQueryAll(root, 'input[type="radio"]')) {
+      if (!radio.name || radio.disabled) continue;
+      if (!groups.has(radio.name)) groups.set(radio.name, []);
+      groups.get(radio.name).push(radio);
+    }
+    for (const radio of deepQueryAll(root, '[role="radio"]')) {
+      if (!isAriaRadio(radio) || radio.getAttribute("aria-disabled") === "true") continue;
+      let groupEl = null;
+      for (let n = composedParent(radio); n; n = composedParent(n)) {
+        if (n.getAttribute?.("role") === "radiogroup") { groupEl = n; break; }
+      }
+      groupEl ||= composedParent(radio);
+      if (!groupEl) continue;
+      if (!ariaRadioGroupIds.has(groupEl)) ariaRadioGroupIds.set(groupEl, `aria-radio-group-${nextAriaRadioGroupId++}`);
+      const name = ariaRadioGroupIds.get(groupEl);
+      if (!groups.has(name)) groups.set(name, []);
+      groups.get(name).push(radio);
+    }
+    return groups;
+  }
+
   // Same native-setter-override discipline as setNativeValue, applied to
   // `checked` instead of `value` — frameworks track checkbox/radio state via
   // the same kind of intercepted property setter.
   function setNativeChecked(radio) {
+    // Custom ARIA radio (see isAriaRadio): no native `checked` setter to
+    // drive — a real click is what the component itself listens for
+    // (confirmed on SmartRecruiters: aria-checked flips to "true").
+    if (isAriaRadio(radio)) {
+      if (radio.getAttribute("aria-checked") !== "true") radio.click();
+      return;
+    }
     const proto = Object.getPrototypeOf(radio);
     const descriptor = Object.getOwnPropertyDescriptor(proto, "checked");
 
@@ -3084,7 +3636,7 @@
     // via real HTML: id="...-lastYearAttended-dateSectionYear-input" — its
     // own accessible label is just the generic "Year", shared with the
     // "firstYearAttended" field, so label text alone can't tell them apart).
-    { key: "graduationYear", patterns: ["graduation year", "year of passing", "completion year", "year of graduation", "completion date", "graduation date", "lastyearattended"] },
+    { key: "graduationYear", patterns: ["graduation year", "year of passing", "completion year", "year of graduation", "completion date", "graduation date", "lastyearattended", "end date year"] },
     { key: "gpa", patterns: ["gpa", "cgpa", "overall result", "percentage", "grade"] },
   ];
 
@@ -3242,7 +3794,22 @@
     // is. A genuine "From"/"To" field label is always short; a full
     // sentence containing that common word as connective tissue isn't one,
     // whatever the word happens to be.
-    const RISKY_SHORT_WORD_PATTERNS = ["from", "to"];
+    //
+    // Confirmed real, serious AGAIN (KKR/Greenhouse): this function is no
+    // longer only called for fields already confirmed to sit inside a
+    // correctly-detected structured section (fillRepeatedEntries) — it's
+    // also now used as a direct fallback classifier on ARBITRARY fields
+    // across the whole page (see fillField's/scanAndFillGenericComboboxes'
+    // own experience/education fallback checks), where there's no such
+    // boundary confidence at all. "Are you legally authorized to work for
+    // our company in the U.S.?" and a family-members question mentioning
+    // "Global Atlantic Financial Company" both matched bare "company" and
+    // got filled with the candidate's employer name. "degree" is the same
+    // shape of risk ("to what degree...", "advanced degree" showing up in
+    // unrelated prose) even without a caught instance yet — added
+    // preemptively given how serious a wrong-data insert is here, not
+    // speculatively for its own sake.
+    const RISKY_SHORT_WORD_PATTERNS = ["from", "to", "company", "degree", "title"];
     const isShortLabel = strongText.length <= 20;
     const patternIsSafe = (p) => isShortLabel || !RISKY_SHORT_WORD_PATTERNS.includes(p);
     for (const matcher of matchers) {
@@ -3595,7 +4162,10 @@
   // treated as a genuine already-filled answer and silently skipped —
   // every unfilled-state phrasing a widget might use needs to be
   // recognized, not just the "Select..."-style ones seen so far.
-  const PLACEHOLDER_OPTION_TEXT = /^(select( one)?|choose( one)?|please select|no .+ selected|none selected|not selected|no answer)$/;
+  // "No matches"/"No results": confirmed real (Mattel/SmartRecruiters) — a
+  // search that filters everything out renders that as a role="option" row,
+  // and it got clicked as the SQL question's "answer".
+  const PLACEHOLDER_OPTION_TEXT = /^(select( one)?|choose( one)?|please select|no .+ selected|none selected|not selected|no answer|no (matches|results|options)( found)?|nothing found)$/;
 
   function isVisible(el) {
     if (typeof el.checkVisibility === "function") return el.checkVisibility();
@@ -3664,6 +4234,47 @@
     return !!optionGroup && optionGroup === targetGroup;
   }
 
+  // Confirmed real, serious (KKR/Greenhouse's Degree field): this combobox
+  // fetches its options from a remote, term-filtered search endpoint (GET
+  // .../education/degrees?term=...), not a static local list — typing the
+  // literal STORED value as the search term only works when that exact
+  // text happens to substring-match a real option server-side. "M.S."
+  // returns zero options (confirmed live: the real options are spelled
+  // out — "Masters", "Master of Business Administration (MBA)" — none
+  // contain the literal substring "m.s."), so degreeSynonymsMatch above
+  // never even gets real candidates to check, no matter how good its own
+  // matching logic is. Typing this group's own short, common synonym
+  // instead ("master") reliably returns real results, since every
+  // spelled-out option in the same family contains it as a substring —
+  // the match target itself stays the real stored value ("M.S."), only
+  // what gets TYPED changes.
+  function degreeSearchTerm(storedText) {
+    return findDegreeSynonymGroup(storedText)?.synonyms[0] || storedText;
+  }
+
+  // Confirmed real (KKR/Greenhouse): "Information Technology & Management"
+  // — a literal, common stored field-of-study value — has no matching
+  // option anywhere in this site's own 252-entry Discipline list; the
+  // closest real entries are "Information Systems" and "Information
+  // Systems Management". Same remote-search problem as Degree above:
+  // typing the stored value verbatim returns zero options (confirmed
+  // live), but its shared word "information" reliably returns both real
+  // candidates for the existing word-overlap matching (comboboxTextsMatch)
+  // to choose between. Scoped to just this one confirmed-real gap rather
+  // than a speculative full taxonomy of every possible field of study.
+  const FIELD_OF_STUDY_SYNONYM_GROUPS = [
+    {
+      synonyms: ["information technology", "information systems", "computer information systems", "management information systems", "mis", "it"],
+      searchTerm: "information",
+    },
+  ];
+
+  function fieldOfStudySearchTerm(storedText) {
+    const normalized = normalize(storedText);
+    const group = FIELD_OF_STUDY_SYNONYM_GROUPS.find((g) => g.synonyms.some((s) => matchesWholeWord(normalized, s)));
+    return group?.searchTerm || storedText;
+  }
+
   // Word-level, plural-insensitive overlap check — for combobox options
   // that name a CATEGORY/LEVEL ("Bachelors") rather than the specific value
   // stored in the profile ("Bachelor of Technology"). Plain substring
@@ -3726,6 +4337,16 @@
   // needed click() (Workday's native <button>, Darwinbox's div[role=combobox]),
   // so this replaces every plain button.click() used to open/close a
   // combobox rather than being a special case for react-select only.
+  // Attempted fix, REVERTED (KKR/Greenhouse's School/Degree/Discipline and
+  // "authorized to work" fields still show zero rendered options no matter
+  // what element gets clicked — neither targeting the "__control" ancestor
+  // nor a "Toggle flyout" button inside it opened the menu, and the second
+  // attempt actively broke Country/visa-sponsorship/workedHereBefore, which
+  // had been working reliably by clicking the input directly every prior
+  // run. Back to that plain, proven behavior — the real cause of the
+  // zero-options fields is still unknown and needs different evidence (the
+  // actual rendered option list's HTML once genuinely open) before trying
+  // another click target.
   function clickComboboxTrigger(button) {
     button.focus();
     const opts = { bubbles: true, cancelable: true, view: window };
@@ -3841,7 +4462,47 @@
   // field's global search (no aria-controls to scope to, e.g. Degree) can
   // otherwise pick up an unrelated, already-resolved chip from an earlier
   // field as if it were one of its own options.
-  async function waitForBestMatchingOption(scopeEl, desiredText, fieldLabel, excludeOptions) {
+  // Confirmed real, serious (Mattel/SmartRecruiters): with no resolvable
+  // aria-controls (its id lives in a shadow root the input can't see), the
+  // option search fell back to the WHOLE page — and this site leaves a
+  // previous dropdown's list open, so each question got matched against
+  // ANOTHER question's options ("7" against Airflow's, "MA/MS" against
+  // medallion's, "4-6 years" against Education's). The live DOM showed the
+  // field's own list inside a close ancestor (<spl-dropdown>, 5 levels up
+  // through shadow roots, holding exactly its 4 options). So: the NEAREST
+  // composed ancestor of the trigger that contains options is this field's
+  // own list. No stale-option exclusion here — inside the field's own
+  // widget, a still-open list from an earlier pass is its OWN options
+  // (excluding them dropped "No experience with Airflow..." from Airflow).
+  // Capped at a few levels so it can't climb to a form-wide container;
+  // portaled lists (Workday) never match and keep the old page-wide path.
+  const ANCHOR_OPTION_SEARCH_DEPTH = 7;
+  // Triggers whose list has been seen INSIDE their own widget at least once
+  // (e.g. while gathering options for the AI). For these, a page-wide
+  // fallback can only ever find ANOTHER field's leftover open list — this
+  // site leaves them open — so it's skipped entirely (see hasOwnOptionList).
+  const triggersWithOwnOptionList = new WeakSet();
+  function optionsNearAnchor(anchorEl, selector) {
+    if (!anchorEl) return [];
+    let node = composedParent(anchorEl);
+    for (let i = 0; i < ANCHOR_OPTION_SEARCH_DEPTH && node; i++) {
+      const found = [
+        ...deepQueryAll(node, selector),
+        ...(node.shadowRoot ? deepQueryAll(node.shadowRoot, selector) : []),
+      ].filter(isRealOptionCandidate);
+      if (found.length > 0) {
+        triggersWithOwnOptionList.add(anchorEl);
+        return [...new Set(found)];
+      }
+      node = composedParent(node);
+    }
+    return [];
+  }
+  function hasOwnOptionList(anchorEl) {
+    return !!anchorEl && triggersWithOwnOptionList.has(anchorEl);
+  }
+
+  async function waitForBestMatchingOption(scopeEl, desiredText, fieldLabel, excludeOptions, anchorEl) {
     const target = normalize(desiredText);
     if (!target) return null;
 
@@ -3854,6 +4515,17 @@
     // remote lookup rather than a local static list. 50x100ms gives that
     // room without making the common, fast case any slower (the loop still
     // breaks the instant options first appear).
+    //
+    // Attempted fix, REVERTED (KKR/Greenhouse's School/Degree): doubling
+    // this budget to 100x100ms (10s) didn't fix either field — they still
+    // hit "zero options rendered" at 10 seconds, so this was never a pure
+    // patience problem — and it introduced a new regression: stretching
+    // one combobox's wait shifted the timing of everything that runs after
+    // it, and visa-sponsorship (which had succeeded in every single prior
+    // run) failed instead that time. The real cause is still unknown —
+    // most likely some form of resource contention across this fill
+    // pass's many concurrent requests, not something a longer timeout
+    // alone can fix.
     // Confirmed real (BambooHR's Fabric UI widget — Gender/Ethnicity/
     // Disability): its aria-haspopup="true" button opens a plain MUI-style
     // menu whose real, clickable rows are role="menuitem", not the ARIA
@@ -3873,42 +4545,53 @@
     // than a real ARIA role, but a live, out-of-DOM-order menu portal has
     // nothing else to go on here.
     const CLASS_OPTION_SELECTOR = '[class*="__option"]';
-    let options = [];
-    for (let attempt = 0; attempt < 50; attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      options = deepQueryAll(scopeEl, OPTION_ROLE_SELECTOR).filter(isRealOptionCandidate);
-      if (excludeOptions) options = options.filter((o) => !excludeOptions.has(o));
-      if (options.length === 0) {
+
+    function collectRenderedOptions() {
+      const own = optionsNearAnchor(anchorEl, OPTION_ROLE_SELECTOR);
+      if (own.length > 0 || hasOwnOptionList(anchorEl)) return own;
+      let found = deepQueryAll(scopeEl, OPTION_ROLE_SELECTOR).filter(isRealOptionCandidate);
+      if (excludeOptions) found = found.filter((o) => !excludeOptions.has(o));
+      if (found.length === 0) {
         let menuItems = deepQueryAll(scopeEl, MENUITEM_ROLE_SELECTOR).filter(isRealOptionCandidate);
         if (excludeOptions) menuItems = menuItems.filter((o) => !excludeOptions.has(o));
-        options = menuItems;
+        found = menuItems;
       }
-      if (options.length === 0) {
+      if (found.length === 0) {
         let classOptions = deepQueryAll(scopeEl, CLASS_OPTION_SELECTOR).filter(isRealOptionCandidate);
         if (excludeOptions) classOptions = classOptions.filter((o) => !excludeOptions.has(o));
-        options = classOptions;
+        found = classOptions;
       }
-      if (options.length > 0) break;
+      return found;
     }
 
-    // These lists are often virtualized (confirmed via real HTML — a
-    // react-window-style grid that only mounts the currently-visible rows)
-    // — the poll above breaks as soon as it sees "some" options, which can
-    // be just the first partial batch rendering in. Confirmed bug: a real
-    // substring match ("Computer Science") sat a few rows further down and
-    // never got considered because the search gave up right after the
-    // first couple of rows appeared. A short settle delay lets the rest of
-    // that initial visible batch render before matching against it.
-    if (options.length > 0) {
-      await new Promise((resolve) => setTimeout(resolve, 250));
-      const settleSelector = options.every((o) => o.matches(MENUITEM_ROLE_SELECTOR))
-        ? MENUITEM_ROLE_SELECTOR
-        : options.every((o) => o.matches(CLASS_OPTION_SELECTOR))
-          ? CLASS_OPTION_SELECTOR
-          : OPTION_ROLE_SELECTOR;
-      let settled = deepQueryAll(scopeEl, settleSelector).filter(isRealOptionCandidate);
-      if (excludeOptions) settled = settled.filter((o) => !excludeOptions.has(o));
-      if (settled.length >= options.length) options = settled;
+    // Confirmed real, serious (Mattel/SmartRecruiters' Gender dropdown):
+    // these lists are often virtualized or otherwise rendered in batches
+    // (confirmed via real HTML elsewhere — a react-window-style grid that
+    // only mounts the currently-visible rows) — stopping at the very first
+    // NONZERO count (the old behavior, with only one extra one-shot
+    // recheck afterward) can mean matching against a genuinely incomplete
+    // list. Live evidence: the exact same "Male" search found 2 real
+    // options on one attempt and 5 on the very next retry — the count was
+    // still actively changing, not stable, and "Male" itself wasn't even
+    // present in that first incomplete batch. Waiting for the SAME count to
+    // show up on two consecutive checks (~200ms apart) before treating the
+    // list as finished is a real, structural signal that rendering has
+    // actually settled, instead of guessing a fixed extra delay is "enough"
+    // — which the single old settle recheck already proved it sometimes
+    // isn't.
+    let options = [];
+    let lastCount = -1;
+    let stableStreak = 0;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      options = collectRenderedOptions();
+      if (options.length > 0 && options.length === lastCount) {
+        stableStreak++;
+        if (stableStreak >= 2) break;
+      } else {
+        stableStreak = 0;
+      }
+      lastCount = options.length;
     }
 
     if (options.length === 0) {
@@ -3936,23 +4619,25 @@
     // check below matched the placeholder row before any real option was
     // even considered. Empty-text and "Select..."-style rows are never a
     // valid answer, so they're excluded from matching entirely.
+    // optionText, not .textContent — see optionText's own comment (shadow-
+    // DOM option labels read as blank otherwise).
     const matchable = options.filter((o) => {
-      const text = normalize(o.textContent);
+      const text = normalize(optionText(o));
       return text && !PLACEHOLDER_OPTION_TEXT.test(text);
     });
     const heuristicMatch =
-      matchable.find((o) => normalize(o.textContent) === target) ||
-      matchable.find((o) => normalize(o.textContent).includes(target) || target.includes(normalize(o.textContent))) ||
-      matchable.find((o) => comboboxTextsMatch(o.textContent, target)) ||
-      matchable.find((o) => degreeSynonymsMatch(o.textContent, target));
+      matchable.find((o) => normalize(optionText(o)) === target) ||
+      matchable.find((o) => containsWholeWords(normalize(optionText(o)), target) || containsWholeWords(target, normalize(optionText(o)))) ||
+      matchable.find((o) => comboboxTextsMatch(optionText(o), target)) ||
+      matchable.find((o) => degreeSynonymsMatch(optionText(o), target));
     if (heuristicMatch) return heuristicMatch;
 
-    console.log("[AskJobs] dropdown: no heuristic match among", options.length, "option(s) for", desiredText, "— asking AI");
-    const optionTexts = matchable.map((o) => o.textContent.trim());
+    const optionTexts = matchable.map((o) => optionText(o));
+    console.log("[AskJobs] dropdown: no heuristic match among", options.length, "option(s) for", desiredText, "— asking AI with:", optionTexts);
     const aiPick = await aiPickBestOption(fieldLabel, desiredText, optionTexts);
     if (!aiPick) return null;
 
-    return matchable.find((o) => o.textContent.trim() === aiPick) || null;
+    return matchable.find((o) => optionText(o) === aiPick) || null;
   }
 
   // Opens a custom dropdown purely to read its real option texts (not to
@@ -3976,7 +4661,9 @@
   // unrelated navigation menu's menuitem rows. See waitForBestMatchingOption
   // for the same fallback, applied where an option is actually being
   // matched rather than just listed.
-  async function gatherRealOptionOrMenuItemCandidates(scope, existingOptions) {
+  async function gatherRealOptionOrMenuItemCandidates(scope, existingOptions, anchorEl) {
+    const own = optionsNearAnchor(anchorEl, '[role="option"]');
+    if (own.length > 0 || hasOwnOptionList(anchorEl)) return own;
     let candidates = deepQueryAll(scope, '[role="option"]').filter(isRealOptionCandidate);
     candidates = candidates.filter((o) => !existingOptions.has(o));
     if (candidates.length === 0) {
@@ -3987,23 +4674,41 @@
     return candidates;
   }
 
-  async function gatherComboboxOptions(button) {
+  // Shares fillCustomCombobox's lock (see comboboxFillChain) — it opens a
+  // dropdown too, and must never overlap with a fill in progress.
+  function gatherComboboxOptions(button) {
+    const run = comboboxFillChain.then(() => gatherComboboxOptionsNow(button));
+    comboboxFillChain = run.catch(() => {});
+    return run;
+  }
+
+  async function gatherComboboxOptionsNow(button) {
     const existingOptions = new Set(deepQueryAll(null, '[role="option"], [role="menuitem"]'));
     clickComboboxTrigger(button);
 
     const controlsId = button.getAttribute("aria-controls");
     const scope = (controlsId && document.getElementById(controlsId)) || document;
+    const anchor = scope === document ? button : null; // see optionsNearAnchor
 
+    // Confirmed real, serious (same class of bug as waitForBestMatchingOption
+    // above, see its own comment): stopping at the first nonzero count can
+    // mean gathering an incomplete batch of a virtualized/batch-rendered
+    // list. Waiting for the same count on two consecutive checks before
+    // treating it as finished catches the rest of the list without
+    // guessing at a fixed extra delay.
     let options = [];
+    let lastCount = -1;
+    let stableStreak = 0;
     for (let attempt = 0; attempt < 50; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 100));
-      options = await gatherRealOptionOrMenuItemCandidates(scope, existingOptions);
-      if (options.length > 0) break;
-    }
-    if (options.length > 0) {
-      await new Promise((resolve) => setTimeout(resolve, 250));
-      const settled = await gatherRealOptionOrMenuItemCandidates(scope, existingOptions);
-      if (settled.length >= options.length) options = settled;
+      options = await gatherRealOptionOrMenuItemCandidates(scope, existingOptions, anchor);
+      if (options.length > 0 && options.length === lastCount) {
+        stableStreak++;
+        if (stableStreak >= 2) break;
+      } else {
+        stableStreak = 0;
+      }
+      lastCount = options.length;
     }
 
     // Confirmed real (same BambooHR widget): the page's OWN menu-
@@ -4017,14 +4722,22 @@
       clickComboboxTrigger(button);
       await new Promise((resolve) => setTimeout(resolve, 200));
       clickComboboxTrigger(button);
+      lastCount = -1;
+      stableStreak = 0;
       for (let attempt = 0; attempt < 50; attempt++) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        options = await gatherRealOptionOrMenuItemCandidates(scope, existingOptions);
-        if (options.length > 0) break;
+        options = await gatherRealOptionOrMenuItemCandidates(scope, existingOptions, anchor);
+        if (options.length > 0 && options.length === lastCount) {
+          stableStreak++;
+          if (stableStreak >= 2) break;
+        } else {
+          stableStreak = 0;
+        }
+        lastCount = options.length;
       }
     }
 
-    const texts = [...new Set(options.map((o) => o.textContent.trim()).filter(Boolean))];
+    const texts = [...new Set(options.map((o) => optionText(o)).filter((t) => t && !PLACEHOLDER_OPTION_TEXT.test(normalize(t))))];
     clickComboboxTrigger(button); // toggle closed again via the same trigger
     console.log(
       "[AskJobs] gathered", texts.length, "real option(s) for combobox:",
@@ -4044,8 +4757,37 @@
   // widget shape covers Degree here and was already flagged earlier for
   // custom Yes/No questions and Prefix/Gender fields, so it's built once,
   // generically, rather than one-off per field.
-  async function fillCustomCombobox(button, desiredText, fieldLabel) {
+  // Confirmed real, serious (Mattel/SmartRecruiters): several suggestion
+  // inserts fire at once, so 4 dropdowns were open and being typed into
+  // simultaneously — each read whichever list happened to be rendered
+  // ("Advanced SQL..." matched against Education's 9 options), and focus
+  // jumping between them made even correct clicks not stick (Race and
+  // Gender, which fill fine one at a time). A promise-chain lock makes
+  // every combobox fill run strictly one after another.
+  let comboboxFillChain = Promise.resolve();
+  function fillCustomCombobox(...args) {
+    const run = comboboxFillChain.then(() => fillCustomComboboxNow(...args));
+    comboboxFillChain = run.catch(() => {});
+    return run;
+  }
+
+  async function fillCustomComboboxNow(button, desiredText, fieldLabel, searchTermOverride) {
     closeAnyOpenPopup();
+    // Diagnostic only (not a fix yet): School/Degree/Discipline and the
+    // authorization Yes/No combobox all hit "zero options rendered" on
+    // KKR/Greenhouse, but only late in a fill pass, after a lot of other
+    // DOM-mutating work (AI-answered fields, other field reveals) happened
+    // in between the field first being found and this actually running.
+    // The leading real-world cause of "click/type did nothing, nothing
+    // opened" for a reference held that long is the page having re-rendered
+    // and replaced this exact node in the meantime (React's key-based
+    // remounting) — clicking/typing into a detached node is silently a
+    // no-op, indistinguishable from a slow-to-render widget without this
+    // check. Logged rather than guessed at, so the next real run confirms
+    // or rules this out before any fix is built around it.
+    if (!button.isConnected) {
+      console.warn("[AskJobs] combobox trigger is DETACHED from the document (the page likely re-rendered this field since it was first found) — clicking/typing into it can't do anything:", fieldLabel);
+    }
     // Only options VISIBLE before opening count as "already there" (stale
     // selected chips). Confirmed real (Paylocity's react-widgets dropdowns —
     // "Have you applied/worked with us before?"): the list's <li
@@ -4066,13 +4808,23 @@
     // surfaces it. typeStringInto (not typeCharacterByCharacter) is used
     // deliberately: the latter blurs the field when done, which would
     // close this popup before a match can be read/clicked.
-    if (button.tagName === "INPUT" && desiredText) {
-      typeStringInto(button, desiredText);
+    // Confirmed real (KKR/Greenhouse's Degree/Discipline — see
+    // degreeSearchTerm/fieldOfStudySearchTerm): for a REMOTE, term-filtered
+    // search widget, what gets TYPED and what gets MATCHED against don't
+    // have to be the same string — typing the literal stored value can
+    // return zero results server-side even when a real, correct option
+    // exists under a differently-worded search term. desiredText always
+    // stays the real match target either way.
+    const textToType = searchTermOverride || desiredText;
+    if (button.tagName === "INPUT" && textToType) {
+      typeStringInto(button, textToType);
     }
 
     const controlsId = button.getAttribute("aria-controls");
     const scope = (controlsId && document.getElementById(controlsId)) || document;
-    let match = await waitForBestMatchingOption(scope, desiredText, fieldLabel, existingOptions);
+    // Only when aria-controls didn't pin the list down — see optionsNearAnchor.
+    const anchor = scope === document ? button : null;
+    let match = await waitForBestMatchingOption(scope, desiredText, fieldLabel, existingOptions, anchor);
 
     // Confirmed real (BambooHR's Gender/Ethnicity/Disability menu): the
     // page's OWN menu-positioning script threw an uncaught exception while
@@ -4084,10 +4836,20 @@
     // match was already found, and gives the page's own script a second,
     // often-successful attempt when it wasn't.
     if (!match) {
+      // Confirmed real (Mattel/SmartRecruiters' "highest level of
+      // education"): the typed value itself can be the problem — "Master's
+      // Degree" filters a "High School | ... | MA/MS | MBA | PHD" list down
+      // to NOTHING, so retrying with the same text still shows zero
+      // options. Clear the typed search before reopening, so the retry
+      // sees the FULL list and heuristics/AI can pick from it (confirmed in
+      // the console: clearing the text re-renders all 9 options).
+      if (button.tagName === "INPUT" && textToType) {
+        typeStringInto(button, "");
+      }
       clickComboboxTrigger(button);
       await new Promise((resolve) => setTimeout(resolve, 200));
       clickComboboxTrigger(button);
-      match = await waitForBestMatchingOption(scope, desiredText, fieldLabel, existingOptions);
+      match = await waitForBestMatchingOption(scope, desiredText, fieldLabel, existingOptions, anchor);
     }
 
     if (!match) {
@@ -4096,7 +4858,7 @@
       return false;
     }
 
-    console.log("[AskJobs] combobox picking option:", match.textContent?.trim(), "for target:", desiredText, "->", fieldLabel);
+    console.log("[AskJobs] combobox picking option:", optionText(match), "for target:", desiredText, "->", fieldLabel);
     clickMatchedOption(match);
     // Confirmed real (Wellfound's react-select "Years of experience"):
     // belt-and-suspenders on top of clickMatchedOption's own mousedown fix
@@ -4106,6 +4868,39 @@
     // already-closed dropdown for anything else.
     if (button.tagName === "INPUT") dispatchEnterKey(button);
     await new Promise((resolve) => setTimeout(resolve, 150));
+    // Confirmed real, serious (KKR/Greenhouse): this used to return true
+    // unconditionally right here — "a matching option was found and
+    // clicked" isn't the same thing as "the page actually accepted it".
+    // Two screening comboboxes on the same form reported "filled" in the
+    // sidebar while still visibly showing their placeholder afterward; a
+    // third (workedHereBefore), clicked the exact same way moments later,
+    // stuck fine — inconsistent enough to be a real race with the page's
+    // own re-render, not a one-off fluke. Same "does the visible text now
+    // look like a real answer, not a placeholder" check this function's own
+    // caller already uses to decide "already answered" before ever
+    // attempting a fill — reused here to decide whether THIS attempt
+    // actually worked, instead of trusting that dispatching the click was
+    // enough.
+    // Confirmed real (Mattel/SmartRecruiters): the selection shows up well
+    // after 150ms, so correctly-filled dropdowns were reported "Couldn't
+    // find a matching option". Poll briefly instead of one early look.
+    // Also accept the input's OWN value reading exactly the chosen option —
+    // confirmed real (Mattel): comboboxDisplayText reads surrounding
+    // container text, which still held the open list (>100 chars → ""),
+    // so correct picks visibly in the box were reported "didn't stick".
+    const pickedText = normalize(optionText(match));
+    const stuck = (text) =>
+      (button.tagName === "INPUT" && pickedText && normalize(button.value) === pickedText) ||
+      (text && !PLACEHOLDER_OPTION_TEXT.test(text));
+    let resultingText = comboboxDisplayText(button);
+    for (let i = 0; i < 12 && !stuck(resultingText); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 125));
+      resultingText = comboboxDisplayText(button);
+    }
+    if (!stuck(resultingText)) {
+      console.warn("[AskJobs] combobox fill didn't stick — still shows a placeholder after clicking:", optionText(match), "->", fieldLabel);
+      return false;
+    }
     return true;
   }
 
@@ -4118,8 +4913,8 @@
   // leaving nothing for waitForBestMatchingOption to even compare against.
   // The full value is still tried first and used whenever it actually works
   // — splitting is only a fallback, never the first attempt.
-  async function fillCustomComboboxBestEffort(button, desiredText, fieldLabel) {
-    if (await fillCustomCombobox(button, desiredText, fieldLabel)) return { filled: true, value: desiredText };
+  async function fillCustomComboboxBestEffort(button, desiredText, fieldLabel, searchTermOverride) {
+    if (await fillCustomCombobox(button, desiredText, fieldLabel, searchTermOverride)) return { filled: true, value: desiredText };
 
     const parts = desiredText.split(/\s*(?:\/|,|\bor\b)\s*/i).map((p) => p.trim()).filter(Boolean);
     if (parts.length <= 1) return { filled: false, value: desiredText };
@@ -4169,7 +4964,7 @@
       if (options.length > 0) break;
     }
 
-    const match = options.find((o) => OTHER_OPTION_PATTERNS.some((p) => matchesWholeWord(normalize(o.textContent), p)));
+    const match = options.find((o) => OTHER_OPTION_PATTERNS.some((p) => matchesWholeWord(normalize(optionText(o)), p)));
     if (!match) closeAnyOpenPopup();
     return match || null;
   }
@@ -4223,7 +5018,7 @@
       if (match) {
         clickMatchedOption(match);
         filledAny = true;
-        console.log("[AskJobs] multiselect matched:", text, "->", match.textContent?.trim());
+        console.log("[AskJobs] multiselect matched:", text, "->", optionText(match));
         await new Promise((resolve) => setTimeout(resolve, 200));
       } else {
         console.log("[AskJobs] multiselect no match found for:", text);
@@ -4765,21 +5560,120 @@
     });
   }
 
-  async function scanAndFillRadioGroups(root) {
-    const radios = deepQueryAll(root, 'input[type="radio"]');
-    if (radios.length === 0) return;
+  // Confirmed real (Mattel/SmartRecruiters): the site pre-builds Experience
+  // entries from the parsed resume (Title/Company/Description filled) but
+  // leaves the required From/To date pickers empty, and our structured
+  // section scanner never finds this layout at all. For every visible,
+  // empty From/To date box: find its entry (the nearest ancestor that also
+  // holds a Title and a Company input), match that entry to the profile's
+  // experience by company (then title), and type the real dates — or tick
+  // "I currently work here" instead of an end date for a current job.
+  // Entries collapsed to a summary card have no date boxes rendered; once
+  // opened for editing, the mutation observer's rescan picks them up.
+  // Never clicks the entry's own Save — that stays with the user.
+  const EXPERIENCE_DATE_LABEL = /^(from|to|start date|end date|start|end)\*?$/i;
+  const CURRENT_JOB_LABEL = /currently work|currently working|current (job|position|role|employer)|still work|present(ly)? employed/i;
 
-    const groups = new Map();
-    for (const radio of radios) {
-      if (!radio.name || radio.disabled) continue;
-      if (!groups.has(radio.name)) groups.set(radio.name, []);
-      groups.get(radio.name).push(radio);
+  function inputLabelText(input) {
+    return (input.getAttribute("aria-label") || labelForField(input) || "").trim();
+  }
+
+  function experienceEntryFor(dateInput) {
+    let node = composedParent(dateInput);
+    for (let i = 0; i < 12 && node; i++) {
+      const inputs = [...deepQueryAll(node, "input"), ...(node.shadowRoot ? deepQueryAll(node.shadowRoot, "input") : [])];
+      const title = inputs.find((inp) => /^(job )?title\*?$/i.test(inputLabelText(inp)));
+      const company = inputs.find((inp) => /^company( name)?\*?$/i.test(inputLabelText(inp)));
+      if (title && company) return { container: node, title: title.value || "", company: company.value || "" };
+      node = composedParent(node);
     }
+    return null;
+  }
+
+  function matchProfileExperience(title, company) {
+    const exps = profile?.experience || [];
+    const c = normalize(company);
+    const t = normalize(title);
+    // Key-word overlap, not just containment — the site's parsed entry and
+    // the profile often name the same employer differently ("FORD MOTORS"
+    // vs "Ford Motor Company"). Filler words (inc, company, motors, ...)
+    // never count on their own, so unrelated employers still don't match.
+    const LINKING_WORDS = new Set(["of", "for", "at", "in", "on", "de", "la", "motor"]);
+    const keyWords = (s) => normalize(s).split(" ").filter((w) => w.length >= 2 && !COMPANY_FILLER_WORDS.has(w) && !LINKING_WORDS.has(w));
+    const companyMatches = (e) => {
+      const ec = normalize(e.company);
+      if (!c || !ec) return false;
+      if (ec === c || ec.includes(c) || c.includes(ec)) return true;
+      const entryWords = new Set(keyWords(company));
+      return keyWords(e.company).some((w) => entryWords.has(w));
+    };
+    const titleMatches = (e) => {
+      const et = normalize(e.title);
+      return t && et && (et === t || et.includes(t) || t.includes(et));
+    };
+    return (
+      exps.find((e) => companyMatches(e) && titleMatches(e)) ||
+      exps.find(companyMatches) ||
+      (c ? null : exps.find(titleMatches)) ||
+      null
+    );
+  }
+
+  async function scanAndFillExperienceDatePickers(root) {
+    const dateInputs = deepQueryAll(root, "input").filter((inp) => {
+      if (!isVisible(inp) || (inp.value || "").trim()) return false;
+      if (!EXPERIENCE_DATE_LABEL.test(inputLabelText(inp))) return false;
+      const looksLikeDate =
+        inp.type === "date" || inp.type === "month" ||
+        inp.getAttribute("aria-haspopup") === "grid" ||
+        /date/i.test(inp.className || "") ||
+        /date|mm|yyyy/i.test(inp.getAttribute("placeholder") || "");
+      return looksLikeDate;
+    });
+
+    for (const input of dateInputs) {
+      const signature = fieldSignature(input);
+      if (attemptedSignatures.has(signature)) continue;
+      attemptedSignatures.add(signature);
+
+      const entry = experienceEntryFor(input);
+      const label = inputLabelText(input);
+      if (!entry) continue; // not inside an experience entry — leave it
+      const exp = matchProfileExperience(entry.title, entry.company);
+      const resultLabel = `${label} (${entry.title || entry.company || "experience entry"})`;
+      if (!exp) {
+        recordResult("skipped", resultLabel, `No matching job in the profile for "${entry.title}" at "${entry.company}" — please set the date directly`);
+        continue;
+      }
+
+      const isStart = /^(from|start)/i.test(label);
+      if (!isStart && exp.current) {
+        const box = [...deepQueryAll(entry.container, 'input[type="checkbox"], [role="checkbox"]')].find((b) =>
+          CURRENT_JOB_LABEL.test(inputLabelText(b) || b.textContent || ""),
+        );
+        if (box && !(box.checked || box.getAttribute("aria-checked") === "true")) box.click();
+        recordResult(box ? "filled" : "skipped", resultLabel, box ? "Current job — ticked \"I currently work here\"" : "Current job, but no \"I currently work here\" box found — please set it directly");
+        continue;
+      }
+
+      const iso = isStart ? exp.startDate : exp.endDate;
+      if (!iso) {
+        recordResult("skipped", resultLabel, `No ${isStart ? "start" : "end"} date stored for this job — please set it directly`);
+        continue;
+      }
+      const stuck = await typeDateWithFormatFallback(input, iso);
+      recordResult(stuck ? "filled" : "skipped", resultLabel, stuck ? `${stuck} — click Save on the entry` : "The site didn't accept the date — please set it directly");
+    }
+  }
+
+  async function scanAndFillRadioGroups(root) {
+    const groups = collectRadioGroups(root);
+    if (groups.size === 0) return;
 
     for (const [name, groupRadios] of groups) {
       if (attemptedRadioGroups.has(name)) continue;
       // Already answered (by the page itself or the user) — leave it alone.
-      if (groupRadios.some((r) => r.checked)) continue;
+      if (groupRadios.some(isRadioChecked)) continue;
 
       const rawQuestionText = groupQuestionText(groupRadios);
       if (rawQuestionText.length > MAX_QUESTION_LABEL_LENGTH) {
@@ -4950,7 +5844,7 @@
         continue;
       }
 
-      const currentText = normalize(visibleText(button) || "");
+      const currentText = comboboxDisplayText(button);
       if (currentText && !PLACEHOLDER_OPTION_TEXT.test(currentText)) {
         console.log("[AskJobs] generic combobox skipped (already answered):", fieldLabel, "->", currentText);
         continue; // already answered
@@ -5022,6 +5916,50 @@
           recordResult("skipped", fieldLabel, "Suggested from your profile — review above and click Insert");
         } else {
           recordResult("skipped", fieldLabel, "Recognized as a location question, but no address/city is set in the profile — please answer directly");
+        }
+        continue;
+      }
+
+      // Confirmed real (KKR/Greenhouse): "School"/"Degree"/"Discipline" are
+      // react-select comboboxes, not the native elements the structured
+      // Education-section scanner (classifyStructured/fillRepeatedEntries)
+      // looks for — that scan found the wrong container on this page
+      // ("0 field(s)" scanned) and never got a chance at them, so they fell
+      // all the way through to here, where a short label ("School*" is 7
+      // characters) then got rejected even from the generic AI-fallback
+      // queue below. Real, already-known Education data (first entry only,
+      // same scope convention fillRepeatedEntries already uses) deserved a
+      // real shot at these before giving up — checked with the SAME
+      // EDUCATION_FIELD_MATCHERS patterns the structured scanner uses.
+      // Deliberately excludes startDate/endDate: those match "Start/End
+      // date month" comboboxes too, whose real options are spelled-out
+      // month names, not a fuzzy match target for a full stored date string.
+      const rawEducationKey = classifyStructured(button, EDUCATION_FIELD_MATCHERS);
+      const educationKey = ["institution", "degree", "field"].includes(rawEducationKey) ? rawEducationKey : null;
+      if (educationKey) {
+        attemptedSignatures.add(signature);
+        const stored = profile?.education?.[0]?.[educationKey];
+        console.log("[AskJobs] generic combobox recognized as education field", educationKey, "stored value:", stored, "->", fieldLabel);
+        if (stored) {
+          // Confirmed real (KKR/Greenhouse): Degree/Discipline fetch their
+          // options from a remote search endpoint keyed on whatever gets
+          // typed — the literal stored value ("M.S.", "Information
+          // Technology & Management") often returns zero real results,
+          // while a short synonym ("master", "information") reliably
+          // does. Institution names search fine as-is (confirmed:
+          // "Indiana Wesleyan University" matched directly), so only
+          // degree/field get an overridden search term.
+          const searchTermOverride =
+            educationKey === "degree" ? degreeSearchTerm(String(stored))
+            : educationKey === "field" ? fieldOfStudySearchTerm(String(stored))
+            : undefined;
+          renderStoredValueSuggestion(fieldLabel, String(stored), async () => {
+            const result = await fillCustomComboboxBestEffort(button, String(stored), fieldLabel, searchTermOverride);
+            recordResult(result.filled ? "filled" : "skipped", fieldLabel, result.filled ? `${result.value} (from your resume, reviewed)` : "Couldn't find a matching option");
+          });
+          recordResult("skipped", fieldLabel, "Suggested from your resume — review above and click Insert");
+        } else {
+          recordResult("skipped", fieldLabel, `Recognized as "${educationKey}", but no data on file for it — please answer directly`);
         }
         continue;
       }
@@ -5111,6 +6049,9 @@
         // time too, but now against a guess that was already constrained
         // to one of these options in the first place).
         if (queuedFieldSignatures.has(signature)) continue;
+        // The phone number's dial-code picker (same "Phone number" label) —
+        // see fillField's matching guard. Never an AI question.
+        if (classify(button) === "phone") continue;
         const rawLabel = labelForField(button) || button.getAttribute("aria-label") || "";
         const rawLabelLength = rawLabel.trim().length;
         if (rawLabelLength < 10) {
@@ -5288,8 +6229,11 @@
     function strippedText(container) {
       if (!container) return "";
       let text = normalize(container.textContent || "");
+      // Whole words only — a raw substring replace turned "will you now or
+      // in the future require sponsorship" into "will you w or ..." by
+      // stripping the "no" option out of "now" (confirmed on Mattel).
       for (const opt of optionTexts) {
-        if (opt) text = text.replace(opt, "");
+        if (opt) text = ` ${text} `.replace(` ${opt} `, " ").trim();
       }
       return text.trim();
     }
@@ -6070,7 +7014,7 @@
       // second, AI-assisted try.
       if (queuedFieldSignatures.has(signature)) continue;
 
-      const currentText = normalize(visibleText(button) || button.value || "");
+      const currentText = comboboxDisplayText(button);
       if (currentText && !PLACEHOLDER_OPTION_TEXT.test(currentText)) continue; // already answered
 
       const label = (labelForField(button) || button.getAttribute("aria-label") || "").trim();
@@ -6110,16 +7054,10 @@
     // discovering it independently. queuedRadioGroupNames/
     // queuedCheckboxGroupNames (shared with the main scan) prevent
     // re-collecting one already sitting in that queue as a duplicate card.
-    const radios = deepQueryAll(root, 'input[type="radio"]');
-    const radioGroups = new Map();
-    for (const radio of radios) {
-      if (!radio.name || radio.disabled) continue;
-      if (!radioGroups.has(radio.name)) radioGroups.set(radio.name, []);
-      radioGroups.get(radio.name).push(radio);
-    }
+    const radioGroups = collectRadioGroups(root);
     for (const [name, groupRadios] of radioGroups) {
       if (queuedRadioGroupNames.has(name)) continue;
-      if (groupRadios.some((r) => r.checked)) continue; // already answered
+      if (groupRadios.some(isRadioChecked)) continue; // already answered
       const rawQuestionText = groupQuestionText(groupRadios);
       if (rawQuestionText.length < 10 || rawQuestionText.length > MAX_QUESTION_LABEL_LENGTH) continue;
       const normalizedQuestion = normalize(rawQuestionText);
@@ -6265,6 +7203,15 @@
       const onInsert = pendingRemoteInserts.get(event.data.id);
       pendingRemoteInserts.delete(event.data.id);
       onInsert?.(event.data.finalValue);
+    } else if (event.data.type === "remote-request-resend") {
+      // The top frame is telling us it's ready now — replay everything
+      // ever recorded here, in case our very first send(s) went out before
+      // its listener existed. recordResult (not postMessage directly) so a
+      // genuinely NEW result recorded after this point still also pushes
+      // into localResultHistory correctly for any later resend request.
+      for (const { status, label, detail } of localResultHistory) {
+        window.top.postMessage({ source: "askjobs-extension", type: "remote-field-result", status, label, detail }, "*");
+      }
     } else if (event.data.type === "remote-trigger-fill") {
       scanAndFill(document);
     } else if (event.data.type === "remote-trigger-ai-fill") {
@@ -6354,12 +7301,18 @@
         showSuggestionCard(item.questionText, value, true, async (finalValue) => {
           if (key === "skills") {
             await fillSkillsField(item.field);
+            recordResult("filled", item.questionText, `${finalValue} (AI-classified, reviewed)`);
           } else if (item.field.tagName === "TEXTAREA") {
             typeCharacterByCharacter(item.field, finalValue);
+            recordResult("filled", item.questionText, `${finalValue} (AI-classified, reviewed)`);
           } else {
-            setNativeValue(item.field, finalValue);
+            // Confirmed real, serious (Mattel/SmartRecruiters): this used to
+            // report "filled" unconditionally regardless of whether the
+            // value actually stuck — setNativeValue already returns whether
+            // it did (see its own comment), so use that instead of assuming.
+            const filled = setNativeValue(item.field, finalValue);
+            recordResult(filled ? "filled" : "skipped", item.questionText, filled ? `${finalValue} (AI-classified, reviewed)` : `Couldn't confirm "${finalValue}" was actually accepted — please check and fill directly`);
           }
-          recordResult("filled", item.questionText, `${finalValue} (AI-classified, reviewed)`);
         });
         addedCount += 1;
       } else if (item.kind === "radioGroup") {
@@ -6519,7 +7472,7 @@
   // Whether the question already holds an answer (filled by the extension,
   // the site, or the user) — Suggest never overwrites one.
   function suggestItemAlreadyAnswered(item) {
-    if (item.kind === "radioGroup") return item.radios.some((r) => r.checked);
+    if (item.kind === "radioGroup") return item.radios.some(isRadioChecked);
     if (item.kind === "checkboxGroup") return item.boxes.some((b) => b.checked);
     if (item.kind === "buttonToggleGroup") return item.buttons.some((b) => b.getAttribute("aria-pressed") === "true");
     if (item.kind === "field") {
@@ -6727,8 +7680,12 @@
               recordResult("skipped", item.questionText, "The page didn't keep the answer — please type or paste it in directly");
             }
           } else {
-            setNativeValue(item.field, finalValue);
-            recordResult("filled", item.questionText, `${finalValue} (AI-answered from resume, reviewed)`);
+            // Confirmed real, serious (Mattel/SmartRecruiters): this used to
+            // report "filled" unconditionally regardless of whether the
+            // value actually stuck — setNativeValue already returns whether
+            // it did (see its own comment), so use that instead of assuming.
+            const filled = setNativeValue(item.field, finalValue);
+            recordResult(filled ? "filled" : "skipped", item.questionText, filled ? `${finalValue} (AI-answered from resume, reviewed)` : `Couldn't confirm "${finalValue}" was actually accepted — please check and fill directly`);
           }
         });
       }
@@ -6847,6 +7804,78 @@
   // picked manually in the popup when no handoff exists at all (e.g. a job
   // opened by clicking through LinkedIn/the company's own listing directly,
   // where there was never a candidate identity attached to the click).
+  // Confirmed real, serious (Mattel/SmartRecruiters): the popup's picked job
+  // was a FORD job, so the "why are you interested" answer said "joining
+  // Ford" and the Ford-tailored resume got attached — on a Mattel form.
+  // Nothing flagged it. Warn (never block) when no significant word of the
+  // job's company appears in the page's URL or title — ATS URLs almost
+  // always carry the employer (".../MattelInc/...", "capitalone.wd1...",
+  // "greenhouse.io/kkr"), so a miss is a strong hint the wrong job is picked.
+  const COMPANY_FILLER_WORDS = new Set(["inc", "llc", "ltd", "corp", "corporation", "company", "co", "group", "the", "and", "plc", "limited", "holdings", "technologies", "motors"]);
+  // The employer this application page actually belongs to, read from the
+  // ATS URL conventions (SmartRecruiters ".../company/MattelInc/...",
+  // Greenhouse/Lever/Ashby "/<slug>", Workday "<slug>.wd5.myworkdayjobs.com")
+  // or the page's og:site_name. "MattelInc" -> "Mattel". null if unknown.
+  function pageEmployerName() {
+    const host = location.hostname.toLowerCase();
+    const parts = location.pathname.split("/").filter(Boolean);
+    let raw = null;
+    if (host.endsWith("smartrecruiters.com")) {
+      const i = parts.indexOf("company");
+      raw = i !== -1 ? parts[i + 1] : parts[0];
+    } else if (/(^|\.)greenhouse\.io$|jobs\.lever\.co$|jobs\.ashbyhq\.com$/.test(host)) {
+      raw = parts[0];
+    } else if (/\.myworkdayjobs\.com$/.test(host)) {
+      raw = host.split(".")[0];
+    }
+    raw ||= document.querySelector('meta[property="og:site_name"]')?.content || null;
+    if (!raw) return null;
+    const words = decodeURIComponent(raw)
+      .replace(/([a-z])([A-Z])/g, "$1 $2")
+      .replace(/[-_+]+/g, " ")
+      .split(/\s+/)
+      .filter((w) => w && !COMPANY_FILLER_WORDS.has(w.toLowerCase()));
+    const name = words.join(" ").trim();
+    return name ? name.charAt(0).toUpperCase() + name.slice(1) : null;
+  }
+
+  // "Easy apply - Data Engineer, Mobile Game Analytics" -> the job title.
+  function pageJobTitle() {
+    const title = (document.title || "").replace(/^\s*(easy apply|apply( now)?|application|job application)\s*[-|:–]\s*/i, "").trim();
+    return title || null;
+  }
+
+  // Confirmed real (Mattel): a recruiter can DELIBERATELY pick a job
+  // tailored for another company (here, the Ford-optimized resume reused
+  // for a Mattel application) — the resume choice is intentional, but the
+  // answers must still name the company actually being applied to. On a
+  // mismatch the page's own employer/title replace the picked job's, and
+  // the picked job's description is no longer sent to the AI (it described
+  // Ford's battery-manufacturing role). The resume version is untouched.
+  function reconcileJobWithPage(handoff) {
+    const companyName = handoff?.companyName;
+    if (!companyName || handoff.jobMismatchChecked || window.self !== window.top) return;
+    handoff.jobMismatchChecked = true;
+    const pageText = `${location.hostname} ${location.pathname} ${document.title}`.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const words = normalize(companyName).split(" ").filter((w) => w.length >= 3 && !COMPANY_FILLER_WORDS.has(w));
+    const compact = normalize(companyName).replace(/ /g, "");
+    if (words.length === 0 || pageText.includes(compact) || words.some((w) => pageText.includes(w))) return;
+
+    const pageCompany = pageEmployerName();
+    handoff.jobMismatch = true;
+    handoff.pickedCompanyName = companyName;
+    handoff.companyName = pageCompany;
+    handoff.jobTitle = pageJobTitle() || handoff.jobTitle;
+    console.warn("[AskJobs] picked job is for", companyName, "but this page is", pageCompany || "(unknown employer)", "— answering for the page's company; resume unchanged");
+    recordResult(
+      "skipped",
+      "Job check",
+      pageCompany
+        ? `The picked job is for "${companyName}", but this is a ${pageCompany} application — answers are written for ${pageCompany}. The attached resume is still the ${companyName} version you picked.`
+        : `The picked job is for "${companyName}", but this page doesn't look like a ${companyName} application — answers won't name a company. The attached resume is still the ${companyName} version you picked.`,
+    );
+  }
+
   let mutationObserverStarted = false;
   async function loadCandidateContextAndFill(candidateId) {
     // Confirmed real, serious bug: the manual candidate picker's handoff
@@ -6864,11 +7893,19 @@
     if (pendingHandoff?.jobId && !pendingHandoff.companyName) {
       const jobResult = await sendMessage({ type: "API_FETCH", path: `/api/v1/jobs/${pendingHandoff.jobId}` });
       console.log("[AskJobs] backfilling companyName/jobTitle from job for manual-picker handoff:", jobResult);
-      if (jobResult?.ok) {
+      // Confirmed real (Mattel/SmartRecruiters): pendingHandoff is a shared,
+      // module-level variable — a second concurrent call into this same
+      // function (e.g. two near-simultaneous loadCandidateContextAndFill
+      // invocations) can reassign or clear it during this await, so it's no
+      // longer safe to assume it's still the same object (or non-null at
+      // all) once the request resolves. Re-checking here turned an uncaught
+      // TypeError into a harmless no-op for whichever call lost the race.
+      if (jobResult?.ok && pendingHandoff) {
         pendingHandoff.companyName = jobResult.data?.company;
         pendingHandoff.jobTitle = jobResult.data?.title;
       }
     }
+    reconcileJobWithPage(pendingHandoff);
 
     const profileResult = await sendMessage({ type: "API_FETCH", path: `/api/v1/candidates/${candidateId}` });
     console.log("[AskJobs] candidate profile fetch result:", profileResult);
@@ -6977,8 +8014,33 @@
     observer.observe(document.body, { childList: true, subtree: true });
   }
 
+  // Confirmed real, serious (KKR/Greenhouse): only the TOP frame needs to
+  // ask, since it's the only one with anything to receive — a non-top
+  // frame calling this would just be talking to its own (nonexistent)
+  // iframes. Retried a few times with delays rather than sent once: the
+  // real race isn't just "iframe finished before top frame loaded" (which
+  // this alone would fully fix), it's also possible for an iframe to be
+  // inserted into the page slightly LATER than this runs at all, so a
+  // single immediate broadcast could still miss it.
+  function requestResendFromChildFrames() {
+    if (window.self !== window.top) return;
+    const ask = () => {
+      for (const iframe of document.querySelectorAll("iframe")) {
+        try {
+          iframe.contentWindow?.postMessage({ source: "askjobs-extension", type: "remote-request-resend" }, "*");
+        } catch {
+          // Cross-origin iframe whose contentWindow rejected the call — nothing to do here.
+        }
+      }
+    };
+    ask();
+    setTimeout(ask, 1000);
+    setTimeout(ask, 3000);
+  }
+
   async function init() {
     console.log("[AskJobs] content script loaded on", location.hostname);
+    requestResendFromChildFrames();
 
     // Belt-and-suspenders for the common case (manifest content_scripts.matches
     // already restricts automatic injection to the bundled list) — but also

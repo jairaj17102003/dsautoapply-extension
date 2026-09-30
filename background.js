@@ -250,9 +250,28 @@ async function claimPendingHandoff(hostname, tabId) {
   // stale entry instead of the fresh one just pushed for THIS click,
   // reusing an old candidate/resume version with no way to tell.  The most
   // recently pushed unclaimed entry is always the better guess.
+  //
+  // Confirmed real, serious (Mattel/SmartRecruiters application): this
+  // fallback had no recency limit at all — a manual-picker handoff meant
+  // for one specific tab (Ford's application, in this case) that never got
+  // claimed by that tab for whatever reason (closed early, a mismatched
+  // tabId after a reload) sat "unclaimed" in the queue for the rest of its
+  // whole HANDOFF_TTL_MS window, and a COMPLETELY UNRELATED tab opened
+  // minutes later (Mattel, on a totally different hostname, with its own
+  // hostname match correctly finding nothing) silently grabbed it instead
+  // — wrong candidate context (jobTitle/companyName) fed straight into the
+  // AI answering prompt, producing a Ford-battery-storage cover letter and
+  // a wrongly-"Yes" "former Mattel employee" answer on Mattel's own form.
+  // The genuine redirect case this fallback exists for (a landing page
+  // bouncing to the real ATS) always resolves within a few seconds of the
+  // Apply click — an entry old enough to need this fallback at all after
+  // that window is far more likely a stale leftover from a different,
+  // unrelated tab than it is a slow redirect still in flight.
+  const RECENT_FALLBACK_WINDOW_MS = 30 * 1000;
   if (!entry) {
+    const now = Date.now();
     for (let i = queue.length - 1; i >= 0; i--) {
-      if (queue[i].claimedByTabId == null) {
+      if (queue[i].claimedByTabId == null && now - queue[i].receivedAt < RECENT_FALLBACK_WINDOW_MS) {
         entry = queue[i];
         break;
       }

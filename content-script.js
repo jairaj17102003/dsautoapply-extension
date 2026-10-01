@@ -791,6 +791,22 @@
       );
       if (match) return match;
     }
+    // Confirmed real (CNA's Workday tenant): "Country Phone Code" is its
+    // own sibling form block — outside the phone field's parent/grandparent
+    // — and is a multiselect searchBox, not a select/combobox, so the tight
+    // search above found nothing, the "+1" was never stripped, and Workday
+    // rejected "+18136040929". Look a few levels further out, but ONLY for
+    // a field explicitly labeled as the phone's country/dial code.
+    const PHONE_CODE_LABEL = /country (phone )?code|dial(l)?ing code|phone country|calling code/i;
+    let node = phoneField.parentElement;
+    for (let i = 0; i < 6 && node; i++) {
+      const match = deepQueryAll(
+        node,
+        "select, [role='combobox'], button[aria-haspopup='listbox'], input[data-automation-id='searchBox']",
+      ).find((el) => el !== phoneField && PHONE_CODE_LABEL.test(labelForField(el) || el.getAttribute("aria-label") || ""));
+      if (match) return match;
+      node = node.parentElement;
+    }
     return null;
   }
 
@@ -801,7 +817,7 @@
   // every other native-select/custom-combobox field in this file, rather
   // than anything specific to one site's widget.
   async function fillNearbyCountrySelector(phoneField) {
-    const country = countryForPhoneSelector(profile?.phone);
+    const country = countryForPhoneSelector();
     if (!country) {
       console.log("[AskJobs] phone country selector skipped — no country set in your profile");
       return;
@@ -827,8 +843,11 @@
       return;
     }
 
-    const filled = await fillCustomCombobox(selector, country, "Phone country code");
-    recordResult(filled ? "filled" : "skipped", "Phone country code", filled ? `${country} (from your profile)` : "Couldn't find a matching option");
+    // Workday's searchBox multiselect needs its own type-and-pick flow.
+    const filled = isMultiselectSearchBox(selector)
+      ? await fillMultiselectSearch(selector, [country], "Phone country code")
+      : await fillCustomCombobox(selector, country, "Phone country code");
+    recordResult(filled ? "filled" : "skipped", "Phone country code", filled ? `${country} (from your phone number)` : "Couldn't find a matching option");
   }
 
   // Gender and disability status ARE actual stored, opt-in fields (unlike
@@ -1388,28 +1407,42 @@
   // falls back to it; only recognizes a US/Canada-shaped "+1" + 10-digit
   // number (the only case actually confirmed) and leaves the field alone
   // rather than guessing when the phone doesn't match that shape.
-  function countryForPhoneSelector(phone) {
-    if (phone && phone.trim().startsWith("+")) {
-      const digits = phone.replace(/\D/g, "");
-      if (digits.length === 11 && digits.startsWith("1")) return "United States";
+  // The candidate's phone is stored as the full international number
+  // ("+1 (813) 604-0929") plus `phoneCountry` ("United States"), chosen from
+  // a dropdown in the Consultant app's edit form. Mirrors the dial codes in
+  // Backend's phoneFormat.util.js / Consultant's lib/phone.ts.
+  const PHONE_DIAL_CODES = {
+    "United States": "1", Canada: "1", India: "91", "United Kingdom": "44", Australia: "61",
+    Germany: "49", France: "33", Ireland: "353", Netherlands: "31", Singapore: "65",
+    "United Arab Emirates": "971", "Saudi Arabia": "966", Qatar: "974", "New Zealand": "64",
+    Pakistan: "92", Bangladesh: "880", "Sri Lanka": "94", Nepal: "977", Philippines: "63",
+    Mexico: "52", Brazil: "55", "South Africa": "27", Nigeria: "234", Japan: "81", China: "86",
+  };
+
+  // Country for a job site's "Country Phone Code" picker: the stored
+  // phoneCountry, else the one the number's own "+code" implies, else
+  // United States (+1) — the default the recruiter asked for.
+  function countryForPhoneSelector() {
+    if (profile?.phoneCountry && PHONE_DIAL_CODES[profile.phoneCountry]) return profile.phoneCountry;
+    const digits = (profile?.phone || "").replace(/\D/g, "");
+    if ((profile?.phone || "").trim().startsWith("+")) {
+      const byLength = Object.entries(PHONE_DIAL_CODES).sort((a, b) => b[1].length - a[1].length);
+      const hit = byLength.find(([, code]) => digits.startsWith(code));
+      if (hit && hit[1] !== "1") return hit[0];
     }
-    return null;
+    return "United States";
   }
 
-  // Confirmed real (same Workday widget): a nearby "Country Phone Code"
-  // selector means the calling code has somewhere else to live — leaving
-  // it baked into the plain Phone Number field too produced "+15135109003"
-  // in a field whose own validation expects just the national number,
-  // rejecting it outright ("Enter a valid format for Phone Number").
-  // Scoped to the exact same US/Canada shape as countryForPhoneSelector
-  // above, for the same reason: it's the only case actually confirmed.
-  function stripUsCallingCodeIfPresent(value) {
-    const digits = value.replace(/\D/g, "");
-    if (value.trim().startsWith("+") && digits.length === 11 && digits.startsWith("1")) {
-      return digits.slice(1);
-    }
-    return value;
+  // Just the national number ("8136040929"), for a phone field that sits
+  // beside its own country-code picker — the code lives in the picker.
+  function nationalPhoneDigits() {
+    const raw = (profile?.phone || "").trim();
+    const digits = raw.replace(/\D/g, "");
+    if (!raw.startsWith("+")) return digits;
+    const code = PHONE_DIAL_CODES[countryForPhoneSelector()] || "1";
+    return digits.startsWith(code) ? digits.slice(code.length) : digits;
   }
+
 
   // Confirmed real gap: "Current Company"/"Current Title" screening fields
   // ask for the SAME data QuikTrip's own "current: true" experience entry
@@ -3053,9 +3086,15 @@
     // ("Enter a valid format for Phone Number"). Stripping a recognized
     // leading country code from the value itself, not just from the
     // append path, covers both shapes with the same nearby-selector check.
-    const hasNearbyCountrySelector = key === "phone" && !!findNearbyCountrySelector(field);
-    const phoneValue = key === "phone" && hasNearbyCountrySelector ? stripUsCallingCodeIfPresent(value) : value;
-    const finalValue = key === "phone" && isBareDialCodePrefix && !hasNearbyCountrySelector ? `${field.value.trim()}${value}` : phoneValue;
+    // Phone: with a separate country-code picker beside the field
+    // (Workday, SmartRecruiters), the code goes in the picker and this field
+    // gets only the plain national number ("8136040929") — a "+1" here is
+    // rejected ("Enter a valid format for Phone Number"). With no picker
+    // (one combined field), the full stored number goes in as-is
+    // ("+1 (813) 604-0929"), replacing any bare "+1" prefix already there.
+    const hasCodePicker = key === "phone" && !!findNearbyCountrySelector(field);
+    const finalValue =
+      key !== "phone" ? value : hasCodePicker ? nationalPhoneDigits() || value : (profile?.phone || "").trim() || value;
     // Confirmed real (Mattel/SmartRecruiters "Confirm your email"): a
     // one-shot value set read back fine at that moment, but the field was
     // empty (and flagged invalid) afterwards — while real key-by-key typing
@@ -3810,8 +3849,20 @@
     // preemptively given how serious a wrong-data insert is here, not
     // speculatively for its own sake.
     const RISKY_SHORT_WORD_PATTERNS = ["from", "to", "company", "degree", "title"];
+    // The visible label on its own counts too — confirmed real, serious
+    // (Workday Work Experience): strongText includes the field's id, and
+    // Workday's ids are long ("workExperience-3--companyName"), so a plain
+    // "Company*" / "From*" label was judged a long sentence and refused —
+    // Company and From stayed empty while "Job Title" (a multi-word,
+    // non-risky pattern) still filled. Same fix as classify()'s City case.
+    // The risky word must be IN that short label itself, so a short generic
+    // aria-label ("Select One Required") on a long question ("...worked for
+    // our company?") can never unlock a match found elsewhere in the text.
+    const visibleLabel = normalize(labelForField(field) || field.getAttribute("aria-label") || "");
+    const labelIsShort = visibleLabel.length > 0 && visibleLabel.length <= 20;
     const isShortLabel = strongText.length <= 20;
-    const patternIsSafe = (p) => isShortLabel || !RISKY_SHORT_WORD_PATTERNS.includes(p);
+    const patternIsSafe = (p) =>
+      isShortLabel || !RISKY_SHORT_WORD_PATTERNS.includes(p) || (labelIsShort && matchesWholeWord(visibleLabel, p));
     for (const matcher of matchers) {
       if (
         matcher.patterns.some((p) => patternIsSafe(p) && matchesWholeWord(strongText, p)) &&
@@ -7771,6 +7822,19 @@
   function adaptCandidateProfile(candidate) {
     return {
       ...candidate,
+      // Confirmed real (Workday "Role Description" — "no data on file"): a
+      // job's bullet points live in `achievements` (what the Consultant app
+      // displays); `description` is a separate, often-empty free-text
+      // field. Fall back to the bullets so a description field gets the
+      // candidate's real duties instead of being left blank.
+      experience: (candidate.experience || []).map((e) => ({
+        ...e,
+        description:
+          (e.description || "").trim() ||
+          (Array.isArray(e.achievements) && e.achievements.length
+            ? e.achievements.filter(Boolean).map((a) => `• ${a}`).join("\n")
+            : e.description),
+      })),
       education: (candidate.education || []).map((e) => ({
         institution: e.institution,
         degree: e.degree,

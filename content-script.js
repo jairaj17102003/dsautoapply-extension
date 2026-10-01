@@ -797,17 +797,22 @@
     // search above found nothing, the "+1" was never stripped, and Workday
     // rejected "+18136040929". Look a few levels further out, but ONLY for
     // a field explicitly labeled as the phone's country/dial code.
+    // Any input/select/combobox LABELED as the phone's country code — not
+    // only known widget shapes: confirmed real (CNA's Workday), the
+    // "Country Phone Code*" box is a plain <input> carrying none of the
+    // searchBox/combobox markers, so a shape-restricted query missed it.
+    // Nearest first; then page-wide, since a form has one phone-code field.
     const PHONE_CODE_LABEL = /country (phone )?code|dial(l)?ing code|phone country|calling code/i;
+    const PHONE_CODE_SELECTOR = "input:not([type='hidden']), select, [role='combobox'], button[aria-haspopup]";
+    const isPhoneCodeField = (el) =>
+      el !== phoneField && isVisible(el) && PHONE_CODE_LABEL.test(labelForField(el) || el.getAttribute("aria-label") || "");
     let node = phoneField.parentElement;
-    for (let i = 0; i < 6 && node; i++) {
-      const match = deepQueryAll(
-        node,
-        "select, [role='combobox'], button[aria-haspopup='listbox'], input[data-automation-id='searchBox']",
-      ).find((el) => el !== phoneField && PHONE_CODE_LABEL.test(labelForField(el) || el.getAttribute("aria-label") || ""));
+    for (let i = 0; i < 8 && node; i++) {
+      const match = deepQueryAll(node, PHONE_CODE_SELECTOR).find(isPhoneCodeField);
       if (match) return match;
       node = node.parentElement;
     }
-    return null;
+    return deepQueryAll(null, PHONE_CODE_SELECTOR).find(isPhoneCodeField) || null;
   }
 
   // Sets a phone widget's country/dial-code selector to the candidate's
@@ -1137,6 +1142,70 @@
       if (first === words.slice(half).join(" ")) return first;
     }
     return flat;
+  }
+
+  // Whether a dropdown's shown country is the same country as the profile's
+  // ("united states of america" / "usa" for "United States"). Whole words
+  // plus aliases for the common long/short spellings; a minor territory
+  // that starts with the same words ("United States Minor Outlying
+  // Islands") is never treated as the same country.
+  const COUNTRY_TEXT_ALIASES = {
+    "united states": ["united states of america", "usa", "us", "u s a", "u s"],
+    "united kingdom": ["uk", "great britain", "united kingdom of great britain and northern ireland"],
+    "united arab emirates": ["uae"],
+  };
+  function countryTextMatches(shownText, profileCountry) {
+    const shown = normalize(shownText);
+    const wanted = normalize(profileCountry);
+    if (!shown || !wanted) return false;
+    const names = [wanted, ...(COUNTRY_TEXT_ALIASES[wanted] || [])];
+    if (names.includes(shown)) return true;
+    // "United States of America (+1)" style text, minus a minor-territory
+    // name that merely starts with the same words.
+    return names.some((n) => containsWholeWords(shown, n)) && !/minor outlying|virgin islands/.test(shown);
+  }
+
+  // Option text minus a trailing dial code: "United States of America (+1)"
+  // -> "united states of america".
+  function optionCoreText(text) {
+    return normalize((text || "").replace(/\(\s*\+\s*\d+\s*\)\s*$/, ""));
+  }
+
+  // Confirmed real (CNA's Workday Country list): "United States" matched
+  // "United States Minor Outlying Islands" — it contains the words and
+  // sorts first. Per the recruiter: United States (or "+1") ALWAYS means
+  // "United States of America". Picks the full official name first, and
+  // never a territory that merely starts with the same words.
+  const US_NAMES = ["united states", "united states of america", "usa", "us", "u s a", "u s", "america"];
+  const US_TERRITORY = /minor outlying|virgin islands|samoa|guam|puerto rico|northern mariana/;
+  function preferredCountryOption(options, target) {
+    if (!US_NAMES.includes(target)) return null;
+    const core = (o) => optionCoreText(optionText(o));
+    return (
+      options.find((o) => core(o) === "united states of america") ||
+      options.find((o) => core(o) === "united states") ||
+      options.find((o) => ["usa", "us"].includes(core(o))) ||
+      null
+    );
+  }
+
+  // Whole-word match, but when several options contain the target, the
+  // CLOSEST one (fewest extra words) wins instead of whichever sorts first.
+  function closestWholeWordOption(options, target) {
+    const isUs = US_NAMES.includes(target);
+    let best = null;
+    let bestExtra = Infinity;
+    for (const o of options) {
+      const text = normalize(optionText(o));
+      if (isUs && US_TERRITORY.test(text)) continue;
+      if (!(containsWholeWords(text, target) || containsWholeWords(target, text))) continue;
+      const extra = Math.abs(text.split(" ").length - target.split(" ").length);
+      if (extra < bestExtra) {
+        best = o;
+        bestExtra = extra;
+      }
+    }
+    return best;
   }
 
   // Whole-word containment on normalize()d text. Raw substring matching
@@ -4466,11 +4535,37 @@
   // pattern already confirmed for OPENING these widgets, see
   // clickComboboxTrigger's own comment), so a synthetic "click" alone,
   // with no preceding mousedown/mouseup, never reached that handler.
+  // Confirmed real (CNA's Workday "Country Phone Code", tested live in the
+  // console): Workday's prompt list ignores mousedown/mouseup/click alone —
+  // only pointer events fired at the option's on-screen position selected
+  // it, and on the option's TEXT element ([data-automation-id=
+  // "promptOption"]), not its wrapper row. Pointer events + coordinates are
+  // harmless for every other widget, which keep reacting to the mouse
+  // events exactly as before.
   function clickMatchedOption(option) {
     const toggle = option.querySelector('input[type="checkbox"], input[type="radio"]');
-    const target = toggle || option;
-    const opts = { bubbles: true, cancelable: true, view: window };
+    const workdayText =
+      option.getAttribute("data-automation-id") === "promptOption"
+        ? option
+        : option.querySelector('[data-automation-id="promptOption"]');
+    const target = toggle || workdayText || option;
+    const rect = target.getBoundingClientRect();
+    const opts = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: window,
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2,
+      button: 0,
+    };
+    const pointer = { ...opts, pointerId: 1, pointerType: "mouse", isPrimary: true };
+    if (typeof PointerEvent === "function") {
+      target.dispatchEvent(new PointerEvent("pointerover", pointer));
+      target.dispatchEvent(new PointerEvent("pointerdown", pointer));
+    }
     target.dispatchEvent(new MouseEvent("mousedown", opts));
+    if (typeof PointerEvent === "function") target.dispatchEvent(new PointerEvent("pointerup", pointer));
     target.dispatchEvent(new MouseEvent("mouseup", opts));
     target.click();
   }
@@ -4678,7 +4773,8 @@
     });
     const heuristicMatch =
       matchable.find((o) => normalize(optionText(o)) === target) ||
-      matchable.find((o) => containsWholeWords(normalize(optionText(o)), target) || containsWholeWords(target, normalize(optionText(o)))) ||
+      preferredCountryOption(matchable, target) ||
+      closestWholeWordOption(matchable, target) ||
       matchable.find((o) => comboboxTextsMatch(optionText(o), target)) ||
       matchable.find((o) => degreeSynonymsMatch(optionText(o), target));
     if (heuristicMatch) return heuristicMatch;
@@ -5897,8 +5993,31 @@
 
       const currentText = comboboxDisplayText(button);
       if (currentText && !PLACEHOLDER_OPTION_TEXT.test(currentText)) {
-        console.log("[AskJobs] generic combobox skipped (already answered):", fieldLabel, "->", currentText);
-        continue; // already answered
+        // The one exception to never-overwrite: confirmed real (CNA's
+        // Workday), the address Country came back as "Japan" from Workday's
+        // own saved draft on every reload — the profile says United States
+        // — which swapped the whole address section to Japanese fields
+        // (Prefecture, Family Name - Kanji). Country is objective profile
+        // data, so a different pre-filled country is corrected (and said
+        // so in the sidebar). Every other answered field is still left alone.
+        const profileCountry = profile?.addressCountry;
+        const wrongCountry =
+          profileCountry && classify(button) === "addressCountry" && !countryTextMatches(currentText, profileCountry);
+        if (!wrongCountry) {
+          console.log("[AskJobs] generic combobox skipped (already answered):", fieldLabel, "->", currentText);
+          continue; // already answered
+        }
+        attemptedSignatures.add(signature);
+        console.warn("[AskJobs] country shows", currentText, "but the profile says", profileCountry, "— correcting:", fieldLabel);
+        const corrected = await fillCustomCombobox(button, profileCountry, fieldLabel);
+        recordResult(
+          corrected ? "filled" : "skipped",
+          fieldLabel,
+          corrected
+            ? `${profileCountry} — corrected from "${currentText}" to match the profile`
+            : `Shows "${currentText}" but the profile says ${profileCountry} — please correct it`,
+        );
+        continue;
       }
 
       const questionText = normalize(fieldLabel);

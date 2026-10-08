@@ -79,7 +79,10 @@
     { key: "addressStreet", patterns: ["street address", "address line 1", "address line1", "mailing address", "home address"] },
     { key: "addressCity", patterns: ["city"] },
     { key: "addressState", patterns: ["state/province", "state / province", "province", "state"] },
-    { key: "addressPostalCode", patterns: ["postal code", "zip code", "zipcode", "postcode"] },
+    // Bare "zip"/"postal" too: confirmed real (University of Phoenix's
+    // Avature form), the field is labeled just "Zip*" and matched none of
+    // the two-word patterns, so it stayed empty despite a saved postal code.
+    { key: "addressPostalCode", patterns: ["postal code", "zip code", "zipcode", "postcode", "zip", "postal"] },
     {
       key: "addressCountry",
       patterns: ["country"],
@@ -153,7 +156,8 @@
     { key: "location", patterns: ["location"] },
     { key: "linkedin", patterns: ["linkedin"] },
     { key: "portfolio", patterns: ["portfolio", "website", "personal site"] },
-    { key: "currentJobTitle", patterns: ["current title", "job title", "current role"] },
+    // "role title": confirmed real (Lever, Magna Legal's Employment History).
+    { key: "currentJobTitle", patterns: ["current title", "job title", "current role", "role title"] },
     // Confirmed real (Builtin/Zscaler): a standalone "Current Company*"
     // screening field, distinct from the repeated Work Experience section's
     // own per-entry "company" field (EXPERIENCE_FIELD_MATCHERS, a different
@@ -806,13 +810,72 @@
     const PHONE_CODE_SELECTOR = "input:not([type='hidden']), select, [role='combobox'], button[aria-haspopup]";
     const isPhoneCodeField = (el) =>
       el !== phoneField && isVisible(el) && PHONE_CODE_LABEL.test(labelForField(el) || el.getAttribute("aria-label") || "");
+    // Confirmed real (100hires, vue-phone-number-input): the picker's label
+    // is blank — only its id/class name it ("MazPhoneNumberInput-8_country_
+    // selector", "country-selector__input"), so the label test above never
+    // fired and the widget kept its own location-based default (India).
+    // Trusted only within a few levels of the phone field, never page-wide,
+    // so an address "country-selector" elsewhere can't be mistaken for it.
+    const PHONE_CODE_ATTR = /country[_-]?selector|country[_-]?code|dial(l)?(ing)?[_-]?code|calling[_-]?code|phone[_-]?code/i;
+    const isPhoneCodeByAttr = (el) =>
+      el !== phoneField && isVisible(el) && PHONE_CODE_ATTR.test(`${el.id || ""} ${el.getAttribute("name") || ""} ${el.className || ""}`);
     let node = phoneField.parentElement;
     for (let i = 0; i < 8 && node; i++) {
-      const match = deepQueryAll(node, PHONE_CODE_SELECTOR).find(isPhoneCodeField);
+      const fields = deepQueryAll(node, PHONE_CODE_SELECTOR);
+      const match = fields.find(isPhoneCodeField) || (i < 4 ? fields.find(isPhoneCodeByAttr) : null);
       if (match) return match;
       node = node.parentElement;
     }
     return deepQueryAll(null, PHONE_CODE_SELECTOR).find(isPhoneCodeField) || null;
+  }
+
+  // vue-phone-number-input's picker (100hires, actual HTML): a readonly
+  // <input class="country-selector__input"> whose options are plain
+  // <button class="country-selector__list__item"> rows (calling code + a
+  // .dots-text country name) in a virtualized scroller — not a <select>,
+  // not role="option", and only the rows in view exist in the DOM.
+  function isVuePhoneCountrySelector(el) {
+    return Boolean(el.closest?.(".country-selector")?.querySelector(".country-selector__list"));
+  }
+
+  async function fillVuePhoneCountrySelector(selector, country, phoneField) {
+    const root = selector.closest(".country-selector");
+    const list = root.querySelector(".country-selector__list");
+    selector.focus();
+    selector.click();
+    for (let i = 0; i < 10 && getComputedStyle(list).display === "none"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    const scroller = list.querySelector(".vue-recycle-scroller") || list;
+    const findRow = () =>
+      Array.from(list.querySelectorAll(".country-selector__list__item")).find((row) =>
+        countryTextMatches(row.querySelector(".dots-text")?.textContent || "", country),
+      );
+    let row = findRow();
+    // Virtualized: scroll a screenful at a time until the row renders or
+    // the list stops moving (end reached).
+    for (let i = 0; !row && i < 80; i++) {
+      const before = scroller.scrollTop;
+      scroller.scrollTop += Math.max(scroller.clientHeight, 150);
+      scroller.dispatchEvent(new Event("scroll"));
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      row = findRow();
+      if (scroller.scrollTop === before) break;
+    }
+    if (!row) {
+      console.log("[AskJobs] vue phone country picker: no row for", country);
+      selector.blur();
+      return false;
+    }
+    clickMatchedOption(row);
+    // Switching country makes the widget re-parse/reformat the number box;
+    // put the plain national number back if that dropped or altered it.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const national = nationalPhoneDigits();
+    if (national && (phoneField.value || "").replace(/\D/g, "") !== national) {
+      setNativeValue(phoneField, national);
+    }
+    return true;
   }
 
   // Sets a phone widget's country/dial-code selector to the candidate's
@@ -845,6 +908,12 @@
       } else {
         recordResult("skipped", "Phone country code", "Couldn't find a matching option");
       }
+      return;
+    }
+
+    if (isVuePhoneCountrySelector(selector)) {
+      const picked = await fillVuePhoneCountrySelector(selector, country, phoneField);
+      recordResult(picked ? "filled" : "skipped", "Phone country code", picked ? `${country} (from your phone number)` : "Couldn't find a matching option");
       return;
     }
 
@@ -994,7 +1063,36 @@
       field.id || "",
       field.getAttribute("placeholder") || "",
       field.getAttribute("aria-label") || "",
+      // Confirmed real (ClearCompany, actual HTML): Resume, Cover Letter and
+      // Certifications are three identical <input type="file" name="files[]">
+      // with no id/label, so all three shared one signature — once the
+      // resume slot was handled, the other two read as "already attempted"
+      // and were silently skipped. Their own block titles tell them apart.
+      field.type === "file" ? fileInputBlockTitle(field) : "",
     ].join("|");
+  }
+
+  // The title of the smallest page block that holds this file input and no
+  // other one — e.g. ClearCompany's <div class="form-field ... coverletter">
+  // whose first child <div class="control-label field-title"> reads "Cover
+  // Letter", several levels above an otherwise unlabeled input. Only
+  // title-shaped children count (headings/label/legend, or a class naming a
+  // label/title/header), never the upload widget's own "File"/"Upload"/
+  // "Dropbox" button text. "" when there's no such title.
+  function fileInputBlockTitle(input) {
+    let node = input.parentElement;
+    for (let depth = 0; depth < 10 && node && node !== document.body; depth++) {
+      if (node.querySelectorAll('input[type="file"]').length > 1) break;
+      for (const child of node.children) {
+        if (child.contains(input)) continue;
+        const isTitleShaped =
+          /^(H[1-6]|LABEL|LEGEND)$/.test(child.tagName) || /(^|[\s_-])(label|title|header|heading)/i.test(child.className || "");
+        const text = (child.textContent || "").replace(/\s+/g, " ").trim();
+        if (isTitleShaped && text && text.length <= 60) return normalize(text);
+      }
+      node = node.parentElement;
+    }
+    return "";
   }
 
   function sendMessage(message) {
@@ -1369,12 +1467,51 @@
   // text (not nested inside another shadow root) wins. No-op extra cost
   // for the common case (no shadow DOM at all): the chain is just
   // [field], identical to the old single-element behavior.
+  // Lever's question card (actual HTML, Magna Legal's form): <li
+  // class="application-question"> holding <div class="application-label">
+  // <div class="text">Did you graduate?<span class="required">✱</span></div>
+  // beside <div class="application-field"> with the inputs — a SIBLING, not
+  // a <label>/<legend>. Missing it, a radio group's "question" became its
+  // own run-together option text ("yesnocurrently enrolled"), which the AI
+  // then answered wrongly, and gender/ethnicity were never recognized.
+  function leverQuestionText(field) {
+    const card = field.closest?.(".application-question");
+    const textEl = card?.querySelector(".application-label .text");
+    if (textEl) {
+      const clone = textEl.cloneNode(true);
+      clone.querySelectorAll(".required").forEach((el) => el.remove());
+      return (clone.textContent || "").replace(/\s+/g, " ").trim();
+    }
+    // Lever's standard EEO rows ("Gender", "Race ⓘ", "Veteran status") put
+    // the question directly in .application-label, inside a <label> that
+    // also wraps the <select> — so the generic label lookup read "Gender"
+    // glued to every option ("GenderSelect ...MaleFemaleDecline to
+    // self-identify"), the gender rule never matched, and the AI guessed.
+    // Only the label's own text nodes count, skipping any tooltip/icon
+    // element nested in it.
+    const labelEl = card?.querySelector(".application-label");
+    if (!labelEl || labelEl.contains(field)) return "";
+    const ownText = Array.from(labelEl.childNodes)
+      .filter((n) => n.nodeType === Node.TEXT_NODE)
+      .map((n) => n.textContent)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+    return ownText;
+  }
+
   function labelForField(field) {
     // A custom ARIA radio (SmartRecruiters' <spl-radio label="Yes">) is its
     // own option label — climbing its shadow-host chain would return the
     // surrounding QUESTION's label instead.
     if (isAriaRadio(field)) {
       return field.getAttribute("label") || field.getAttribute("aria-label") || optionText(field);
+    }
+    // Radios/checkboxes keep their own option label ("Yes"); only a single
+    // field takes the card's question text.
+    if (field.type !== "radio" && field.type !== "checkbox") {
+      const lever = leverQuestionText(field);
+      if (lever) return lever;
     }
     for (const el of shadowHostChain(field)) {
       const label = labelForOne(el);
@@ -2249,6 +2386,54 @@
     }
   }
 
+  // Attaches the cover letter generated with this job's resume version
+  // (rendered as a PDF by GET /resume-versions/:id/cover-letter/pdf) into a
+  // "Cover Letter" upload field — confirmed real gap (University of
+  // Phoenix's Avature form): the field was always left for manual upload
+  // even though every optimized version already carries a letter. Only a
+  // job-specific version has one; the master-resume fallback never does.
+  // Returns a human-readable reason when it can't, for the sidebar.
+  async function attachCoverLetterFile(input) {
+    if (!pendingHandoff?.resumeVersionId) {
+      return { attached: false, reason: "No job-specific resume picked, so there's no cover letter to attach — attach manually" };
+    }
+    const accept = (input.getAttribute("accept") || "").toLowerCase();
+    if (accept && !/pdf|\*/.test(accept)) {
+      return { attached: false, reason: `This upload doesn't accept PDFs (${accept}) — attach manually` };
+    }
+    try {
+      const result = await sendMessage({
+        type: "API_FETCH_FILE",
+        path: `/api/v1/resume-versions/${pendingHandoff.resumeVersionId}/cover-letter/pdf`,
+      });
+      if (!result?.ok) {
+        console.warn("[AskJobs] cover letter PDF fetch failed", result);
+        return {
+          attached: false,
+          reason:
+            result?.status === 404
+              ? "This resume version has no cover letter — attach manually"
+              : "Couldn't fetch the cover letter — attach manually",
+        };
+      }
+      const blob = await (await fetch(result.dataUrl)).blob();
+      const baseName = (resumeFileName || "resume").replace(/\.(docx?|pdf)$/i, "");
+      const file = new File([blob], `${baseName}_Cover_Letter.pdf`, { type: "application/pdf" });
+      const dataTransfer = new DataTransfer();
+      dataTransfer.items.add(file);
+      input.files = dataTransfer.files;
+      // Checked before dispatch, for the same reason as attachResumeFile.
+      const assigned = input.files.length > 0;
+      input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      return assigned
+        ? { attached: true }
+        : { attached: false, reason: "The site refused the file — attach manually" };
+    } catch (error) {
+      console.warn("[AskJobs] cover letter attach failed", error);
+      return { attached: false, reason: "Couldn't attach the cover letter — attach manually" };
+    }
+  }
+
   // Some ATS platforms (confirmed real: SAP SuccessFactors) build their
   // resume-upload UI entirely out of <div>/<span> elements with no
   // <input type="file"> in the DOM at all until a click creates one —
@@ -2812,10 +2997,25 @@
       attemptedSignatures.add(signature);
       // A "cover letter" upload is a genuinely different document from the
       // resume — attaching the resume into it would be actively wrong, not
-      // just unhelpful. Left for manual attachment for now; only a cover
-      // letter TEXT field (below) gets AI-generated content.
-      if (classify(field) === "coverLetter") {
-        recordResult("skipped", fieldLabel, "Cover letter file upload — attach manually for now");
+      // just unhelpful. It gets the version's own generated cover letter
+      // instead (see attachCoverLetterFile), or a manual-attach note.
+      // An unlabeled upload (ClearCompany's name="files[]") is classified by
+      // its block title instead — "Cover Letter", "Certifications", etc.
+      const blockTitle = fileInputBlockTitle(field);
+      const titleSays = (patterns) => patterns.some((p) => matchesWholeWord(blockTitle, p));
+      const labelKind = classify(field);
+      let documentKind = null;
+      if (labelKind === "coverLetter" || labelKind === "otherDocument") documentKind = labelKind;
+      else if (titleSays(["cover letter", "covering letter", "motivation letter"])) documentKind = "coverLetter";
+      else if (
+        titleSays(["transcript", "transcripts", "writing sample", "additional document", "additional documents", "references", "certification", "certifications", "license", "licenses"])
+      ) {
+        documentKind = "otherDocument";
+      }
+      if (documentKind === "coverLetter") {
+        await getResumeFileUrl(); // ensures resumeFileName is populated
+        const { attached, reason } = await attachCoverLetterFile(field);
+        recordResult(attached ? "filled" : "skipped", fieldLabel, attached ? "Attached the generated cover letter (PDF)" : reason);
         return;
       }
       // Confirmed real (Johns Hopkins APL's iCIMS form): "transcripts" and
@@ -2823,7 +3023,7 @@
       // real resume field, outside any repeated-entry section, so nothing
       // above stopped them from also being treated as "the resume slot" —
       // the same resume file got attached into all of them.
-      if (classify(field) === "otherDocument") {
+      if (documentKind === "otherDocument") {
         recordResult("skipped", fieldLabel, "Not the resume field — attach manually if required");
         return;
       }
@@ -3354,6 +3554,9 @@
   //    question text is a SIBLING of the options wrapper, not a
   //    descendant of it at all).
   function groupQuestionText(items) {
+    const lever = leverQuestionText(items[0]);
+    if (lever) return lever;
+
     let node = items[0].closest("fieldset");
     while (node) {
       const legend = node.querySelector("legend");
@@ -3394,13 +3597,32 @@
     return text;
   }
 
+  // The employer a "have you worked for X?" question names, or null when it
+  // only says "this company"/"us"/"our organization" (then the picked job's
+  // company is the right target). "Boston University (BU)?" -> "Boston
+  // University"; "Genpact in any capacity?" -> "Genpact".
+  function companyNamedInQuestion(questionText) {
+    const match = (questionText || "").match(
+      /\b(?:work(?:ed)?|been employed|employed)\s+(?:for|at|by)\s+(.+?)\s*(?:\(|\?|,|\bin any\b|\bor any\b|\bor its\b|\bincluding\b|\bas an?\b|\bbefore\b|\bpreviously\b|\bin the past\b|\bagain\b|$)/i,
+    );
+    const name = match?.[1]?.replace(/^(?:the)\s+/i, "").trim();
+    if (!name || name.length < 2) return null;
+    if (/^(?:this|our|us|we|the)\b|^(?:company|organization|organisation|employer|firm)$/i.test(name)) return null;
+    return name;
+  }
+
   // Deterministic (no AI) answer for a matched radio-question key, sourced
   // from stored preferences (Settings → Screening Questions) or, for
   // "worked here before," derived per-application from resume history —
   // never stored, genuinely computed each time against the current job.
-  function radioAnswerForKey(key) {
+  function radioAnswerForKey(key, questionText = "") {
     if (key === "workedHereBefore") {
-      const targetCompany = pendingHandoff?.companyName;
+      // The question naming the employer itself beats the picked job's
+      // company — confirmed real (Boston University's SilkRoad form, "Have
+      // you previously worked for Boston University (BU)?"): the picked job
+      // didn't match the page, reconcileJobWithPage cleared companyName,
+      // and the question went unanswered though it names the company.
+      const targetCompany = companyNamedInQuestion(questionText) || pendingHandoff?.companyName;
       if (!targetCompany) return null;
       // Confirmed real bug: this used to bail out to null ("can't answer")
       // whenever experience was empty, even though an empty work history
@@ -3614,7 +3836,7 @@
     const matcher = matchRadioQuestion(questionText);
     if (!matcher) return false;
 
-    const answer = radioAnswerForKey(matcher.key);
+    const answer = radioAnswerForKey(matcher.key, questionText);
     if (answer === null) {
       recordResult("skipped", fieldLabel, "Recognized, but no stored preference set yet");
       return true;
@@ -4092,6 +4314,22 @@
       const combined = normalize(`${labelEl?.textContent || labelledBy || ""} ${group.getAttribute("aria-label") || ""}`);
       if (patterns.some((p) => matchesWholeWord(combined, p)) && isPlausibleSectionContainer(group, sectionKey, "role=group", combined)) {
         return group;
+      }
+    }
+
+    // Confirmed real (Workable, actual HTML): each repeated section is
+    // <div data-ui="education"> holding a <p id="education_label"> label and
+    // its own "+ Add" button — no heading tag and no role="group", so neither
+    // pass here found it and Education/Experience were never filled. Exact
+    // match on the attribute value only (never "contains"), so a field like
+    // data-ui="summary" or an unrelated widget can't be mistaken for one.
+    // Checked before the looser heading pass below, which otherwise matched
+    // an unrelated "Visit website" heading on the same page.
+    const tagged = deepQueryAll(null, "[data-ui]");
+    for (const el of tagged) {
+      const value = normalize(el.getAttribute("data-ui") || "");
+      if (patterns.includes(value) && isPlausibleSectionContainer(el, sectionKey, "data-ui", value)) {
+        return el;
       }
     }
 
@@ -5908,7 +6146,7 @@
         continue; // Not a question we recognize — leave for the AI classification fallback or the user.
       }
 
-      const answer = radioAnswerForKey(matcher.key);
+      const answer = radioAnswerForKey(matcher.key, questionText);
       if (answer === null) {
         recordResult("skipped", rawQuestionText || matcher.key, "Recognized, but no stored preference set yet");
         continue; // Recognized, but no stored preference to answer with yet.
@@ -6245,7 +6483,7 @@
         continue;
       }
 
-      const answer = radioAnswerForKey(matcher.key);
+      const answer = radioAnswerForKey(matcher.key, questionText);
       if (answer === null) {
         console.log("[AskJobs] generic combobox recognized as", matcher.key, "but no stored preference:", fieldLabel);
         recordResult("skipped", fieldLabel, "Recognized, but no stored preference set yet");
@@ -6280,6 +6518,9 @@
       if (node.querySelector("legend")?.textContent?.trim()) return node;
       node = node.parentElement?.closest("fieldset") || null;
     }
+    // Lever's checkbox questions ("I identify my ethnicity as") have no
+    // fieldset at all — the card itself is the group.
+    if (leverQuestionText(box)) return box.closest(".application-question");
     return box.closest("fieldset");
   }
 
@@ -6309,12 +6550,13 @@
       if (groupBoxes.length < 2) continue;
 
       const legend = fieldsetEl.querySelector("legend");
-      const rawQuestionText = (legend?.textContent || "").trim();
+      const rawQuestionText = (legend?.textContent || "").trim() || leverQuestionText(groupBoxes[0]);
       // Stable per-question key: the legend's own id if it (or a child) has
       // one (Workday: "checkbox-group-label7"), falling back to the first
       // checkbox's id — DOM elements themselves aren't reused as Set keys
       // here since a re-scan after a step change queries fresh nodes.
-      const name = legend?.querySelector("[id]")?.id || legend?.id || groupBoxes[0].id;
+      // Lever's boxes have no id; their shared name is just as stable.
+      const name = legend?.querySelector("[id]")?.id || legend?.id || groupBoxes[0].id || groupBoxes[0].name;
       if (!name) continue;
 
       if (attemptedCheckboxGroups.has(name)) continue;
@@ -6361,7 +6603,7 @@
         continue; // Not one of the fixed screening categories — leave for the AI qualification-answer fallback.
       }
 
-      const answer = radioAnswerForKey(matcher.key);
+      const answer = radioAnswerForKey(matcher.key, questionText);
       if (answer === null) {
         recordResult("skipped", rawQuestionText || matcher.key, "Recognized, but no stored preference set yet");
         continue;
@@ -6506,7 +6748,7 @@
         continue;
       }
 
-      const answer = radioAnswerForKey(matcher.key);
+      const answer = radioAnswerForKey(matcher.key, questionText);
       if (answer === null) {
         recordResult("skipped", rawQuestionText, "Recognized, but no stored preference set yet");
         continue;
@@ -7444,11 +7686,11 @@
         return;
       }
 
-      if (item.kind === "field" && item.field.tagName === "SELECT" && radioAnswerForKey(key) !== null) {
+      if (item.kind === "field" && item.field.tagName === "SELECT" && radioAnswerForKey(key, item.questionText) !== null) {
         // A native <select> classified into a Yes/No screening category —
         // radio groups and comboboxes already handle these below; this is
         // the same treatment for the plain-select shape.
-        const answer = radioAnswerForKey(key);
+        const answer = radioAnswerForKey(key, item.questionText);
         const wanted = answer ? "yes" : "no";
         const option = Array.from(item.field.options).find((o) => {
           const label = normalize(o.textContent);
@@ -7486,7 +7728,7 @@
         });
         addedCount += 1;
       } else if (item.kind === "radioGroup") {
-        const answer = radioAnswerForKey(key);
+        const answer = radioAnswerForKey(key, item.questionText);
         if (answer === null) return;
 
         const wantedText = answer ? "yes" : "no";
@@ -7502,7 +7744,7 @@
         });
         addedCount += 1;
       } else if (item.kind === "buttonToggleGroup") {
-        const answer = radioAnswerForKey(key);
+        const answer = radioAnswerForKey(key, item.questionText);
         if (answer === null) return;
 
         const wantedWord = answer ? "yes" : "no";
@@ -7529,7 +7771,7 @@
         // only ever tried radioAnswerForKey — which returns null for
         // anything it doesn't recognize — so the suggestion silently
         // vanished no matter how correct the upstream classification was.
-        const boolAnswer = radioAnswerForKey(key);
+        const boolAnswer = radioAnswerForKey(key, item.questionText);
         const wantedText =
           boolAnswer !== null
             ? boolAnswer

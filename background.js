@@ -431,3 +431,55 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   return true; // keep the message channel open for the async response
 });
+
+// Confirmed real (University of Phoenix's Avature, a multi-step form): a
+// site enabled from the popup's "Enable on this site" only ever got the
+// script injected ONCE, into the page open at that moment — a runtime host
+// permission alone never makes Chrome inject the manifest's content_scripts
+// (those match only the static list). Every later step/reload loaded with no
+// extension at all, so the sidebar "disappeared" and the console stayed
+// empty. Registering the script for every manually-granted origin makes
+// those sites load it on every page, exactly like the built-in ones.
+const MANUAL_SITES_SCRIPT_ID = "askjobs-manual-sites";
+let manualSitesSync = Promise.resolve();
+
+async function syncManualSiteScript() {
+  const manifest = chrome.runtime.getManifest();
+  const builtIn = new Set([
+    ...(manifest.host_permissions || []),
+    ...(manifest.content_scripts || []).flatMap((cs) => cs.matches || []),
+  ]);
+  const { origins = [] } = await chrome.permissions.getAll();
+  const matches = origins.filter((o) => o !== "<all_urls>" && !builtIn.has(o));
+
+  const existing = await chrome.scripting.getRegisteredContentScripts({ ids: [MANUAL_SITES_SCRIPT_ID] });
+  if (matches.length === 0) {
+    if (existing.length) await chrome.scripting.unregisterContentScripts({ ids: [MANUAL_SITES_SCRIPT_ID] });
+    return;
+  }
+  // Same shape as the manifest's own content_scripts entry. Double injection
+  // is harmless either way (window.__askjobsAutofillInjected guard).
+  const script = {
+    id: MANUAL_SITES_SCRIPT_ID,
+    js: ["content-script.js"],
+    matches,
+    runAt: "document_idle",
+    allFrames: true,
+    persistAcrossSessions: true,
+  };
+  if (existing.length) await chrome.scripting.updateContentScripts([script]);
+  else await chrome.scripting.registerContentScripts([script]);
+}
+
+// Serialized: onInstalled and onAdded can fire together, and two concurrent
+// registerContentScripts calls would fail on the duplicate id.
+function queueManualSiteSync() {
+  manualSitesSync = manualSitesSync
+    .then(syncManualSiteScript)
+    .catch((error) => console.error("[AskJobs] manual-site script sync failed:", error));
+}
+
+chrome.runtime.onInstalled.addListener(queueManualSiteSync);
+chrome.runtime.onStartup.addListener(queueManualSiteSync);
+chrome.permissions.onAdded.addListener(queueManualSiteSync);
+chrome.permissions.onRemoved.addListener(queueManualSiteSync);

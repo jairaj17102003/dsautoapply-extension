@@ -38,6 +38,9 @@
     // Confirmed real (Mattel/SmartRecruiters signature block): "First and
     // Last Name:" matched "last name" and got ONLY the surname — it's the
     // fullName field (see its patterns below).
+    // Before first/last name — and see fillField: with no middle name on
+    // file it's left empty, never sent to the AI.
+    { key: "middleName", patterns: ["middle name", "middlename", "middle initial", "middle names"] },
     { key: "firstName", patterns: ["first name", "firstname", "given name", "preferred name"], excludePatterns: ["first and last name"] },
     { key: "lastName", patterns: ["last name", "lastname", "surname", "family name"], excludePatterns: ["first and last name"] },
     { key: "email", patterns: ["email"] },
@@ -76,7 +79,31 @@
     // sub-field per real sub-field — profile.address itself is untouched and
     // still used for the generic "location" fallback below (see
     // Candidate.model.js's comment on why these are additive, not merged).
-    { key: "addressStreet", patterns: ["street address", "address line 1", "address line1", "mailing address", "home address"] },
+    // A single "Home Address" box (confirmed real, Lever/Magna Legal) wants
+    // the whole address, not just the street — with no street on file it
+    // was left empty though city/state/zip/country were all stored. See
+    // valueForKey("fullAddress") for the separate-City/ZIP-fields case.
+    {
+      key: "fullAddress",
+      patterns: ["home address", "mailing address", "residential address", "current address", "permanent address", "full address"],
+    },
+    // Bare "Address" / name="AddressLine1": confirmed real (NYU Langone's
+    // SilkRoad form) — matched none of the multi-word patterns and stayed
+    // empty. Guarded: never an email/web/IP address or line 2, and only as a
+    // short label ("address" is in RISKY_SHORT_WORD_PATTERNS).
+    {
+      key: "addressStreet",
+      patterns: ["street address", "address line 1", "address line1", "addressline1", "address1", "address"],
+      // City/ZIP/state/country too — confirmed real, serious (Analog
+      // Devices' Workday): every address field's id starts "address--"
+      // ("address--city", "address--postalCode"), so bare "address" matched
+      // them all and City + Postal Code got the street ("123 Main St").
+      excludePatterns: [
+        "email", "e mail", "web", "website", "ip", "url", "address line 2", "address line2", "addressline2", "address2", "line 2",
+        "city", "town", "postal", "postalcode", "postal code", "zip", "zipcode", "zip code", "postcode",
+        "state", "province", "region", "county", "country", "countryregion",
+      ],
+    },
     { key: "addressCity", patterns: ["city"] },
     { key: "addressState", patterns: ["state/province", "state / province", "province", "state"] },
     // Bare "zip"/"postal" too: confirmed real (University of Phoenix's
@@ -246,6 +273,22 @@
   // overall question text), not per-individual-option, since "Yes"/"No"
   // alone carries no meaning without the question they're answering.
   const RADIO_MATCHERS = [
+    // Confirmed real (Analog Devices' Workday): "Are you currently enrolled
+    // in an accredited degree program?" went to the AI, which answered Yes
+    // for a graduated candidate. Answered from education end dates instead
+    // (see radioAnswerForKey) — first, so no broader "degree" rule claims it.
+    {
+      key: "currentlyEnrolled",
+      patterns: [
+        "currently enrolled",
+        "currently a student",
+        "currently pursuing",
+        "currently attending",
+        "enrolled in an accredited",
+        "enrolled in a degree",
+        "current student",
+      ],
+    },
     {
       key: "atLeast18",
       patterns: [
@@ -324,11 +367,19 @@
         "need a visa",
         "sponsor an employment visa",
         "immigration sponsorship",
+        // Confirmed real (Analog Devices' Workday): "Will you need to be
+        // sponsored for a work visa by Analog Devices – either now or in the
+        // future" matched none of the above.
+        "be sponsored",
+        "sponsored for a work visa",
+        "sponsored for a visa",
       ],
     },
     {
       key: "willingToRelocate",
-      patterns: ["willing to relocate", "relocation", "open to relocation", "open to relocating", "able to relocate"],
+      // "open to relocate"/bare "relocate": confirmed real (Rippling, "Are
+      // you open to relocate within the US?") matched none of the others.
+      patterns: ["willing to relocate", "relocation", "open to relocation", "open to relocating", "able to relocate", "open to relocate", "relocate"],
     },
     // Disclosure-style questions where "No" is the answer for virtually every
     // candidate (see radioAnswerForKey) — confirmed real (3M's Workday form):
@@ -369,6 +420,18 @@
         "employed by a government",
         "government official",
         "public official",
+        // Confirmed real (Analog Devices' Workday): "Have you ever served as
+        // an employee in the U.S. Government or on active duty in the U.S.
+        // Military?" matched none of the above. Default No, like the rest.
+        // (Veteran-status EEO questions are handled before this rule.)
+        "u s government",
+        "us government",
+        "federal government",
+        "government employee",
+        "active duty",
+        "u s military",
+        "us military",
+        "armed forces",
       ],
     },
     {
@@ -499,6 +562,31 @@
     return null;
   }
 
+  // "Are you Hispanic/Latino?" asked on its own (Yes / No / decline) —
+  // confirmed real (Rippling): it was treated as the race question and
+  // answered with the stored race ("Asian"), which matches no Yes/No
+  // option, so it fell through to the AI and went unanswered. A question
+  // that also asks about race keeps the combined race handling.
+  function isHispanicYesNoQuestion(normalizedQuestionText) {
+    return (
+      (normalizedQuestionText.includes("hispanic") || normalizedQuestionText.includes("latino") || normalizedQuestionText.includes("latina")) &&
+      !matchesWholeWord(normalizedQuestionText, "race") &&
+      !normalizedQuestionText.includes("racial")
+    );
+  }
+
+  // Yes/No from the stored answer; with none on file, a stored race that
+  // isn't itself Hispanic/Latino (e.g. "Asian") answers No — the user's
+  // explicit rule. A stored "decline" stays unanswered (sites word that
+  // option too differently to pick reliably).
+  function eeoHispanicYesNo() {
+    if (eeoProfile?.hispanicOrLatino === "yes") return "Yes";
+    if (eeoProfile?.hispanicOrLatino === "no") return "No";
+    if (eeoProfile?.hispanicOrLatino) return null;
+    if (eeoProfile?.race) return /hispanic|latin/i.test(eeoProfile.race) ? "Yes" : "No";
+    return null;
+  }
+
   function eeoHispanicOrLatinoText() {
     if (eeoProfile?.hispanicOrLatino === "yes") return "Hispanic or Latino";
     if (eeoProfile?.hispanicOrLatino === "no") return "Not Hispanic or Latino";
@@ -559,6 +647,8 @@
   function sensitiveSelfIdSingleValue(normalizedQuestionText) {
     if (!eeoProfile) return null;
     if (normalizedQuestionText.includes("veteran")) return eeoVeteranStatusText();
+    // Must precede the race branch below, which also matches "hispanic".
+    if (isHispanicYesNoQuestion(normalizedQuestionText)) return eeoHispanicYesNo();
     if (normalizedQuestionText.includes("ethnicit") || normalizedQuestionText.includes("hispanic") || normalizedQuestionText.includes("racial") || matchesWholeWord(normalizedQuestionText, "race")) {
       return eeoProfile.race || null;
     }
@@ -592,13 +682,24 @@
     }
     if (wantedValues.length === 0) return null;
 
+    // Exact option first, then WHOLE-WORD containment either way — never a
+    // raw substring. Confirmed real, serious (Lever): an Asian candidate got
+    // "White / Caucasian" checked, because "caucasian".includes("asian") is
+    // true and that option is listed before "Asian".
+    const optionTextOf = (b) => normalize(labelForField(b) || b.value || "");
     const targets = [];
     for (const wanted of wantedValues) {
       const normWanted = normalize(wanted);
-      const box = boxes.find((b) => {
-        const optionText = normalize(labelForField(b) || b.value || "");
-        return optionText && (optionText.includes(normWanted) || normWanted.includes(optionText));
-      });
+      // "Hispanic or Latino" vs Lever's "Hispanic, Latino, or Spanish
+      // origin" — same meaning, different wording. Never for "Not Hispanic".
+      const meansHispanic = /\b(hispanic|latino|latina|latinx)\b/.test(normWanted) && !/\bnot\b/.test(normWanted);
+      const box =
+        boxes.find((b) => optionTextOf(b) === normWanted) ||
+        boxes.find((b) => {
+          const optionText = optionTextOf(b);
+          return optionText && (containsWholeWords(optionText, normWanted) || containsWholeWords(normWanted, optionText));
+        }) ||
+        (meansHispanic ? boxes.find((b) => /\b(hispanic|latino|latina|latinx)\b/.test(optionTextOf(b)) && !/\bnot\b/.test(optionTextOf(b))) : null);
       if (box && !targets.includes(box)) targets.push(box);
     }
     if (targets.length === 0) return null;
@@ -697,31 +798,55 @@
     );
   }
 
-  // "How did you hear about us?" — answered with the company's Careers
-  // site when the list offers it, otherwise LinkedIn, otherwise left alone
-  // (never a guess at some other source). Any option STARTING with "career"
-  // counts as Careers, except "career fair"/"career event" wordings, which
-  // are different sources entirely.
+  // "How did you hear about us?" — answered with LinkedIn when the list
+  // offers it, otherwise a careers option (see pickReferralSourceOption),
+  // otherwise left alone (never a guess at some other source).
   function isReferralSourceQuestion(normalizedQuestionText) {
+    // The free-text follow-up ("If you selected 'Other' for where you
+    // learned about Samsara, please share additional details.") is not the
+    // source question itself — confirmed real: it got "LinkedIn" typed in.
+    if (/\b(if you selected|additional details|please share|please explain)\b/.test(normalizedQuestionText)) return false;
     return (
       normalizedQuestionText.includes("how did you hear") ||
       normalizedQuestionText.includes("where did you hear") ||
       normalizedQuestionText.includes("how did you find out") ||
       normalizedQuestionText.includes("how did you learn about") ||
       normalizedQuestionText.includes("hear about us") ||
-      normalizedQuestionText.includes("referral source")
+      normalizedQuestionText.includes("referral source") ||
+      // Confirmed real (Samsara): "Where have you learned about Samsara?
+      // Select all that apply." went to the AI and stayed empty.
+      normalizedQuestionText.includes("learned about") ||
+      normalizedQuestionText.includes("learn about us") ||
+      normalizedQuestionText.includes("where have you heard") ||
+      normalizedQuestionText.includes("where did you learn")
     );
   }
 
+  // The user's rule (explicit): LinkedIn FIRST; only when the list has no
+  // LinkedIn option, a careers option. Among several LinkedIn options
+  // (Samsara: "LinkedIn Jobs" / "LinkedIn Post" / "LinkedIn InMail ..."),
+  // plain "LinkedIn", then a LinkedIn jobs option, then any LinkedIn one.
+  // Careers: the careers SITE ("Careers", "Career Site", "Samsara Careers
+  // Site", "Company Website") before any other careers-worded option —
+  // never a career fair/event/program (confirmed real, NYU Langone: "Career
+  // Options Program" is not the careers site).
   function pickReferralSourceOption(optionTexts) {
-    const careers = optionTexts.find((t) => {
-      const n = normalize(t);
-      return n.startsWith("career") && !/(fair|event)/.test(n);
-    });
-    if (careers) return careers;
-    const companySite = optionTexts.find((t) => /^(company|corporate) (career |careers )?(web ?site|site|page)$/.test(normalize(t)));
-    if (companySite) return companySite;
-    return optionTexts.find((t) => normalize(t).includes("linkedin")) || null;
+    const n = (t) => normalize(t);
+    const linkedIn = optionTexts.filter((t) => /\blinked ?in\b/.test(n(t)));
+    if (linkedIn.length) {
+      return (
+        linkedIn.find((t) => /^linked ?in$/.test(n(t))) ||
+        linkedIn.find((t) => /\bjobs?\b/.test(n(t))) ||
+        linkedIn[0]
+      );
+    }
+    const notCareerEvent = (t) => !/\b(fair|fairs|event|events|program|programs)\b/.test(n(t));
+    const careersSite =
+      optionTexts.find((t) => /^careers?( (web ?site|site|page|portal|website))?$/.test(n(t))) ||
+      optionTexts.find((t) => /\bcareers? (web ?site|site|page|portal|website)\b/.test(n(t)) && notCareerEvent(t)) ||
+      optionTexts.find((t) => /^(company|corporate) (career |careers )?(web ?site|site|page|website)$/.test(n(t)));
+    if (careersSite) return careersSite;
+    return optionTexts.find((t) => /\bcareers?\b/.test(n(t)) && notCareerEvent(t)) || null;
   }
 
   function isCountryQuestion(normalizedQuestionText) {
@@ -1047,6 +1172,10 @@
   // overwriting anything the user just deliberately cleared. Once attempted,
   // a field is never auto-filled again, full stop.
   const attemptedSignatures = new Set();
+  // The element each fillField() signature was last seen on — lets a
+  // page-re-rendered (replaced, empty) field be told apart from one the
+  // user cleared by hand (same element). See fillField.
+  const attemptedFieldElements = new Map();
 
   // Fields/radio-groups the deterministic matchers didn't recognize, queued
   // for a single batched AI classification call after each fill pass (never
@@ -1085,8 +1214,16 @@
       if (node.querySelectorAll('input[type="file"]').length > 1) break;
       for (const child of node.children) {
         if (child.contains(input)) continue;
+        // Also an element identified as a label by id — confirmed real
+        // (Rippling): <div class="css-1w8xq0"><span id="field-4-label">Résumé
+        // </span></div>, hashed class names, so the class test can't see it;
+        // Résumé and Cover letter uploads then shared one signature and the
+        // cover letter was skipped as "already attempted".
         const isTitleShaped =
-          /^(H[1-6]|LABEL|LEGEND)$/.test(child.tagName) || /(^|[\s_-])(label|title|header|heading)/i.test(child.className || "");
+          /^(H[1-6]|LABEL|LEGEND)$/.test(child.tagName) ||
+          /(^|[\s_-])(label|title|header|heading)/i.test(child.className || "") ||
+          /-label$/i.test(child.id || "") ||
+          Boolean(child.querySelector?.('[id$="-label"]'));
         const text = (child.textContent || "").replace(/\s+/g, " ").trim();
         if (isTitleShaped && text && text.length <= 60) return normalize(text);
       }
@@ -1154,6 +1291,21 @@
   function isTodaysDateLabel(label) {
     const text = normalize(label);
     return /\b(today s date|todays date|today date|current date|date today|date signed|signature date|date of signature)\b/.test(text) || text === "date";
+  }
+
+  // A date split into separate Month/Day/Year spinbutton inputs sharing one
+  // wrapper (Workday's dateInputWrapper), or null for an ordinary field.
+  // Month and Year must both be present; Day is optional (month/year-only).
+  function segmentedDateInputs(field) {
+    if (field.getAttribute("role") !== "spinbutton") return null;
+    const wrapper = field.closest('[data-automation-id="dateInputWrapper"], [role="group"]');
+    if (!wrapper) return null;
+    const byLabel = (name) =>
+      Array.from(wrapper.querySelectorAll('input[role="spinbutton"]')).find(
+        (input) => normalize(input.getAttribute("aria-label") || "") === name,
+      ) || null;
+    const segments = { month: byLabel("month"), day: byLabel("day"), year: byLabel("year") };
+    return segments.month && segments.year ? segments : null;
   }
 
   // Formats the current date the way the field expects: ISO for a native
@@ -1420,6 +1572,24 @@
     // carries no question content to match against.
     const legend = field.closest("fieldset")?.querySelector("legend");
     if (legend?.textContent) return legend.textContent;
+    // Standard ARIA labelling — confirmed real (Rippling, actual HTML): every
+    // field is <... aria-labelledby="field-88-label"> pointing at a sibling
+    // <span id="field-88-label">Gender</span>, with no <label> at all; a
+    // combobox's own aria-label is just its placeholder ("Select..."). Never
+    // read before, so Gender/Race/eligibility dropdowns and placeholder-less
+    // inputs (salary) went unrecognized. A self-reference (the field's own
+    // id, i.e. its current value text) is skipped. Checked after the real-
+    // <label>/legend strategies above so already-working sites keep theirs.
+    const labelledBy = field.getAttribute?.("aria-labelledby");
+    if (labelledBy) {
+      const text = labelledBy
+        .split(/\s+/)
+        .filter((id) => id && id !== field.id)
+        .map((id) => document.getElementById(id)?.textContent?.trim())
+        .filter(Boolean)
+        .join(" ");
+      if (text) return text;
+    }
     // Bootstrap-style wrapper convention (confirmed real: Darwinbox's
     // ".form-group" divs) — a light-DOM sibling <label> for a
     // shadow-hosting custom element that isn't referenced by `for=` at
@@ -1459,6 +1629,18 @@
     // located?" / "ideal start-date".
     const ashbyTitle = field.closest(".ashby-application-form-field-entry")?.querySelector(".ashby-application-form-question-title");
     if (ashbyTitle?.textContent?.trim()) return ashbyTitle.textContent;
+    // Confirmed real (Rippling custom questions, actual HTML): the question
+    // is a <p> in the block just BEFORE the field's <div data-testid="field">,
+    // and the field itself carries no label, aria-labelledby or useful
+    // aria-label ("Select") — "Are you currently eligible to work in the
+    // US?" and "What is your salary expectation?" went unrecognized. Only a
+    // preceding block with no form controls of its own, and short text.
+    const fieldBlock = field.closest('[data-testid="field"]');
+    const header = fieldBlock?.previousElementSibling;
+    if (header && !header.querySelector("input, select, textarea, [role='combobox'], [role='checkbox'], [role='radio']")) {
+      const headerText = (header.textContent || "").replace(/\s+/g, " ").trim();
+      if (headerText && headerText.length <= 300) return headerText;
+    }
     return "";
   }
 
@@ -1536,7 +1718,16 @@
   // A genuine short field label ("Location", "City", "Portfolio URL") is
   // always short; a full question that happens to use one of these words
   // as ordinary grammar isn't, whatever it's actually asking about.
-  const RISKY_SHORT_WORD_PATTERNS = ["location", "city", "portfolio", "website"];
+  const RISKY_SHORT_WORD_PATTERNS = ["location", "city", "portfolio", "website", "address"];
+
+  // A field asking for SOMEONE ELSE's details (referrer, emergency contact,
+  // reference, supervisor) — never gets the candidate's own name/email/phone,
+  // whether classified by rules or by the AI. Confirmed real, serious (NYU
+  // Langone's SilkRoad form: "Referrer's First Name/Last Name/Email").
+  const CANDIDATE_IDENTITY_KEYS = ["firstName", "lastName", "fullName", "middleName", "preferredName", "email", "phone"];
+  function isAboutAnotherPerson(normalizedText) {
+    return /\b(referrer|referrers|referred by|who referred|referring employee|emergency contact|reference name|references?|supervisor|supervisors|spouse|next of kin)\b/.test(normalizedText);
+  }
 
   function classify(field) {
     const haystack = normalize(
@@ -1555,8 +1746,14 @@
     const visibleLabel = normalize(labelForField(field));
     const isShortLabel = haystack.length <= 20 || (visibleLabel.length > 0 && visibleLabel.length <= 20);
     const patternIsSafe = (p) => isShortLabel || !RISKY_SHORT_WORD_PATTERNS.includes(p);
+    // Confirmed real, serious (NYU Langone's SilkRoad form): "Referrer's
+    // First Name / Last Name / Email Address" got the CANDIDATE's own name
+    // and email — claiming they referred themselves. A field about another
+    // person never takes the candidate's identity details.
+    const aboutAnotherPerson = isAboutAnotherPerson(haystack);
 
     for (const matcher of FIELD_MATCHERS) {
+      if (aboutAnotherPerson && CANDIDATE_IDENTITY_KEYS.includes(matcher.key)) continue;
       if (
         // Confirmed real, serious bug: plain .includes() matched addressCity's
         // "city" pattern INSIDE "ethnicity" (e-t-h-n-i-CITY) and silently
@@ -1665,6 +1862,16 @@
     return profile?.experience?.find((exp) => exp.current) || null;
   }
 
+  // No street on file: the address line still gets the location parts that
+  // ARE stored ("Dallas, Texas, United States") instead of staying empty —
+  // the user's explicit choice (a required "Address" box on NYU Langone's
+  // SilkRoad form was blocking the application). Falls back to the free-text
+  // address. No ZIP here: the form has its own Postal Code field for it.
+  function addressWithoutStreet() {
+    const parts = [profile?.addressCity, profile?.addressState, profile?.addressCountry].filter(Boolean);
+    return parts.length ? parts.join(", ") : profile?.address || null;
+  }
+
   function valueForKey(key) {
     if (!profile) return null;
 
@@ -1695,8 +1902,21 @@
         const cityAndCountry = [profile.addressCity, profile.addressCountry].filter(Boolean).join(", ");
         return cityAndCountry || profile.address || currentExperienceEntry()?.location || null;
       }
+      case "middleName":
+        return profile.middleName || null;
       case "addressStreet":
-        return profile.addressStreet || null;
+        return profile.addressStreet || addressWithoutStreet();
+      case "fullAddress": {
+        // When the same form has its own City/ZIP fields, this box is just
+        // line 1 — the street alone, or the parts would be entered twice.
+        const hasSeparateParts = deepQueryAll(document, "input, select").some((f) =>
+          /\b(city|zip|zipcode|postal|postcode)\b/.test(normalize(labelForField(f) || f.getAttribute("aria-label") || f.name || f.id || "")),
+        );
+        if (hasSeparateParts) return profile.addressStreet || addressWithoutStreet();
+        const stateZip = [profile.addressState, profile.addressPostalCode].filter(Boolean).join(" ");
+        const full = [profile.addressStreet, profile.addressCity, stateZip, profile.addressCountry].filter(Boolean).join(", ");
+        return full || profile.address || null;
+      }
       case "addressCity":
         return profile.addressCity || null;
       case "addressState":
@@ -2419,12 +2639,39 @@
       const blob = await (await fetch(result.dataUrl)).blob();
       const baseName = (resumeFileName || "resume").replace(/\.(docx?|pdf)$/i, "");
       const file = new File([blob], `${baseName}_Cover_Letter.pdf`, { type: "application/pdf" });
-      const dataTransfer = new DataTransfer();
-      dataTransfer.items.add(file);
-      input.files = dataTransfer.files;
-      // Checked before dispatch, for the same reason as attachResumeFile.
-      const assigned = input.files.length > 0;
-      input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      const attachTo = (target) => {
+        const dataTransfer = new DataTransfer();
+        dataTransfer.items.add(file);
+        target.files = dataTransfer.files;
+        // Checked before dispatch, for the same reason as attachResumeFile.
+        const ok = target.files.length > 0;
+        target.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+        return ok;
+      };
+      const assigned = attachTo(input);
+      // Confirmed real (Rippling): the attach succeeded, then the site's own
+      // résumé parse finished seconds later and re-populated the whole form
+      // from the parsed résumé, wiping the cover letter. Re-check once after
+      // a delay: if the upload (or the fresh element that replaced it) is
+      // empty and its block doesn't show our file name, attach again.
+      if (assigned) {
+        const signature = fieldSignature(input);
+        // Twice: a slow parse can land after the first check.
+        for (const delay of [6000, 15000]) {
+          setTimeout(() => {
+            const live = input.isConnected
+              ? input
+              : deepQueryAll(document, 'input[type="file"]').find((f) => fieldSignature(f) === signature);
+            if (!live) return;
+            const block = live.closest('[data-testid="field"], fieldset, .form-field') || live.parentElement?.parentElement?.parentElement;
+            const shown = (block?.textContent || "").includes(file.name);
+            if (!shown && (live !== input || live.files.length === 0)) {
+              console.log(`[AskJobs] cover letter was cleared after attaching (site re-render) — re-attaching (${delay / 1000}s check)`);
+              attachTo(live);
+            }
+          }, delay);
+        }
+      }
       return assigned
         ? { attached: true }
         : { attached: false, reason: "The site refused the file — attach manually" };
@@ -2780,6 +3027,14 @@
       ""
     ).trim();
     if (label.length < 10 || label.length > MAX_QUESTION_LABEL_LENGTH) return;
+    // Someone else's details (referrer, emergency contact...) — never sent to
+    // the AI passes, which answered "Referrer's First Name" with the
+    // candidate's own name (confirmed real: NYU Langone).
+    if (isAboutAnotherPerson(normalize(label))) {
+      queuedFieldSignatures.add(signature);
+      recordResult("skipped", label, "Asks for someone else's details (referrer/contact) — left for you");
+      return;
+    }
     // Confirmed real (CATS One): a masked "Date Available" field got queued
     // here like any other unrecognized field and came back from the AI
     // pass with "Immediately" — a reasonable phrase, not a valid value for
@@ -2940,7 +3195,21 @@
     // Already attempted this logical field once (regardless of whether the
     // current DOM node is the same object) — never touch it again. This is
     // what lets a manual clear stick instead of silently being refilled.
-    if (attemptedSignatures.has(signature)) return;
+    // One exception: the page threw the element away and rendered a fresh,
+    // EMPTY one with the same signature — confirmed real, recurring (Analog
+    // Devices' / Carrier's Workday): the address section was filled in the
+    // draft's country layout, then rebuilt for the corrected country, and
+    // the new Address Line 1/City/Postal Code (same ids) were skipped as
+    // "already attempted" though the sidebar said filled. A manual clear
+    // keeps the SAME element, so it still sticks.
+    if (attemptedSignatures.has(signature)) {
+      const previous = attemptedFieldElements.get(signature);
+      const rerenderedEmpty = previous && previous !== field && !previous.isConnected && !field.value;
+      if (!rerenderedEmpty) return;
+      attemptedSignatures.delete(signature);
+      console.log("[AskJobs] field was re-rendered empty by the page — filling again:", fieldLabel);
+    }
+    attemptedFieldElements.set(signature, field);
 
     // Confirmed real (BambooHR's Fabric UI widget — Gender/Ethnicity/
     // Disability/State/Country selects all use this shape): the actual
@@ -3128,6 +3397,23 @@
       // list to choose from, so LinkedIn is the fixed answer.
       if (field.tagName !== "SELECT" && isReferralSourceQuestion(normalize(fieldLabel))) {
         attemptedSignatures.add(signature);
+        // Confirmed real (Carrier's Workday): "How Did You Hear About Us?" is
+        // a prompt search box, not free text — typing "LinkedIn" only ran a
+        // search and nothing was ever selected. Search, then pick the result.
+        if (isMultiselectSearchBox(field)) {
+          // Same order as pickReferralSourceOption: LinkedIn, then careers —
+          // one search at a time, stopping at the first that selects
+          // something (this is a multi-select; never pick both).
+          let pickedTerm = null;
+          for (const term of ["LinkedIn", "Careers", "Career"]) {
+            if (await fillMultiselectSearch(field, [term], fieldLabel)) {
+              pickedTerm = term;
+              break;
+            }
+          }
+          recordResult(pickedTerm ? "filled" : "skipped", fieldLabel, pickedTerm ? `${pickedTerm} (from the list)` : "No LinkedIn or careers option found — please choose directly");
+          return;
+        }
         const filled = setNativeValue(field, "LinkedIn");
         recordResult(filled ? "filled" : "skipped", fieldLabel, filled ? "LinkedIn" : `Couldn't confirm "LinkedIn" was actually accepted — please check and fill directly`);
         return;
@@ -3167,11 +3453,66 @@
           return;
         }
       }
+      // Same gap for education — confirmed real (NYU Langone's SilkRoad
+      // "Additional Information"): loose "School" / "Degree" <select>s with
+      // no Education section around them, so EDUCATION_FIELD_MATCHERS (used
+      // only by the structured scanner) never saw them and they stayed on
+      // "Choose One". Short labels only, so "Did you graduate high school?"
+      // style questions keep going to the screening/AI paths. Selects and
+      // text boxes both go through fillStructuredField (degree synonyms).
+      const isPlainNameLabel = !fieldLabel.includes("?") && normalize(fieldLabel).split(" ").filter(Boolean).length <= 4;
+      if (isPlainNameLabel && !isInsideEducationOrExperienceSection(field)) {
+        const rawEducationKey = classifyStructured(field, EDUCATION_FIELD_MATCHERS);
+        const educationKey = ["institution", "degree"].includes(rawEducationKey) ? rawEducationKey : null;
+        if (educationKey) {
+          const stored = profile?.education?.[0]?.[educationKey];
+          console.log("[AskJobs] generic field recognized as education field", educationKey, "stored value:", stored, "->", fieldLabel);
+          if (stored) {
+            attemptedSignatures.add(signature);
+            const filled = await fillStructuredField(field, stored, fieldLabel, educationKey, profile?.education?.[0]?.field);
+            if (filled) {
+              recordResult("filled", fieldLabel, stored);
+              return;
+            }
+            console.log("[AskJobs] education field: no matching option for", stored, "— handing to AI:", fieldLabel);
+          }
+          await maybeQueueFieldForClassification(field, signature);
+          return;
+        }
+      }
       // Confirmed real (Mattel/SmartRecruiters signature block): "Today's
       // Date:" went to the AI, which correctly said the resume can't answer
       // it — it's just the current date, known locally.
       if (field.tagName === "INPUT" && isTodaysDateLabel(fieldLabel)) {
         attemptedSignatures.add(signature);
+        // Confirmed real (Snap's Workday, actual HTML): the date is three
+        // separate role="spinbutton" inputs (aria-label Month/Day/Year) in
+        // a dateInputWrapper. The whole "10/10/2026" string went into the
+        // Month box alone, and Workday showed "10/10/1900" — Year never
+        // set. Each segment gets its own part, typed (these ignore a bulk
+        // value set — see fillStructuredField's spinbutton branch).
+        const segments = segmentedDateInputs(field);
+        if (segments) {
+          const now = new Date();
+          const mm = String(now.getMonth() + 1).padStart(2, "0");
+          const dd = String(now.getDate()).padStart(2, "0");
+          const yyyy = String(now.getFullYear());
+          const parts = [
+            [segments.month, mm],
+            [segments.day, dd],
+            [segments.year, yyyy],
+          ].filter(([input]) => input);
+          for (const [input, value] of parts) {
+            attemptedSignatures.add(fieldSignature(input));
+            typeCharacterByCharacter(input, value);
+            await new Promise((resolve) => setTimeout(resolve, 80));
+          }
+          const yearNow = segments.year.getAttribute("aria-valuenow") || segments.year.value;
+          const shown = segments.day ? `${mm}/${dd}/${yyyy}` : `${mm}/${yyyy}`;
+          const ok = String(yearNow) === yyyy;
+          recordResult(ok ? "filled" : "skipped", fieldLabel, ok ? shown : `Couldn't confirm today's date (${shown}) was accepted — please check and fill directly`);
+          return;
+        }
         const today = formatTodayForField(field);
         const filled = setNativeValue(field, today);
         recordResult(filled ? "filled" : "skipped", fieldLabel, filled ? today : `Couldn't confirm "${today}" was actually accepted — please check and fill directly`);
@@ -3225,6 +3566,14 @@
       // paths — even after clicking "AI-fill remaining questions", it stayed
       // blank forever, unlike an unrecognized field (e.g. "Current Company"),
       // which the AI could still infer correctly from resume context.
+      // No middle name on file means leave it empty — most candidates have
+      // none, and the AI pass answered "reddy" (the surname) from the
+      // resume (confirmed real: Analog Devices' Workday).
+      if (key === "middleName") {
+        attemptedSignatures.add(signature);
+        recordResult("skipped", fieldLabel, "No middle name on file — left empty");
+        return;
+      }
       console.log("[AskJobs] generic field recognized as", key, "but no data for it, queueing for AI fallback:", fieldLabel);
       await maybeQueueFieldForClassification(field, signature);
       return;
@@ -3415,6 +3764,7 @@
 
   function resetFillState() {
     attemptedSignatures.clear();
+    attemptedFieldElements.clear();
     queuedFieldSignatures.clear();
     queuedRadioGroupNames.clear();
     attemptedRadioGroups.clear();
@@ -3481,6 +3831,29 @@
   // mid-fill still gets picked up once the current pass actually finishes,
   // without ever running two passes at the same time.
   let rerunQueued = false;
+
+  // Confirmed real, recurring (Carrier's Workday): the saved draft had
+  // Country = India; correcting it to the profile's United States makes
+  // Workday REBUILD the whole address section for the new country — fresh,
+  // empty Address Line 1 / City / State / Postal Code — after this pass had
+  // already handled (and marked attempted) the old ones, so they stayed
+  // empty. Once the rebuild settles, forget those address fields and run
+  // another pass; scanAndFill queues it if one is still running.
+  const ADDRESS_REFILL_KEYS = ["addressStreet", "fullAddress", "addressCity", "addressState", "addressPostalCode"];
+  let addressRefillScheduled = false;
+  function scheduleAddressRefillAfterCountryChange() {
+    if (addressRefillScheduled) return;
+    addressRefillScheduled = true;
+    setTimeout(() => {
+      addressRefillScheduled = false;
+      let cleared = 0;
+      for (const el of deepQueryAll(document, "input, select, textarea, button, [role='combobox']")) {
+        if (ADDRESS_REFILL_KEYS.includes(classify(el)) && attemptedSignatures.delete(fieldSignature(el))) cleared++;
+      }
+      console.log("[AskJobs] address section rebuilt after the country change — refilling", cleared, "address field(s)");
+      scanAndFill(document);
+    }, 1500);
+  }
 
   async function scanAndFill(root) {
     if (fillInProgress) {
@@ -3565,9 +3938,21 @@
     }
 
     const optionTexts = items.map((r) => normalize(labelForField(r) || r.value || ""));
+    // Text with a space between every text node — confirmed real (Rippling,
+    // Lever): option labels rendered in adjacent elements have no whitespace
+    // between them, so textContent read "LinkedInIndeedGlassdoor..." as one
+    // word, none of the whole-word option strips below could remove them,
+    // and that run-together string (>= 10 chars) was returned as the
+    // "question" instead of climbing on to the real one.
+    function spacedText(container) {
+      const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+      const parts = [];
+      for (let n = walker.nextNode(); n; n = walker.nextNode()) parts.push(n.textContent);
+      return parts.join(" ");
+    }
     function strippedText(container) {
       if (!container) return "";
-      let text = normalize(container.textContent || "");
+      let text = normalize(spacedText(container));
       // Whole words only — a raw substring replace turned "will you now or
       // in the future require sponsorship" into "will you w or ..." by
       // stripping the "no" option out of "now" (confirmed on Mattel).
@@ -3616,6 +4001,12 @@
   // "worked here before," derived per-application from resume history —
   // never stored, genuinely computed each time against the current job.
   function radioAnswerForKey(key, questionText = "") {
+    // Enrolled now only if an education entry ends in the future; with no
+    // future end date on file (graduated, or no dates), No.
+    if (key === "currentlyEnrolled") {
+      const now = Date.now();
+      return (profile?.education || []).some((e) => e.endDate && new Date(e.endDate).getTime() > now);
+    }
     if (key === "workedHereBefore") {
       // The question naming the employer itself beats the picked job's
       // company — confirmed real (Boston University's SilkRoad form, "Have
@@ -3697,7 +4088,11 @@
 
     if (key === "visaSponsorshipNeeded" || key === "willingToRelocate") {
       const v = prefs[key];
-      return typeof v === "boolean" ? v : null;
+      if (typeof v === "boolean") return v;
+      // The user's explicit default: with no sponsorship answer saved on the
+      // candidate's EEO profile, "needs sponsorship?" is answered Yes.
+      if (key === "visaSponsorshipNeeded") return true;
+      return null;
     }
     return null;
   }
@@ -3724,6 +4119,20 @@
   // had nothing to fall back to and just gave up. Never invents an option
   // that wasn't actually offered — aiPickBestOption is scoped to exactly the
   // option texts passed in.
+  // Exact option first, then whole-word, then the old loose containment —
+  // a stored "No" must pick "No", never "Choose not to disclose" just
+  // because that option happens to be listed first (confirmed real shape:
+  // Rippling's Yes / No / Choose not to disclose).
+  function quickOptionMatch(optionTexts, normStored) {
+    if (!normStored) return null;
+    return (
+      optionTexts.find((t) => normalize(t) === normStored) ||
+      optionTexts.find((t) => containsWholeWords(normalize(t), normStored)) ||
+      optionTexts.find((t) => normalize(t).includes(normStored) || normStored.includes(normalize(t))) ||
+      null
+    );
+  }
+
   async function resolveOptionMatch(fieldLabel, storedValue, optionTexts, quickMatch) {
     if (quickMatch) return quickMatch;
     if (!storedValue || optionTexts.length === 0) return null;
@@ -3794,7 +4203,7 @@
       const optionTexts = Array.from(field.options).map((o) => o.textContent.trim()).filter(Boolean);
       const normStored = stored ? normalize(stored) : "";
       const quickMatch = stored
-        ? optionTexts.find((t) => normalize(t).includes(normStored) || normStored.includes(normalize(t)))
+        ? quickOptionMatch(optionTexts, normStored)
         : null;
       const matchedOption = await resolveOptionMatch(fieldLabel, stored, optionTexts, quickMatch);
       if (matchedOption) {
@@ -3924,6 +4333,15 @@
     // (confirmed on SmartRecruiters: aria-checked flips to "true").
     if (isAriaRadio(radio)) {
       if (radio.getAttribute("aria-checked") !== "true") radio.click();
+      return;
+    }
+    // A real input wrapped in its own ARIA checkbox/radio control (confirmed
+    // real: Rippling's <div role="checkbox" aria-checked="false"> around a
+    // hidden <input type="checkbox">) — the wrapper is what the page listens
+    // to, so a direct checked-set on the hidden input never reaches it.
+    const ariaWrapper = radio.parentElement?.closest('[role="checkbox"], [role="radio"]');
+    if (ariaWrapper) {
+      if (ariaWrapper.getAttribute("aria-checked") !== "true") ariaWrapper.click();
       return;
     }
     const proto = Object.getPrototypeOf(radio);
@@ -4371,7 +4789,61 @@
     return ["education", "experience", "certifications", "websites", "languages"].some((key) => findSectionContainer(key)?.contains?.(field));
   }
 
-  async function fillStructuredField(field, value, fieldLabel, key) {
+  // Best <option> for a stored education/experience value. Confirmed real,
+  // serious (NYU Langone's SilkRoad): "Master of Science" picked the first
+  // option CONTAINING it — "Master of Science, Nursing" — out of a dozen
+  // specialties, and a school name fell through to loose word overlap and
+  // picked "Tacoma Community College" (shared word: "college").
+  // Exact > containment either way (a stored "Trinity College Dublin"
+  // finds a "Trinity College" option) > for degrees, the specialty matching
+  // the field of study (prefix-tolerant: these lists truncate, "...in
+  // Informati") > the most generic option ("Master Of Science - M S") —
+  // never another field's specialty. Schools never use word overlap.
+  function bestStructuredSelectOption(options, value, key, fieldOfStudy) {
+    const text = (o) => normalize(o.textContent);
+    const target = normalize(value);
+    const real = options.filter((o) => text(o) && !PLACEHOLDER_OPTION_TEXT.test(text(o)));
+    const exact = real.find((o) => text(o) === target);
+    if (exact) return exact;
+
+    const longerThanTarget = real.filter((o) => text(o).includes(target));
+    if (longerThanTarget.length) {
+      if (longerThanTarget.length === 1) return longerThanTarget[0];
+      const targetWords = new Set(target.split(" "));
+      const hintWords = normalize(fieldOfStudy || "")
+        .split(" ")
+        .filter((w) => w.length >= 4 && !targetWords.has(w));
+      const extraWords = (o) => text(o).split(" ").filter((w) => !targetWords.has(w));
+      // Whole-word hits count double over truncated-prefix hits ("Electrical"
+      // beats "...in Engineeri" for "Electrical Engineering").
+      const hintScore = (o) =>
+        extraWords(o).reduce(
+          (sum, w) => sum + (hintWords.includes(w) ? 2 : hintWords.some((h) => (w.length >= 5 && h.startsWith(w)) || (h.length >= 5 && w.startsWith(h))) ? 1 : 0),
+          0,
+        );
+      const hinted = hintWords.length ? [...longerThanTarget].sort((a, b) => hintScore(b) - hintScore(a))[0] : null;
+      if (hinted && hintScore(hinted) > 0) return hinted;
+      // Generic: extra words are only degree abbreviations ("m s", "ms",
+      // "msc", "degree") — then the fewest extra words.
+      const GENERIC = new Set(["m", "s", "ms", "msc", "ma", "mba", "b", "bs", "bsc", "ba", "degree", "general", "of", "in"]);
+      const generic = longerThanTarget.find((o) => extraWords(o).every((w) => GENERIC.has(w)));
+      if (generic) return generic;
+      if (key === "degree") return null; // only specialties left — don't pick someone else's
+      return [...longerThanTarget].sort((a, b) => extraWords(a).length - extraWords(b).length)[0];
+    }
+
+    const shorterThanTarget = real.filter((o) => text(o).length >= 4 && containsWholeWords(target, text(o)));
+    if (shorterThanTarget.length) return [...shorterThanTarget].sort((a, b) => text(b).length - text(a).length)[0];
+
+    if (key === "institution") return null;
+    return (
+      real.find((o) => degreeSynonymsMatch(o.textContent, value)) ||
+      real.find((o) => comboboxTextsMatch(o.textContent, target)) ||
+      null
+    );
+  }
+
+  async function fillStructuredField(field, value, fieldLabel, key, fieldOfStudy) {
     const stringValue = String(value);
     // Confirmed real (Johns Hopkins APL's iCIMS form): a Start/End date's
     // own Month/Day/Year sub-controls each inherit the shared "Start
@@ -4429,12 +4901,7 @@
       // native <select> deserves the same fallback instead of only ever
       // working when the value happens to already be the option's exact
       // wording.
-      const targetNormalized = normalize(stringValue);
-      const options = Array.from(field.options);
-      const option =
-        options.find((o) => normalize(o.textContent).includes(targetNormalized)) ||
-        options.find((o) => degreeSynonymsMatch(o.textContent, stringValue)) ||
-        options.find((o) => comboboxTextsMatch(o.textContent, targetNormalized));
+      const option = bestStructuredSelectOption(Array.from(field.options), stringValue, key, fieldOfStudy);
       if (!option) return false;
       field.value = option.value;
       field.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
@@ -5016,6 +5483,15 @@
       matchable.find((o) => comboboxTextsMatch(optionText(o), target)) ||
       matchable.find((o) => degreeSynonymsMatch(optionText(o), target));
     if (heuristicMatch) return heuristicMatch;
+    // A "Yes" answer to a single-option confirmation dropdown (Samsara:
+    // "Processing of Personal Data" -> only "Acknowledge/Confirm").
+    if (
+      target === "yes" &&
+      matchable.length === 1 &&
+      /\b(acknowledge|acknowledged|confirm|confirmed|agree|agreed|consent|accept|accepted|understand|i have read)\b/.test(normalize(optionText(matchable[0])))
+    ) {
+      return matchable[0];
+    }
 
     const optionTexts = matchable.map((o) => optionText(o));
     console.log("[AskJobs] dropdown: no heuristic match among", options.length, "option(s) for", desiredText, "— asking AI with:", optionTexts);
@@ -5200,7 +5676,13 @@
     // return zero results server-side even when a real, correct option
     // exists under a differently-worded search term. desiredText always
     // stays the real match target either way.
-    const textToType = searchTermOverride || desiredText;
+    // Never for a bare Yes/No target — confirmed real (Samsara's "Processing
+    // of Personal Data", whose only option is "Acknowledge/Confirm"): typing
+    // "Yes" filtered that option out, leaving nothing to match. Yes/No
+    // lists are short; matching against the full list (heuristics + AI)
+    // also covers "No, I don't have a disability"-style wordings.
+    const isBareYesNo = /^(yes|no)$/.test(normalize(desiredText)) && !searchTermOverride;
+    const textToType = isBareYesNo ? "" : searchTermOverride || desiredText;
     if (button.tagName === "INPUT" && textToType) {
       typeStringInto(button, textToType);
     }
@@ -5251,7 +5733,27 @@
     // highlighted option on this widget. Only for the INPUT-as-trigger
     // shape (react-select's own pattern here); harmless no-op on an
     // already-closed dropdown for anything else.
-    if (button.tagName === "INPUT") dispatchEnterKey(button);
+    // Confirmed real, serious (Samsara/Greenhouse react-select): the click
+    // didn't commit, and Enter then selected react-select's HIGHLIGHTED
+    // option — the first filtered match ("Cis-man" while searching "man")
+    // — not the "Man" just picked. Move the highlight onto our option first
+    // (react-select reports it via aria-activedescendant = option id); if
+    // it can't be moved there, skip Enter rather than commit a wrong answer.
+    if (button.tagName === "INPUT") {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      const stillOpen = button.getAttribute("aria-expanded") === "true";
+      const tracksHighlight = button.hasAttribute("aria-activedescendant");
+      let onOurOption = !stillOpen || !tracksHighlight || !match.id;
+      if (stillOpen && tracksHighlight && match.id) {
+        for (let i = 0; i < 80 && button.getAttribute("aria-activedescendant") !== match.id; i++) {
+          button.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", code: "ArrowDown", keyCode: 40, which: 40, bubbles: true, cancelable: true }));
+          await new Promise((resolve) => setTimeout(resolve, 15));
+        }
+        onOurOption = button.getAttribute("aria-activedescendant") === match.id;
+        if (!onOurOption) console.warn("[AskJobs] couldn't move the highlight onto", optionText(match), "— not pressing Enter:", fieldLabel);
+      }
+      if (onOurOption) dispatchEnterKey(button);
+    }
     await new Promise((resolve) => setTimeout(resolve, 150));
     // Confirmed real, serious (KKR/Greenhouse): this used to return true
     // unconditionally right here — "a matching option was found and
@@ -5394,6 +5896,16 @@
       if (!alreadyOpen) dispatchEnterKey(searchInput);
 
       let match = await waitForBestMatchingOption(null, text, fieldLabel, existingOptions);
+      // Workday's school/field-of-study search is a SERVER lookup — results
+      // can land after the first wait (confirmed real, Analog Devices: the
+      // user saw "Trine University" appear only once it had loaded). Give it
+      // one more, longer look before giving up — and above all before
+      // settling for "Other" while the real school is still loading.
+      if (!match) {
+        console.log("[AskJobs] multiselect: no results yet for", text, "— waiting longer for the search to load");
+        await new Promise((resolve) => setTimeout(resolve, 2500));
+        match = await waitForBestMatchingOption(null, text, fieldLabel, existingOptions);
+      }
 
       if (!match && fallbackToOther) {
         match = await trySelectOtherOption(searchInput, existingOptions);
@@ -5650,7 +6162,7 @@
       // generic top-level scan's differently-scoped (and often wrong)
       // matcher for the same-sounding label.
       attemptedSignatures.add(signature);
-      if (await fillStructuredField(field, value, fieldLabel, key)) {
+      if (await fillStructuredField(field, value, fieldLabel, key, entryData?.field)) {
         recordResult("filled", fieldLabel, String(value));
         console.log("[AskJobs] structured field filled:", key, "=", value, "->", fieldLabel);
       } else {
@@ -6117,7 +6629,7 @@
         const optionTexts = stored ? groupRadios.map((r) => (labelForField(r) || r.value || "").trim()).filter(Boolean) : [];
         const normStored = stored ? normalize(stored) : "";
         const quickMatch = stored
-          ? optionTexts.find((t) => normalize(t).includes(normStored) || normStored.includes(normalize(t)))
+          ? quickOptionMatch(optionTexts, normStored)
           : null;
         const matchedOption = await resolveOptionMatch(label, stored, optionTexts, quickMatch);
         if (matchedOption) {
@@ -6136,6 +6648,24 @@
           }
         } else {
           recordResult("skipped", label, "Voluntary demographic question — left for you to answer directly");
+        }
+        continue;
+      }
+
+      // "How did you hear about Cintal?" as radios (confirmed real,
+      // Rippling) — the same Careers/LinkedIn rule the select, combobox and
+      // text paths already apply; without it this went to the AI, which
+      // can't answer it from a resume.
+      if (isReferralSourceQuestion(questionText)) {
+        const optionTexts = groupRadios.map((r) => (labelForField(r) || r.value || "").trim()).filter(Boolean);
+        const choice = pickReferralSourceOption(optionTexts);
+        const target = choice ? groupRadios.find((r) => (labelForField(r) || r.value || "").trim() === choice) : null;
+        attemptedRadioGroups.add(name);
+        if (target) {
+          setNativeChecked(target);
+          recordResult("filled", rawQuestionText, choice);
+        } else {
+          recordResult("skipped", rawQuestionText, "No Careers or LinkedIn option offered — please choose directly");
         }
         continue;
       }
@@ -6255,6 +6785,7 @@
             ? `${profileCountry} — corrected from "${currentText}" to match the profile`
             : `Shows "${currentText}" but the profile says ${profileCountry} — please correct it`,
         );
+        if (corrected) scheduleAddressRefillAfterCountryChange();
         continue;
       }
 
@@ -6271,7 +6802,16 @@
           // time, same as the AI-answered combobox path does, and let it
           // match against whatever actually appears when opened.
           renderStoredValueSuggestion(fieldLabel, stored, async () => {
-            const result = await fillCustomComboboxBestEffort(button, stored, fieldLabel);
+            // Confirmed real (Samsara/Greenhouse): options read "Man" /
+            // "Cis-man", never "Male" — try the stored value, then its
+            // synonyms (GENDER_SYNONYM_GROUPS), in that order.
+            const group = GENDER_SYNONYM_GROUPS.find((g) => g.synonyms.includes(normalize(stored)));
+            const targets = [stored, ...(group ? group.synonyms.filter((s) => s !== normalize(stored)) : [])];
+            let result = { filled: false };
+            for (const target of targets) {
+              result = await fillCustomComboboxBestEffort(button, target, fieldLabel);
+              if (result.filled) break;
+            }
             recordResult(result.filled ? "filled" : "skipped", fieldLabel, result.filled ? `${result.value} (from your profile, reviewed)` : "Couldn't find a matching option");
           });
           recordResult("skipped", fieldLabel, "Suggested from your profile — review above and click Insert");
@@ -6380,6 +6920,25 @@
         continue;
       }
 
+      // Address State/City rendered as a custom dropdown — confirmed real
+      // (Analog Devices' Workday: "State* Select One"): no branch here
+      // handled it, and "State" is too short a label to send to the AI, so
+      // it stayed unselected ("The field State is required"). Same stored
+      // values the plain-input path uses (valueForKey), filled directly.
+      const addressPartKey = classify(button);
+      if (addressPartKey === "addressState" || addressPartKey === "addressCity") {
+        attemptedSignatures.add(signature);
+        const stored = valueForKey(addressPartKey);
+        console.log("[AskJobs] generic combobox recognized as", addressPartKey, "stored value:", stored, "->", fieldLabel);
+        if (!stored) {
+          recordResult("skipped", fieldLabel, `No ${addressPartKey === "addressState" ? "state" : "city"} saved on the profile — please choose directly`);
+          continue;
+        }
+        const result = await fillCustomComboboxBestEffort(button, stored, fieldLabel);
+        recordResult(result.filled ? "filled" : "skipped", fieldLabel, result.filled ? result.value : `Couldn't find "${stored}" in the list — please choose directly`);
+        continue;
+      }
+
       if (isCountryQuestion(questionText)) {
         attemptedSignatures.add(signature);
         // Confirmed real bug: this read profile?.address?.country, but
@@ -6433,6 +6992,21 @@
             );
           };
           if (isRaceOrEthnicityQuestion(questionText)) {
+            // Confirmed real (Samsara): a stored "Asian" auto-picked "East
+            // Asian (inclusive of Chinese, Japanese, Korean...)" — the first
+            // of several options containing the word — for a candidate the
+            // stored value can't place. With no exact option and 2+ whole-
+            // word candidates, never guess a sub-group; leave it, naming them.
+            const options = await gatherComboboxOptions(button);
+            const normStored = normalize(stored);
+            const exact = options.some((o) => normalize(o) === normStored);
+            const candidates = options.filter((o) => containsWholeWords(normalize(o), normStored));
+            if (!exact && candidates.length >= 2) {
+              const names = candidates.map((o) => o.split("(")[0].trim()).join(", ");
+              console.log("[AskJobs] race combobox: several options match", stored, "— not guessing:", candidates);
+              recordResult("skipped", fieldLabel, `Several options match "${stored}" (${names}) — please choose the right one`);
+              continue;
+            }
             await insertValue();
           } else {
             renderStoredValueSuggestion(fieldLabel, stored, insertValue);
@@ -6521,7 +7095,13 @@
     // Lever's checkbox questions ("I identify my ethnicity as") have no
     // fieldset at all — the card itself is the group.
     if (leverQuestionText(box)) return box.closest(".application-question");
-    return box.closest("fieldset");
+    // Rippling's Yes/No checkbox questions: no fieldset, just a
+    // <div role="group"> around <div role="checkbox"> options.
+    const fieldsetEl = box.closest("fieldset");
+    if (fieldsetEl) return fieldsetEl;
+    const group = box.closest('[role="group"]');
+    const count = group ? group.querySelectorAll('input[type="checkbox"]').length : 0;
+    return count >= 2 && count <= 12 ? group : null;
   }
 
   // Standalone multi-option questions rendered as a GROUP of checkboxes
@@ -6550,7 +7130,7 @@
       if (groupBoxes.length < 2) continue;
 
       const legend = fieldsetEl.querySelector("legend");
-      const rawQuestionText = (legend?.textContent || "").trim() || leverQuestionText(groupBoxes[0]);
+      const rawQuestionText = (legend?.textContent || "").trim() || leverQuestionText(groupBoxes[0]) || groupQuestionText(groupBoxes);
       // Stable per-question key: the legend's own id if it (or a child) has
       // one (Workday: "checkbox-group-label7"), falling back to the first
       // checkbox's id — DOM elements themselves aren't reused as Set keys
@@ -7685,6 +8265,12 @@
         unresolved.push(item);
         return;
       }
+      // The AI pass can label "Referrer's First Name" as firstName just like
+      // the rules could — same guard (confirmed real: NYU Langone).
+      if (CANDIDATE_IDENTITY_KEYS.includes(key) && isAboutAnotherPerson(normalize(item.questionText || ""))) {
+        recordResult("skipped", item.questionText, "Asks for someone else's details (referrer/contact) — left for you");
+        return;
+      }
 
       if (item.kind === "field" && item.field.tagName === "SELECT" && radioAnswerForKey(key, item.questionText) !== null) {
         // A native <select> classified into a Yes/No screening category —
@@ -7717,6 +8303,20 @@
           } else if (item.field.tagName === "TEXTAREA") {
             typeCharacterByCharacter(item.field, finalValue);
             recordResult("filled", item.questionText, `${finalValue} (AI-classified, reviewed)`);
+          } else if (isMultiselectSearchBox(item.field)) {
+            // Confirmed real (Analog Devices' Workday Education): "School or
+            // University" / "Field of Study" are search-and-pick boxes —
+            // setting the text only ran a search ("No Items.") and selected
+            // nothing, while the sidebar said filled. Search, then pick; for
+            // a school not in Workday's list, its own instructions say pick
+            // "Other".
+            const isSchool = /\b(school|university|college|institution)\b/.test(normalize(item.questionText));
+            const picked = await fillMultiselectSearch(item.field, [finalValue], item.questionText, { fallbackToOther: isSchool });
+            recordResult(
+              picked ? "filled" : "skipped",
+              item.questionText,
+              picked ? `${finalValue} (AI-answered, picked from the list)` : `"${finalValue}" isn't in the list — please choose directly`,
+            );
           } else {
             // Confirmed real, serious (Mattel/SmartRecruiters): this used to
             // report "filled" unconditionally regardless of whether the
@@ -8091,6 +8691,20 @@
             } else {
               recordResult("skipped", item.questionText, "The page didn't keep the answer — please type or paste it in directly");
             }
+          } else if (isMultiselectSearchBox(item.field)) {
+            // Confirmed real (Analog Devices' Workday Education): "School or
+            // University" / "Field of Study" are search-and-pick boxes —
+            // setting the text only ran a search ("No Items.") and selected
+            // nothing, while the sidebar said filled. Search, then pick; for
+            // a school not in Workday's list, its own instructions say pick
+            // "Other".
+            const isSchool = /\b(school|university|college|institution)\b/.test(normalize(item.questionText));
+            const picked = await fillMultiselectSearch(item.field, [finalValue], item.questionText, { fallbackToOther: isSchool });
+            recordResult(
+              picked ? "filled" : "skipped",
+              item.questionText,
+              picked ? `${finalValue} (AI-answered, picked from the list)` : `"${finalValue}" isn't in the list — please choose directly`,
+            );
           } else {
             // Confirmed real, serious (Mattel/SmartRecruiters): this used to
             // report "filled" unconditionally regardless of whether the

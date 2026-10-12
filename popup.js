@@ -295,7 +295,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       return;
     }
 
-    statusEl.textContent = "Connected to AskJobs";
+    statusEl.textContent = `Connected to ${(chrome.runtime.getManifest().short_name || "AskJobs").replace(/ Autofill$/, "")}`;
     statusEl.className = "status connected";
     wireFillButton();
   });

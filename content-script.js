@@ -12,6 +12,13 @@
   if (window.__askjobsAutofillInjected) return;
   window.__askjobsAutofillInjected = true;
 
+  // Brand shown in the on-page panel — read from THIS extension's own
+  // manifest short_name ("DsAutoapply Autofill" / "AskJobs Autofill"), so
+  // the same content script serves both builds. Bubble initials come from
+  // the first word's capitals ("DsAutoapply" -> "DA", "AskJobs" -> "AJ").
+  const BRAND_NAME = chrome.runtime.getManifest?.().short_name || "AskJobs Autofill";
+  const BRAND_INITIALS = (BRAND_NAME.split(" ")[0].match(/[A-Z]/g) || ["A", "J"]).slice(0, 2).join("");
+
   // Confirmed real (Ashby's RevenueCat application): a GDPR consent
   // checkbox's real label ("I acknowledge the GDPR Candidate Privacy
   // Notice") sits in the same container as the entire multi-thousand-word
@@ -7679,7 +7686,7 @@
       </style>
       <div class="panel" id="askjobs-panel">
         <div class="title">
-          <span class="dot"></span> AskJobs Autofill
+          <span class="dot"></span> ${BRAND_NAME}
           <button id="askjobs-minimize-btn" title="Minimize">–</button>
         </div>
         <div id="askjobs-counter" title="Click to show/hide details">Ready</div>
@@ -7695,7 +7702,7 @@
           and attach it manually.
         </div>
       </div>
-      <div id="askjobs-bubble" class="hidden" title="Click to restore AskJobs Autofill">AJ<span class="dot"></span></div>
+      <div id="askjobs-bubble" class="hidden" title="Click to restore ${BRAND_NAME}">${BRAND_INITIALS}<span class="dot"></span></div>
     `;
 
     sidebarShadow = shadow;

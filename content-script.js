@@ -594,6 +594,39 @@
     return null;
   }
 
+  // Race/ethnicity option for this candidate — never an AI guess (a wrong
+  // pick on an EEO form is worse than a blank). The user's rule (all
+  // candidates are Indian): with a saved race of Asian/Indian, or none saved,
+  //   exact saved value > the one "Asian" option > among several "Asian"
+  //   options the one mentioning Indian (Samsara: "South Asian (inclusive of
+  //   ... Indian ...)"), else South Asian > with no "Asian" option, one
+  //   mentioning Indian — never "American Indian or Alaska Native" or other
+  //   Native American wordings, a different group entirely.
+  // Any other saved race: exact, else a single whole-word match. null = leave
+  // it for the user.
+  const NATIVE_AMERICAN_INDIAN = /\b(american indian|native american|alaska native|alaskan native|indigenous|first nations|tribal)\b/;
+  function pickRaceOptionText(optionTexts) {
+    const n = (t) => normalize(t);
+    const real = optionTexts.filter((t) => n(t) && !PLACEHOLDER_OPTION_TEXT.test(n(t)));
+    const stored = n(eeoProfile?.race || "");
+    const exact = stored ? real.find((t) => n(t) === stored) : null;
+    if (exact) return exact;
+    const isIndianCandidate = !stored || /\basian\b/.test(stored) || (/\bindian\b/.test(stored) && !NATIVE_AMERICAN_INDIAN.test(stored));
+    if (!isIndianCandidate) {
+      const wholeWord = real.filter((t) => containsWholeWords(n(t), stored));
+      return wholeWord.length === 1 ? wholeWord[0] : null;
+    }
+    const mentionsIndian = (t) => /\b(asian indian|indian)\b/.test(n(t)) && !NATIVE_AMERICAN_INDIAN.test(n(t));
+    const asian = real.filter((t) => /\basian\b/.test(n(t)));
+    if (asian.length === 1) return asian[0];
+    if (asian.length > 1) return asian.find(mentionsIndian) || asian.find((t) => /\bsouth asian\b/.test(n(t))) || null;
+    return real.find(mentionsIndian) || null;
+  }
+
+  function isRaceOnlyQuestion(normalizedQuestionText) {
+    return isRaceOrEthnicityQuestion(normalizedQuestionText) && !isHispanicYesNoQuestion(normalizedQuestionText);
+  }
+
   function eeoHispanicOrLatinoText() {
     if (eeoProfile?.hispanicOrLatino === "yes") return "Hispanic or Latino";
     if (eeoProfile?.hispanicOrLatino === "no") return "Not Hispanic or Latino";
@@ -680,7 +713,10 @@
       const v = eeoVeteranStatusText();
       wantedValues = v ? [v] : [];
     } else if (normalizedQuestionText.includes("ethnicit") || normalizedQuestionText.includes("hispanic") || normalizedQuestionText.includes("racial") || matchesWholeWord(normalizedQuestionText, "race")) {
-      wantedValues = [eeoProfile.race, eeoHispanicOrLatinoText()].filter(Boolean);
+      // The race box via the fixed Asian/Indian rule (pickRaceOptionText);
+      // the separate Hispanic/Latino answer, if any, still matched below.
+      const raceText = pickRaceOptionText(boxes.map((b) => (labelForField(b) || b.value || "").trim()));
+      wantedValues = [raceText, eeoHispanicOrLatinoText()].filter(Boolean);
     } else if (normalizedQuestionText.includes("lgbtq") || normalizedQuestionText.includes("transgender")) {
       const v = eeoLgbtqText();
       wantedValues = v ? [v] : [];
@@ -4212,7 +4248,10 @@
       const quickMatch = stored
         ? quickOptionMatch(optionTexts, normStored)
         : null;
-      const matchedOption = await resolveOptionMatch(fieldLabel, stored, optionTexts, quickMatch);
+      // Race: the fixed rule in pickRaceOptionText, never the AI.
+      const matchedOption = isRaceOnlyQuestion(questionText)
+        ? pickRaceOptionText(optionTexts)
+        : await resolveOptionMatch(fieldLabel, stored, optionTexts, quickMatch);
       if (matchedOption) {
         const insertOption = () => {
           const option = Array.from(field.options).find((o) => o.textContent.trim() === matchedOption);
@@ -5607,6 +5646,10 @@
 
     const texts = [...new Set(options.map((o) => optionText(o)).filter((t) => t && !PLACEHOLDER_OPTION_TEXT.test(normalize(t))))];
     clickComboboxTrigger(button); // toggle closed again via the same trigger
+    // Confirmed real (3M's Workday): that toggle can leave the list open,
+    // which breaks the next fill's "already visible" snapshot. Make sure.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    if (button.getAttribute("aria-expanded") === "true") dismissOpenCombobox(button);
     console.log(
       "[AskJobs] gathered", texts.length, "real option(s) for combobox:",
       labelForField(button) || button.getAttribute("aria-label") || button.id
@@ -5633,6 +5676,46 @@
   // Gender, which fill fine one at a time). A promise-chain lock makes
   // every combobox fill run strictly one after another.
   let comboboxFillChain = Promise.resolve();
+
+  // closeComboboxPopup() is a deliberate no-op; this actually closes an open
+  // dropdown (Escape on its trigger — Workday, react-select and most ARIA
+  // listboxes honor it) when a later step needs it closed.
+  function dismissOpenCombobox(button) {
+    const esc = { key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true, cancelable: true };
+    button.dispatchEvent(new KeyboardEvent("keydown", esc));
+    button.dispatchEvent(new KeyboardEvent("keyup", esc));
+  }
+
+  // Last resort for a dropdown whose options DO render but the generic fill
+  // missed (see the referral branch): click the option whose text is
+  // EXACTLY wantedText — among the options already showing, else after
+  // opening the list. Never a near match.
+  async function pickComboboxOptionDirect(button, wantedText) {
+    const want = normalize(wantedText);
+    const findShowing = () =>
+      deepQueryAll(null, '[role="option"], [role="menuitem"], [data-automation-id="promptOption"]')
+        .filter(isVisible)
+        .find((o) => normalize(optionText(o)) === want);
+    let option = findShowing();
+    if (!option) {
+      clickComboboxTrigger(button);
+      for (let i = 0; i < 25 && !option; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        option = findShowing();
+      }
+    }
+    if (!option) {
+      console.log("[AskJobs] direct pick: no showing option exactly", wantedText);
+      dismissOpenCombobox(button);
+      return false;
+    }
+    option.scrollIntoView?.({ block: "nearest" });
+    clickMatchedOption(option);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const shown = normalize(comboboxDisplayText(button));
+    console.log("[AskJobs] direct pick: clicked", optionText(option), "— box now shows", JSON.stringify(shown));
+    return shown === want || containsWholeWords(shown, want);
+  }
   function fillCustomCombobox(...args) {
     const run = comboboxFillChain.then(() => fillCustomComboboxNow(...args));
     comboboxFillChain = run.catch(() => {});
@@ -6633,12 +6716,14 @@
         attemptedRadioGroups.add(name);
         const label = rawQuestionText || "Demographic question";
         const stored = sensitiveSelfIdSingleValue(questionText);
-        const optionTexts = stored ? groupRadios.map((r) => (labelForField(r) || r.value || "").trim()).filter(Boolean) : [];
+        const isRace = isRaceOnlyQuestion(questionText);
+        const optionTexts = stored || isRace ? groupRadios.map((r) => (labelForField(r) || r.value || "").trim()).filter(Boolean) : [];
         const normStored = stored ? normalize(stored) : "";
         const quickMatch = stored
           ? quickOptionMatch(optionTexts, normStored)
           : null;
-        const matchedOption = await resolveOptionMatch(label, stored, optionTexts, quickMatch);
+        // Race: the fixed rule in pickRaceOptionText, never the AI.
+        const matchedOption = isRace ? pickRaceOptionText(optionTexts) : await resolveOptionMatch(label, stored, optionTexts, quickMatch);
         if (matchedOption) {
           const insertOption = () => {
             const target = groupRadios.find((r) => (labelForField(r) || r.value || "").trim() === matchedOption);
@@ -6853,7 +6938,16 @@
           recordResult("skipped", fieldLabel, "No Careers or LinkedIn option offered — please choose directly");
           continue;
         }
-        const filled = await fillCustomCombobox(button, choice, fieldLabel);
+        // Confirmed real (3M's Workday): gatherComboboxOptions' closing click
+        // left the list OPEN, so fillCustomCombobox's "already visible
+        // before opening" snapshot excluded all 31 options and its own
+        // click then closed the list — "zero options rendered" for a
+        // LinkedIn that was right there. Close it properly first, and fall
+        // back to clicking the exact option directly.
+        dismissOpenCombobox(button);
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        let filled = await fillCustomCombobox(button, choice, fieldLabel);
+        if (!filled) filled = await pickComboboxOptionDirect(button, choice);
         console.log("[AskJobs] generic combobox recognized as referral source ->", filled ? "filled" : "fill failed", choice, ":", fieldLabel);
         recordResult(filled ? "filled" : "skipped", fieldLabel, filled ? choice : `Couldn't select "${choice}"`);
         continue;
@@ -6989,6 +7083,22 @@
         attemptedSignatures.add(signature);
         const stored = sensitiveSelfIdSingleValue(questionText);
         console.log("[AskJobs] generic combobox recognized as sensitive self-ID question, stored value:", stored, "->", fieldLabel);
+        // Race: the fixed rule in pickRaceOptionText (Asian, else the
+        // Indian-mentioning option), read from the real list — never the AI,
+        // and also with no race saved (the user: all candidates are Indian).
+        if (isRaceOnlyQuestion(questionText)) {
+          const options = await gatherComboboxOptions(button);
+          const pick = pickRaceOptionText(options);
+          console.log("[AskJobs] race combobox: options", options, "-> pick:", pick);
+          if (!pick) {
+            recordResult("skipped", fieldLabel, "No Asian or Indian option offered — please choose directly");
+            continue;
+          }
+          let result = await fillCustomComboboxBestEffort(button, pick, fieldLabel);
+          if (!result.filled && (await pickComboboxOptionDirect(button, pick))) result = { filled: true, value: pick };
+          recordResult(result.filled ? "filled" : "skipped", fieldLabel, result.filled ? `${pick} (from the candidate's EEO profile)` : `Couldn't select "${pick}" — please choose directly`);
+          continue;
+        }
         if (stored) {
           const insertValue = async () => {
             const result = await fillCustomComboboxBestEffort(button, stored, fieldLabel);
@@ -6999,21 +7109,6 @@
             );
           };
           if (isRaceOrEthnicityQuestion(questionText)) {
-            // Confirmed real (Samsara): a stored "Asian" auto-picked "East
-            // Asian (inclusive of Chinese, Japanese, Korean...)" — the first
-            // of several options containing the word — for a candidate the
-            // stored value can't place. With no exact option and 2+ whole-
-            // word candidates, never guess a sub-group; leave it, naming them.
-            const options = await gatherComboboxOptions(button);
-            const normStored = normalize(stored);
-            const exact = options.some((o) => normalize(o) === normStored);
-            const candidates = options.filter((o) => containsWholeWords(normalize(o), normStored));
-            if (!exact && candidates.length >= 2) {
-              const names = candidates.map((o) => o.split("(")[0].trim()).join(", ");
-              console.log("[AskJobs] race combobox: several options match", stored, "— not guessing:", candidates);
-              recordResult("skipped", fieldLabel, `Several options match "${stored}" (${names}) — please choose the right one`);
-              continue;
-            }
             await insertValue();
           } else {
             renderStoredValueSuggestion(fieldLabel, stored, insertValue);

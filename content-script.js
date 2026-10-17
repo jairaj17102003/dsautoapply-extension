@@ -100,7 +100,9 @@
     // short label ("address" is in RISKY_SHORT_WORD_PATTERNS).
     {
       key: "addressStreet",
-      patterns: ["street address", "address line 1", "address line1", "addressline1", "address1", "address"],
+      // "street number", "street name", "p o box": confirmed real (Ford's
+      // Oracle Recruiting "Street Number and Name or P.O. Box").
+      patterns: ["street address", "address line 1", "address line1", "addressline1", "address1", "street number", "street name", "p o box", "address"],
       // City/ZIP/state/country too — confirmed real, serious (Analog
       // Devices' Workday): every address field's id starts "address--"
       // ("address--city", "address--postalCode"), so bare "address" matched
@@ -174,7 +176,11 @@
     // make NOW, a different question from what they want.
     {
       key: "expectedSalary",
-      patterns: ["expected salary", "desired salary", "salary expectation", "salary expectations", "compensation expectation", "compensation expectations", "salary"],
+      // "expected/desired compensation", "salary/compensation requirements":
+      // confirmed real (Bose's Workday "What is your expected compensation?")
+      // — unmatched, it went to the AI, which guessed 80000 instead of the
+      // saved 100000.
+      patterns: ["expected salary", "desired salary", "salary expectation", "salary expectations", "compensation expectation", "compensation expectations", "expected compensation", "desired compensation", "compensation requirements", "salary requirements", "salary"],
       excludePatterns: ["current salary", "current compensation"],
     },
     // Deliberately NOT matching "available to start"/"date available" —
@@ -566,7 +572,8 @@
     if (eeoProfile?.veteranStatus === "yes") return "Yes";
     if (eeoProfile?.veteranStatus === "no") return "No";
     if (eeoProfile?.veteranStatus === "decline_to_answer") return "Decline to answer";
-    return null;
+    // The user's default (2026-10-15): nothing saved -> not a protected veteran.
+    return "No";
   }
 
   // "Are you Hispanic/Latino?" asked on its own (Yes / No / decline) —
@@ -618,6 +625,18 @@
     }
     const mentionsIndian = (t) => /\b(asian indian|indian)\b/.test(n(t)) && !NATIVE_AMERICAN_INDIAN.test(n(t));
     const asian = real.filter((t) => /\basian\b/.test(n(t)));
+    // An "Ethnicity" question that is really Hispanic yes/no — confirmed
+    // real (an Oracle Recruiting form: "Please enter Ethnicity" -> Hispanic
+    // or Latino / Not Hispanic or Latino / I choose not to disclose). With no
+    // Asian option, answer it from eeoHispanicYesNo (No for an Indian
+    // candidate).
+    const notHispanic = real.find((t) => /\bnot hispanic\b/.test(n(t)));
+    if (!asian.length && notHispanic) {
+      const ans = eeoHispanicYesNo();
+      if (ans === "No") return notHispanic;
+      if (ans === "Yes") return real.find((t) => /\b(hispanic|latino)\b/.test(n(t)) && !/\bnot\b/.test(n(t))) || null;
+      return null;
+    }
     if (asian.length === 1) return asian[0];
     if (asian.length > 1) return asian.find(mentionsIndian) || asian.find((t) => /\bsouth asian\b/.test(n(t))) || null;
     return real.find(mentionsIndian) || null;
@@ -657,7 +676,8 @@
     if (eeoProfile?.disability === "yes") return "Yes";
     if (eeoProfile?.disability === "no") return "No";
     if (eeoProfile?.disability === "decline_to_answer") return "Decline to answer";
-    return null;
+    // The user's default (2026-10-15): nothing saved -> no disability.
+    return "No";
   }
 
   // For free-text fields only, which can hold any combined string —
@@ -994,7 +1014,24 @@
       if (match) return match;
       node = node.parentElement;
     }
-    return deepQueryAll(null, PHONE_CODE_SELECTOR).find(isPhoneCodeField) || null;
+    const labelled = deepQueryAll(null, PHONE_CODE_SELECTOR).find(isPhoneCodeField);
+    if (labelled) return labelled;
+    // Confirmed real (Sairam's Workday): a visible "Country Phone Code*"
+    // box with a "United States of America (+1)" chip, yet the number still
+    // went in as "+1 (913) 263-4096" — the label isn't tied to the input in
+    // a way labelForField reads. Last resort: start from the LABEL text and
+    // take the box its own form-field block holds.
+    for (const label of deepQueryAll(null, "label, legend, [data-automation-id='formLabel']")) {
+      if (!PHONE_CODE_LABEL.test(label.textContent || "")) continue;
+      const byFor = label.htmlFor ? document.getElementById(label.htmlFor) : null;
+      if (byFor && byFor !== phoneField) return byFor;
+      // Only a block holding exactly ONE box — never a wrapper that also
+      // holds the number/extension fields.
+      const block = label.closest('[data-automation-id^="formField"]') || label.parentElement;
+      const boxes = [...(block?.querySelectorAll(PHONE_CODE_SELECTOR) || [])];
+      if (boxes.length === 1 && boxes[0] !== phoneField) return boxes[0];
+    }
+    return null;
   }
 
   // vue-phone-number-input's picker (100hires, actual HTML): a readonly
@@ -1124,11 +1161,43 @@
     { synonyms: ["prefer not to say", "i don't wish to answer", "decline to answer", "prefer not to answer", "i do not wish to answer"] },
   ];
 
+  // Veteran-status option for the saved answer (default No): "Not a
+  // Protected Veteran" / "I am not a protected veteran" — confirmed real
+  // (Ford, Samsara). A plain "no" isn't a word in those, so the generic
+  // matcher missed them.
+  function bestVeteranOptionText(optionTexts) {
+    const stored = normalize(eeoVeteranStatusText() || "");
+    const n = (t) => normalize(t);
+    if (stored === "no") {
+      return optionTexts.find((t) => /\bnot\b.*\bveteran\b|^no\b|\bnot a veteran\b/.test(n(t)) && !/\b(decline|don t wish|do not wish|prefer not)\b/.test(n(t))) || null;
+    }
+    if (stored === "yes") {
+      return optionTexts.find((t) => /\b(identify as|i am)\b.*\bveteran\b/.test(n(t)) && !/\bnot\b/.test(n(t))) || null;
+    }
+    if (stored) return optionTexts.find((t) => /\b(decline|don t wish|do not wish|prefer not|choose not)\b/.test(n(t))) || null;
+    return null;
+  }
+
+  function isVeteranQuestion(normalizedQuestionText) {
+    return normalizedQuestionText.includes("veteran");
+  }
+
   function bestDisabilityOptionText(optionTexts) {
     const stored = normalize(eeoDisabilityText() || "");
     if (!stored) return null;
     const exact = optionTexts.find((t) => normalize(t) === stored);
     if (exact) return exact;
+    // Long wordings (Ford: "No, I do not have a disability and have not had
+    // one in the past"; "Yes, I have a disability, or have had one ...").
+    const declineish = (n) => /\b(not want|don t want|do not wish|don t wish|decline|prefer not|choose not)\b/.test(n);
+    if (stored === "no") {
+      const no = optionTexts.find((t) => { const n = normalize(t); return /\b(do not|don t) have a disability\b|^no\b/.test(n) && !declineish(n); });
+      if (no) return no;
+    }
+    if (stored === "yes") {
+      const yes = optionTexts.find((t) => { const n = normalize(t); return /^yes\b|\bi have a disability\b/.test(n) && !declineish(n); });
+      if (yes) return yes;
+    }
     const group = DISABILITY_SYNONYM_GROUPS.find((g) => g.synonyms.includes(stored));
     if (!group) return null;
     return optionTexts.find((t) => group.synonyms.includes(normalize(t))) || null;
@@ -1219,6 +1288,10 @@
   // page-re-rendered (replaced, empty) field be told apart from one the
   // user cleared by hand (same element). See fillField.
   const attemptedFieldElements = new Map();
+  // Signatures of text fields the extension itself filled — see
+  // manualFill(): a page step that wiped them (Ford's "Import profile")
+  // gets them refilled on the next explicit Fill click.
+  const extensionFilledSignatures = new Set();
 
   // Fields/radio-groups the deterministic matchers didn't recognize, queued
   // for a single batched AI classification call after each fill pass (never
@@ -1242,6 +1315,22 @@
       // and were silently skipped. Their own block titles tell them apart.
       field.type === "file" ? fileInputBlockTitle(field) : "",
     ].join("|");
+  }
+
+  // A résumé upload whose purpose is to PARSE the résumé into the form
+  // ("Import your profile", "Autofill with résumé", "Upload your résumé to
+  // apply faster") — not the application's own Résumé attachment.
+  const RESUME_IMPORT_TEXT = /\b(import your profile|import profile|import from resume|autofill with (your )?resume|auto fill with (your )?resume|parse (your )?resume|apply faster with (your )?resume|quick apply with (your )?resume)\b/;
+  function isResumeImportUpload(input, blockTitle) {
+    if (RESUME_IMPORT_TEXT.test(normalize(blockTitle || ""))) return true;
+    let node = input.parentElement;
+    for (let depth = 0; depth < 8 && node && node !== document.body; depth++) {
+      if (node.querySelectorAll('input[type="file"]').length > 1) break;
+      const heading = node.querySelector("h1, h2, h3, h4, h5, h6, legend, [class*='title'], [class*='header']");
+      if (heading && RESUME_IMPORT_TEXT.test(normalize(heading.textContent || ""))) return true;
+      node = node.parentElement;
+    }
+    return false;
   }
 
   // The title of the smallest page block that holds this file input and no
@@ -1349,6 +1438,37 @@
       ) || null;
     const segments = { month: byLabel("month"), day: byLabel("day"), year: byLabel("year") };
     return segments.month && segments.year ? segments : null;
+  }
+
+  // Types each Month/Day/Year spinbutton its own part. Confirmed real (Bose's
+  // Workday "When are you available to start?"): Workday keeps its OWN
+  // "active segment", updated a moment after a segment is focused — typing
+  // the Day right away still went into Month ("16" clamped to 12, Day left
+  // empty: "12/DD/2026"). So each segment is clicked and focused, given time
+  // to become active, then typed; all three are checked afterwards, with one
+  // slower retry before reporting failure.
+  async function typeSegmentedDate(parts) {
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const present = parts.filter(([input]) => input);
+    const matches = () => present.every(([input, value]) => Number(input.value || input.getAttribute("aria-valuenow")) === Number(value));
+    for (const pause of [150, 450]) {
+      for (const [input, value] of present) {
+        const section = input.parentElement;
+        for (const type of ["mousedown", "mouseup", "click"]) {
+          section?.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true, view: window }));
+        }
+        input.focus();
+        input.dispatchEvent(new Event("focus", { bubbles: true, composed: true }));
+        await sleep(pause);
+        typeStringInto(input, value);
+        await sleep(pause);
+      }
+      present[present.length - 1]?.[0].blur();
+      await sleep(150);
+      if (matches()) return true;
+      console.log("[AskJobs] segmented date didn't take on the first try — got", present.map(([i]) => i.value).join("/"), "; retrying slower");
+    }
+    return matches();
   }
 
   // Formats the current date the way the field expects: ISO for a native
@@ -2421,6 +2541,45 @@
     return null;
   }
 
+  // A text box's character limit: its own maxlength, else a limit the page
+  // states next to it. Confirmed real (Bose's Workday "Type to Add Skills"
+  // textarea): no maxlength, but "Please do not enter more than 2000
+  // characters." appeared under it once a 2000+ character answer went in.
+  function characterLimitFor(field) {
+    if (field.maxLength > 0 && field.maxLength < 100000) return field.maxLength;
+    const block = field.closest('[data-automation-id^="formField"], fieldset, .form-group, .field') || field.parentElement?.parentElement;
+    const text = (block?.innerText || "").replace(/\s+/g, " ");
+    const match =
+      text.match(/\b(?:more than|max(?:imum)?(?: of)?|up to|limit(?:ed)? to|no more than|at most|exceed)\s*([\d,]{2,7})\s*char/i) ||
+      text.match(/\b([\d,]{2,7})\s*char(?:acter)?s?\s*(?:max|maximum|limit|or less|or fewer)/i);
+    const limit = match ? Number(match[1].replace(/,/g, "")) : 0;
+    return limit >= 10 ? limit : 0;
+  }
+
+  // Shortens text to fit a limit at the last comma/sentence/space boundary,
+  // never mid-word (or mid-skill in a comma list).
+  function fitTextToLimit(text, limit) {
+    if (!limit || !text || text.length <= limit) return text;
+    const cut = text.slice(0, limit);
+    const boundary = Math.max(cut.lastIndexOf(", "), cut.lastIndexOf(". "), cut.lastIndexOf("\n"), cut.lastIndexOf("; "));
+    const end = boundary >= limit * 0.6 ? boundary + (cut[boundary] === "." ? 1 : 0) : cut.lastIndexOf(" ") > limit * 0.6 ? cut.lastIndexOf(" ") : limit;
+    return cut.slice(0, end).replace(/[\s,;]+$/, "");
+  }
+
+  // After typing: if the page now states a limit the text exceeds, cut the
+  // text to fit and set it again. Returns the value the box ends up with.
+  async function enforceCharacterLimit(field) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const limit = characterLimitFor(field);
+    const value = field.value || "";
+    if (!limit || value.length <= limit) return value;
+    const fitted = fitTextToLimit(value, limit);
+    console.log("[AskJobs] text was", value.length, "characters; the field allows", limit, "— shortened to", fitted.length);
+    setNativeValue(field, fitted);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    return field.value || "";
+  }
+
   function typeCharacterByCharacter(field, value) {
     field.focus();
     field.dispatchEvent(new Event("focus", { bubbles: true, composed: true }));
@@ -3046,8 +3205,9 @@
       const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(field), "value");
       descriptor.set.call(field, "");
       field.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
-      typeStringInto(field, skills.join(", "), { clearFirst: false });
+      typeStringInto(field, fitTextToLimit(skills.join(", "), characterLimitFor(field)), { clearFirst: false });
       field.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      await enforceCharacterLimit(field);
     }
 
     field.blur();
@@ -3061,8 +3221,21 @@
   // to plausibly be a real question (same >=10-char heuristic already used
   // by collectUnansweredQuestions, to avoid scooping up stray cosmetic
   // fields with no label).
+  // Address parts are filled only from the saved address (fillAddressLookup-
+  // Combobox / valueForKey) — never AI-answered. Confirmed real (an Oracle
+  // Recruiting form): the AI pass replaced a correctly picked ZIP with a
+  // different one and typed into Street/City/County lookups.
+  function isAddressPartLabel(label) {
+    const n = normalize(label || "");
+    return /\b(street|address|zip|postal|postcode|city|county|state|province|apartment|unit number|suite)\b/.test(n) && n.split(" ").length <= 10;
+  }
+
   async function maybeQueueFieldForClassification(field, signature) {
     if (queuedFieldSignatures.has(signature)) return;
+    if (isAddressPartLabel(labelForField(field) || field.getAttribute("aria-label") || field.getAttribute("placeholder") || "")) {
+      queuedFieldSignatures.add(signature);
+      return;
+    }
     const label = (
       labelForField(field) ||
       field.getAttribute("aria-label") ||
@@ -3088,6 +3261,34 @@
     // for whatever this field expects (formatDateForField already handles
     // native type="date" vs. various masked placeholder formats). Still
     // review-before-insert, same as everything else — never auto-filled.
+    // Confirmed real (Bose's Workday "When are you available to start?"):
+    // the date is three Month/Day/Year spinbuttons, not one date-shaped box,
+    // so the today's-date suggestion below never fired — all three went to
+    // the AI, which answered "Immediately" (not a date). Same suggestion,
+    // one card for the whole date, each segment typed its own part.
+    const startSegments = segmentedDateInputs(field);
+    if (startSegments && isStartDateQuestion(normalize(label)) && !isInsideEducationOrExperienceSection(field)) {
+      const segmentInputs = [startSegments.month, startSegments.day, startSegments.year].filter(Boolean);
+      const alreadyOffered = segmentInputs.some((input) => queuedFieldSignatures.has(fieldSignature(input)));
+      for (const input of segmentInputs) queuedFieldSignatures.add(fieldSignature(input));
+      if (alreadyOffered) return;
+      const now = new Date();
+      const mm = String(now.getMonth() + 1).padStart(2, "0");
+      const dd = String(now.getDate()).padStart(2, "0");
+      const yyyy = String(now.getFullYear());
+      const shown = startSegments.day ? `${mm}/${dd}/${yyyy}` : `${mm}/${yyyy}`;
+      renderStoredValueSuggestion(label, `${shown} (today)`, async () => {
+        const ok = await typeSegmentedDate([
+          [startSegments.month, mm],
+          [startSegments.day, dd],
+          [startSegments.year, yyyy],
+        ]);
+        recordResult(ok ? "filled" : "skipped", label, ok ? `${shown} (today's date, reviewed)` : "Couldn't enter the date correctly — please set it manually");
+      });
+      recordResult("skipped", label, "Suggested today's date — review above and click Insert, or set an exact date directly");
+      return;
+    }
+
     if (isDateShapedField(field)) {
       const questionText = normalize(label);
       // "Start Date" is exactly as common a label on a degree/job entry
@@ -3315,6 +3516,18 @@
       // its block title instead — "Cover Letter", "Certifications", etc.
       const blockTitle = fileInputBlockTitle(field);
       const titleSays = (patterns) => patterns.some((p) => matchesWholeWord(blockTitle, p));
+      // "Import your profile" résumé parsers (Ford's Oracle Recruiting): an
+      // upload there makes the site parse the résumé and RE-FILL the form —
+      // wiping names, rewriting the address, inventing experience entries
+      // (a wrong company on one). The user's choice: skip it; the extension
+      // fills the form from the profile itself. The real Résumé field is a
+      // separate upload and still gets the file.
+      if (isResumeImportUpload(field, blockTitle)) {
+        attemptedSignatures.add(signature);
+        console.log("[AskJobs] skipped the site's résumé-import upload (it would overwrite the form):", blockTitle || fieldLabel);
+        recordResult("skipped", "Import profile", "Skipped on purpose — the site would overwrite the filled form from the résumé");
+        return;
+      }
       const labelKind = classify(field);
       let documentKind = null;
       if (labelKind === "coverLetter" || labelKind === "otherDocument") documentKind = labelKind;
@@ -3649,7 +3862,7 @@
       attemptedSignatures.add(signature);
       if (await fillDateField(field, finalValue)) {
         recordResult("filled", fieldLabel, finalValue);
-        console.log("[AskJobs] generic field filled:", key, "=", finalValue, "->", fieldLabel);
+        console.log("[AskJobs] generic field filled:", key, "=", finalValue, "->", fieldLabel); extensionFilledSignatures.add(signature);
       } else {
         recordResult("skipped", fieldLabel, "Couldn't enter the date correctly — please set it manually");
       }
@@ -3706,6 +3919,23 @@
     if (key === "phone" && isComboboxField(field)) {
       attemptedSignatures.add(signature);
       queuedFieldSignatures.add(signature);
+      return;
+    }
+    // Address-lookup search boxes (Ford's Oracle Recruiting Street / ZIP):
+    // only a suggestion that IS this address counts — never the closest
+    // match, which was another town's "123 MAIN ST, AKRON, IOWA", or a
+    // neighbouring ZIP.
+    if (isComboboxField(field) && (key === "addressStreet" || key === "addressPostalCode")) {
+      attemptedSignatures.add(signature);
+      const picked = await fillAddressLookupCombobox(field, key, value, fieldLabel);
+      recordResult(
+        picked ? "filled" : "skipped",
+        fieldLabel,
+        picked ||
+          (key === "addressPostalCode"
+            ? `ZIP ${value} isn't among the suggestions for this city/county — check the ZIP saved on the profile`
+            : `No suggestion matches "${value}" in ${profile?.addressCity || "the saved city"} — please enter the street directly`),
+      );
       return;
     }
     if (isComboboxField(field)) {
@@ -3772,7 +4002,7 @@
     }
     attemptedSignatures.add(signature);
     if (filled) {
-      console.log("[AskJobs] generic field filled:", key, "=", finalValue, "->", fieldLabel);
+      console.log("[AskJobs] generic field filled:", key, "=", finalValue, "->", fieldLabel); extensionFilledSignatures.add(signature);
       recordResult("filled", fieldLabel, finalValue);
     } else {
       console.log("[AskJobs] generic field fill didn't stick (even after retry):", key, "=", finalValue, "->", fieldLabel);
@@ -3898,12 +4128,29 @@
     }, 1500);
   }
 
+  // An explicit "Fill this application" click: fields the extension filled
+  // earlier that are now EMPTY get filled again — confirmed real (Ford's
+  // Oracle Recruiting: "Profile successfully imported" re-populated the form
+  // and wiped First/Last Name after they were filled). Automatic re-scans
+  // still leave emptied fields alone (a manual clear sticks); clicking Fill
+  // is the user asking for the form to be filled.
+  function manualFill(root) {
+    let cleared = 0;
+    for (const field of deepQueryAll(root, "input, textarea")) {
+      const signature = fieldSignature(field);
+      if (!field.value && extensionFilledSignatures.has(signature) && attemptedSignatures.delete(signature)) cleared++;
+    }
+    if (cleared) console.log("[AskJobs] Fill clicked —", cleared, "field(s) the extension filled earlier are now empty; filling them again");
+    return scanAndFill(root);
+  }
+
   async function scanAndFill(root) {
     if (fillInProgress) {
       rerunQueued = true;
       return;
     }
     fillInProgress = true;
+    setBusy("fill", true);
     try {
       resetFillStateIfNewContext(deepQueryAll(root, "input, select, textarea, button"));
 
@@ -3917,6 +4164,7 @@
       await fillCertifications();
       await fillLanguages();
       await fillWebsites();
+      await fillOracleExperienceTiles();
 
       const fields = deepQueryAll(root, "input, select, textarea");
       for (const field of fields) {
@@ -3944,13 +4192,40 @@
       await scanAndFillButtonToggleGroups(root);
       await runClassificationPass();
       await flagUnreachableResumeUploadIfNeeded();
+      scheduleWipedFieldRecheck();
     } finally {
       fillInProgress = false;
+      setBusy("fill", false);
       if (rerunQueued) {
         rerunQueued = false;
         scanAndFill(root);
       }
     }
+  }
+
+  // Confirmed real, recurring (Ford's Oracle Recruiting): "Import profile"
+  // finishes AFTER the fill and wipes First/Last Name. A few seconds after a
+  // pass, any text field the extension itself filled that is now empty is
+  // filled again — the user wants these overridden. Two checks (4s, 10s),
+  // only armed once per fill so it can't loop.
+  let wipedRecheckArmed = false;
+  function scheduleWipedFieldRecheck() {
+    if (wipedRecheckArmed || extensionFilledSignatures.size === 0) return;
+    wipedRecheckArmed = true;
+    const check = (last) => {
+      let cleared = 0;
+      for (const field of deepQueryAll(document, "input, textarea")) {
+        const signature = fieldSignature(field);
+        if (!field.value && extensionFilledSignatures.has(signature) && attemptedSignatures.delete(signature)) cleared++;
+      }
+      if (cleared) {
+        console.log("[AskJobs]", cleared, "field(s) the extension filled were emptied by the page — filling them again");
+        scanAndFill(document);
+      }
+      if (last) wipedRecheckArmed = false;
+    };
+    setTimeout(() => check(false), 4000);
+    setTimeout(() => check(true), 10000);
   }
 
   // Resolves the overall question a group of radios/checkboxes is asking.
@@ -3972,6 +4247,21 @@
   function groupQuestionText(items) {
     const lever = leverQuestionText(items[0]);
     if (lever) return lever;
+
+    // ARIA radiogroup's own label — confirmed real (Ford's Oracle Recruiting
+    // pills: <ul role="radiogroup" aria-label="<the question>"> around
+    // <button role="radio">). Text-stripping returned Oracle's validation
+    // message "this info is required" instead.
+    const radioGroup = items[0]?.closest?.('[role="radiogroup"]');
+    if (radioGroup && items.every((r) => radioGroup.contains(r))) {
+      const labelled = (radioGroup.getAttribute("aria-labelledby") || "")
+        .split(/\s+/)
+        .map((id) => id && document.getElementById(id)?.textContent?.trim())
+        .filter(Boolean)
+        .join(" ");
+      const own = (radioGroup.getAttribute("aria-label") || "").trim() || labelled;
+      if (own.length >= 3) return own;
+    }
 
     let node = items[0].closest("fieldset");
     while (node) {
@@ -4883,6 +5173,7 @@
 
     if (key === "institution") return null;
     return (
+      (key === "degree" ? preferredTechnicalDegreeOption(real, value, (o) => o.textContent) : null) ||
       real.find((o) => degreeSynonymsMatch(o.textContent, value)) ||
       real.find((o) => comboboxTextsMatch(o.textContent, target)) ||
       null
@@ -4984,13 +5275,40 @@
       return fillDateField(field, finalValue);
     }
     if (isMultiselectSearchBox(field)) {
-      return fillMultiselectSearch(field, [stringValue], fieldLabel, { fallbackToOther: key === "institution" });
+      return fillMultiselectSearch(field, [stringValue], fieldLabel, { fallbackToOther: key === "institution", retryWithKeyWord: key === "field" });
     }
     // role="spinbutton" year/date fields (confirmed via real HTML: a
     // separate decorative "YYYY" display div sits alongside the real
     // input) are the same segmented-input shape that caused the "10/10/0010"
     // masked-date bug — bulk-setting the value bypasses their internal
     // per-keystroke state the same way, so type it out instead.
+    // Confirmed real (Workday Work Experience "From*"/"To*" MM/YYYY boxes):
+    // each date is separate Month/Year spinbuttons that both carry the
+    // From/To label, so each got the raw "2022-01-01T00:00:00.000Z" typed
+    // into it and stayed empty ("The field From is required"). A date key
+    // on a Month/Day/Year segment now gets just its own part. UTC parts —
+    // the stored value is midnight UTC, which local time would turn into
+    // the previous month/year in the US.
+    if ((key === "startDate" || key === "endDate") && field.getAttribute("role") === "spinbutton") {
+      const parsed = new Date(stringValue);
+      const segment = /\bmonth\b|datesectionmonth/.test(normalize(`${field.getAttribute("aria-label") || ""} ${field.id || ""}`))
+        ? "month"
+        : /\bday\b|datesectionday/.test(normalize(`${field.getAttribute("aria-label") || ""} ${field.id || ""}`))
+          ? "day"
+          : /\byear\b|datesectionyear/.test(normalize(`${field.getAttribute("aria-label") || ""} ${field.id || ""}`))
+            ? "year"
+            : null;
+      if (segment && !Number.isNaN(parsed.getTime())) {
+        const part =
+          segment === "month"
+            ? String(parsed.getUTCMonth() + 1).padStart(2, "0")
+            : segment === "day"
+              ? String(parsed.getUTCDate()).padStart(2, "0")
+              : String(parsed.getUTCFullYear());
+        // Focused, then a pause before typing — see typeSegmentedDate.
+        return typeSegmentedDate([[field, part]]);
+      }
+    }
     if (field.getAttribute("role") === "spinbutton") {
       typeCharacterByCharacter(field, stringValue);
       return true;
@@ -5097,6 +5415,34 @@
     // The first three synonym groups (bachelor, master, doctoral) line up
     // with DEGREE_ABBREVIATIONS by position; doctoral is group index 2.
     return abbreviationIndex === -1 ? undefined : DEGREE_LEVEL_SYNONYMS[abbreviationIndex];
+  }
+
+  // Confirmed real (Workday, Vishala's "Bachelor of Technology"): the list
+  // had no B.Tech, and degreeSynonymsMatch accepts EVERY bachelor-level
+  // option, so the first one — "B.A." (arts) — won. A technical degree
+  // (technology/engineering/science, or its abbreviation) first looks for a
+  // same-level science/engineering/technology option; arts/commerce are
+  // never preferred. Returns null when there's no such option, so the old
+  // "any same-level option" pick still runs after it.
+  const TECHNICAL_DEGREE_WORDS = /\b(technology|engineering|science|sciences|btech|b tech|be|beng|bs|bsc|b s|b sc|b e|mtech|m tech|me|meng|ms|msc|m s|m sc|m e)\b/;
+  const TECHNICAL_DEGREE_OPTION = /\b(science|sciences|engineering|technology|bs|bsc|b s|b sc|be|beng|b e|btech|b tech|ms|msc|m s|m sc|me|meng|m e|mtech|m tech)\b/;
+  function preferredTechnicalDegreeOption(options, targetText, textOf = (o) => o) {
+    const target = normalize(targetText);
+    const group = findDegreeSynonymGroup(targetText);
+    if (!group || group === DEGREE_LEVEL_SYNONYMS[2] || !TECHNICAL_DEGREE_WORDS.test(target)) return null;
+    const sameLevel = options.filter((o) => findDegreeSynonymGroup(textOf(o)) === group);
+    const technical = sameLevel.filter((o) => {
+      const t = normalize(textOf(o));
+      return TECHNICAL_DEGREE_OPTION.test(t) && !/\b(arts|commerce|fine arts)\b/.test(t);
+    });
+    // Engineering/technology first when the stored degree says so, else science.
+    const wantsEngineering = /\b(technology|engineering|btech|b tech|be|beng|b e|mtech|m tech|me|meng|m e)\b/.test(target);
+    return (
+      (wantsEngineering && technical.find((o) => /\b(engineering|technology|be|beng|b e|btech|b tech|me|meng|m e|mtech|m tech)\b/.test(normalize(textOf(o))))) ||
+      technical.find((o) => /\b(science|sciences|bs|bsc|b s|b sc|ms|msc|m s|m sc)\b/.test(normalize(textOf(o)))) ||
+      technical[0] ||
+      null
+    );
   }
 
   function degreeSynonymsMatch(optionText, targetText) {
@@ -5454,7 +5800,12 @@
         found = menuItems;
       }
       if (found.length === 0) {
-        let classOptions = deepQueryAll(scopeEl, CLASS_OPTION_SELECTOR).filter(isRealOptionCandidate);
+        let gridItems = gridOptionCandidates(scopeEl);
+        if (excludeOptions) gridItems = gridItems.filter((o) => !excludeOptions.has(o));
+        found = gridItems;
+      }
+      if (found.length === 0) {
+        let classOptions = innermostOnly(deepQueryAll(scopeEl, CLASS_OPTION_SELECTOR)).filter(isRealOptionCandidate);
         if (excludeOptions) classOptions = classOptions.filter((o) => !excludeOptions.has(o));
         found = classOptions;
       }
@@ -5527,6 +5878,7 @@
       preferredCountryOption(matchable, target) ||
       closestWholeWordOption(matchable, target) ||
       matchable.find((o) => comboboxTextsMatch(optionText(o), target)) ||
+      preferredTechnicalDegreeOption(matchable, desiredText, optionText) ||
       matchable.find((o) => degreeSynonymsMatch(optionText(o), target));
     if (heuristicMatch) return heuristicMatch;
     // A "Yes" answer to a single-option confirmation dropdown (Samsara:
@@ -5578,7 +5930,26 @@
       menuItems = menuItems.filter((o) => !existingOptions.has(o));
       candidates = menuItems;
     }
+    if (candidates.length === 0) candidates = gridOptionCandidates(scope).filter((o) => !existingOptions.has(o));
     return candidates;
+  }
+
+  // ARIA grid popups (aria-haspopup="grid") — confirmed real (Ford's Oracle
+  // Recruiting "cx-select": Gender, Street, ZIP): each choice is a
+  // role="row"/"gridcell", never role="option", so the whole list was read
+  // as ONE run-together option ("FemaleMale"). Rows first (one per choice);
+  // a row's lone cell otherwise.
+  function gridOptionCandidates(scope) {
+    const rows = deepQueryAll(scope, '[role="row"]').filter((r) => (r.textContent || "").trim() && isRealOptionCandidate(r));
+    if (rows.length) return rows;
+    return deepQueryAll(scope, '[role="gridcell"]').filter((c) => (c.textContent || "").trim() && isRealOptionCandidate(c));
+  }
+
+  // Drops elements that contain another element of the same list — a
+  // class match like "__option" also hits the "__options" CONTAINER, whose
+  // text is every option run together.
+  function innermostOnly(elements) {
+    return elements.filter((el) => !elements.some((other) => other !== el && el.contains(other)));
   }
 
   // Shares fillCustomCombobox's lock (see comboboxFillChain) — it opens a
@@ -5676,6 +6047,50 @@
   // Gender, which fill fine one at a time). A promise-chain lock makes
   // every combobox fill run strictly one after another.
   let comboboxFillChain = Promise.resolve();
+
+  // Types the saved street/ZIP into an address-lookup box and picks the
+  // suggestion that is exactly this address: ZIP -> a suggestion starting
+  // with that ZIP ("75080, Dallas, Collin, TX"); street -> one starting with
+  // the saved street AND naming the saved city. Returns the picked text or
+  // null (nothing picked, the box is cleared).
+  async function fillAddressLookupCombobox(input, key, value, fieldLabel) {
+    const want = normalize(value);
+    const city = normalize(profile?.addressCity || "");
+    if (!want) return null;
+    input.focus();
+    // Street: type what a person would — house number + first word ("1500
+    // Marilla"). Confirmed real (Ford's Oracle Recruiting): that returned
+    // "1500 MARILLA ST, DALLAS, TEXAS[, 75201]"; the full "1500 Marilla St"
+    // found no match. The match below still requires the whole saved street.
+    typeStringInto(input, key === "addressStreet" ? searchPrefixFor(value) : value);
+    const zip = normalize(profile?.addressPostalCode || "");
+    const isMatch = (t) => {
+      const n = normalize(t);
+      if (key === "addressPostalCode") return n.split(" ")[0] === want.split(" ")[0];
+      return n.startsWith(want) && (!city || containsWholeWords(n, city));
+    };
+    let option = null;
+    let seen = [];
+    for (let i = 0; i < 40 && !option; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const visible = innermostOnly(deepQueryAll(null, '[role="option"], [role="row"], [role="gridcell"]').filter(isVisible));
+      seen = visible.map((o) => optionText(o).trim());
+      const matches = visible.filter((o) => isMatch(optionText(o)));
+      // Prefer the suggestion that also carries the saved ZIP.
+      option = (zip && matches.find((o) => containsWholeWords(normalize(optionText(o)), zip))) || matches[0] || null;
+    }
+    if (!option) {
+      console.log("[AskJobs] address lookup: no suggestion is", value, city ? `in ${city}` : "", "-> ", fieldLabel, "| suggestions seen:", seen.slice(0, 8));
+      typeStringInto(input, "");
+      dismissOpenCombobox(input);
+      return null;
+    }
+    const text = optionText(option).trim();
+    clickMatchedOption(option);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    console.log("[AskJobs] address lookup picked:", text, "->", fieldLabel);
+    return text;
+  }
 
   // closeComboboxPopup() is a deliberate no-op; this actually closes an open
   // dropdown (Escape on its trigger — Workday, react-select and most ARIA
@@ -5890,6 +6305,121 @@
   // leaving nothing for waitForBestMatchingOption to even compare against.
   // The full value is still tried first and used whenever it actually works
   // — splitting is only a fallback, never the first attempt.
+  // Oracle Recruiting's inline Experience entries (confirmed real, actual
+  // HTML — Ford / efds.fa.em5.oraclecloud.com): an "Experience" apply-flow
+  // block with an "Add Experience" button that opens an inline form —
+  // employerName, jobTitle, Start/End Date as Month + Year cx-select
+  // pickers, a "Current Job" checkbox, Employer Country, Achievements — and
+  // a footer save button. Each profile job not already shown as a tile is
+  // added this way; the site's own "Import profile" (which mislabels jobs)
+  // is skipped elsewhere. Stops at the first entry the site won't save.
+  let oracleExperienceDone = false;
+  async function fillOracleExperienceTiles() {
+    if (oracleExperienceDone) return;
+    const block = [...document.querySelectorAll("apply-flow-block")].find(
+      (b) => normalize(b.querySelector(".apply-flow-block__title")?.textContent || "") === "experience",
+    );
+    if (!block) return;
+    const jobs = profile?.experience || [];
+    if (!jobs.length) return;
+    oracleExperienceDone = true;
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const tileText = () => [...block.querySelectorAll(".apply-flow-profile-item-tile__summary")].map((t) => normalize(t.getAttribute("aria-label") || t.textContent || ""));
+    const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    const pickMonthYear = async (prefix, iso) => {
+      const d = iso ? new Date(iso) : null;
+      if (!d || Number.isNaN(d.getTime())) return;
+      const month = block.querySelector(`input[id^="month-${prefix}"]`);
+      const year = block.querySelector(`input[id^="year-${prefix}"]`);
+      const m = d.getUTCMonth();
+      // Confirmed real (Ford): "January" was reported picked but the Month
+      // box stayed empty, so the entry couldn't save ("enter the whole
+      // date"). Success = the box itself shows a value; else next format,
+      // then a direct click on the exact option.
+      const shows = (input) => !!(input.value || "").trim();
+      // Direct click on the exact option first — fast; typing into Ford's
+      // month search matched nothing and cost ~5s per date before falling
+      // back. The typed path stays as the fallback (years type fine).
+      const pick = async (input, texts, label) => {
+        for (const text of texts) {
+          if (await pickComboboxOptionDirect(input, text)) {
+            await sleep(150);
+            if (shows(input)) return true;
+          }
+        }
+        for (const text of texts) {
+          await fillCustomComboboxBestEffort(input, text, label);
+          await sleep(200);
+          if (shows(input)) return true;
+          dismissOpenCombobox(input);
+        }
+        console.warn("[AskJobs] Oracle experience: couldn't set", label, "— tried", texts);
+        return false;
+      };
+      if (month) await pick(month, [MONTHS[m], MONTHS[m].slice(0, 3), String(m + 1).padStart(2, "0"), String(m + 1)], `${prefix} month`);
+      if (year) await pick(year, [String(d.getUTCFullYear())], `${prefix} year`);
+    };
+
+    for (const job of jobs) {
+      const title = (job.title || "").trim();
+      const company = (job.company || "").trim();
+      if (!company && !title) continue;
+      const shown = tileText();
+      if (shown.some((t) => (title && t.includes(normalize(title)) && (!company || t.includes(normalize(company)))) || (company && t.includes(normalize(company)) && !title))) {
+        console.log("[AskJobs] Oracle experience: already listed —", title, "@", company);
+        continue;
+      }
+      const addButton = block.querySelector("button.apply-flow-profile-item-tile__new-tile");
+      if (!addButton || addButton.disabled) {
+        recordResult("skipped", "Experience", `Couldn't add "${title} at ${company}" — the page's Add Experience button isn't available (finish or delete the open entry first)`);
+        return;
+      }
+      addButton.click();
+      let employer = null;
+      for (let i = 0; i < 30 && !employer; i++) {
+        await sleep(100);
+        employer = block.querySelector('.profile-item-content input[name="employerName"]');
+      }
+      if (!employer) {
+        recordResult("skipped", "Experience", "The Add Experience form didn't open — please add the jobs directly");
+        return;
+      }
+      setNativeValue(employer, company);
+      const jobTitle = block.querySelector('.profile-item-content input[name="jobTitle"]');
+      if (jobTitle) setNativeValue(jobTitle, title);
+      await pickMonthYear("startDate", job.startDate);
+      if (job.current) {
+        const current = block.querySelector('.profile-item-content input[id*="currentJobFlag"]');
+        if (current && !current.checked) {
+          (block.querySelector(`label[for="${CSS.escape(current.id)}"]`) || current).click();
+          await sleep(150);
+          if (!current.checked) current.click();
+        }
+      } else {
+        await pickMonthYear("endDate", job.endDate);
+      }
+      const country = block.querySelector('.profile-item-content input[name="countryCode"]');
+      if (country && !country.value && profile?.addressCountry) await fillCustomComboboxBestEffort(country, profile.addressCountry, "Employer Country");
+      const achievements = block.querySelector('.profile-item-content textarea[name="achievements"]');
+      const bullets = Array.isArray(job.achievements) ? job.achievements.filter(Boolean) : [];
+      if (achievements && bullets.length) typeCharacterByCharacter(achievements, bullets.map((b) => `• ${b}`).join("\n").slice(0, 3900));
+
+      block.querySelector(".profile-item-footer .save-btn")?.click();
+      let closed = false;
+      for (let i = 0; i < 40 && !closed; i++) {
+        await sleep(150);
+        closed = !block.querySelector(".profile-item-content");
+      }
+      if (!closed) {
+        console.warn("[AskJobs] Oracle experience: the site didn't accept the entry —", title, "@", company);
+        recordResult("skipped", "Experience", `"${title} at ${company}" needs a field fixed in the open form, then click its Add Experience button`);
+        return;
+      }
+      recordResult("filled", "Experience", `${title} at ${company}`);
+      await sleep(300);
+    }
+  }
+
   async function fillCustomComboboxBestEffort(button, desiredText, fieldLabel, searchTermOverride) {
     if (await fillCustomCombobox(button, desiredText, fieldLabel, searchTermOverride)) return { filled: true, value: desiredText };
 
@@ -5953,7 +6483,9 @@
   // reverts to empty. Filling one means typing to trigger the search,
   // waiting for results, then clicking the best match — once per desired
   // value, so it doubles as the multi-value (skills) case.
-  async function fillMultiselectSearch(searchInput, desiredTexts, fieldLabel, { fallbackToOther = false } = {}) {
+  const MULTISELECT_CHIP_SELECTOR = '[data-automation-id="selectedItem"]';
+
+  async function fillMultiselectSearch(searchInput, desiredTexts, fieldLabel, { fallbackToOther = false, retryWithKeyWord = false } = {}) {
     let filledAny = false;
     const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(searchInput), "value");
 
@@ -5966,6 +6498,7 @@
       // not just while its own dropdown is open) from being picked up as if
       // it were one of THIS search's results.
       const existingOptions = new Set(deepQueryAll(null, '[role="option"]'));
+      const chipsBefore = new Set(deepQueryAll(null, MULTISELECT_CHIP_SELECTOR));
       const typedPrefix = searchPrefixFor(text);
       typeStringInto(searchInput, typedPrefix);
       console.log("[AskJobs] multiselect: typed", JSON.stringify(typedPrefix), "into search box for", fieldLabel, "— input.value is now", JSON.stringify(searchInput.value));
@@ -5997,15 +6530,52 @@
         match = await waitForBestMatchingOption(null, text, fieldLabel, existingOptions);
       }
 
+      // Confirmed real (Workday Field of Study, "Electrical and Electronics
+      // Engineering"): the two-word search "Electrical and" found nothing,
+      // though "Electrical Engineering" is in the list. Field of Study only
+      // (never Skills/School, where a one-word search would pick a
+      // different skill or school): search the stored value's first real
+      // word and match against the full value as usual.
+      if (!match && retryWithKeyWord) {
+        const keyWord = (text.match(/[A-Za-z][A-Za-z&]{3,}/g) || []).find((w) => !/^(and|with|the|from)$/i.test(w));
+        if (keyWord && normalize(keyWord) !== normalize(typedPrefix)) {
+          descriptor.set.call(searchInput, "");
+          searchInput.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+          typeStringInto(searchInput, keyWord);
+          console.log("[AskJobs] multiselect: nothing for", JSON.stringify(typedPrefix), "— searching", JSON.stringify(keyWord), "for", fieldLabel);
+          await new Promise((resolve) => setTimeout(resolve, 350));
+          const opened = deepQueryAll(null, '[role="option"]')
+            .filter((o) => !existingOptions.has(o))
+            .some(isRealOptionCandidate);
+          if (!opened) dispatchEnterKey(searchInput);
+          match = await waitForBestMatchingOption(null, text, fieldLabel, existingOptions);
+        }
+      }
+
       if (!match && fallbackToOther) {
         match = await trySelectOtherOption(searchInput, existingOptions);
         if (match) console.log("[AskJobs] multiselect falling back to 'Other' option for:", text);
       }
 
       if (match) {
-        clickMatchedOption(match);
+        // Confirmed real (Bose's Workday Skills): Enter alone already adds an
+        // exact hit as a chip, and each chip is itself a role="option" (with
+        // a DELETE_charm inside) — so the match was that fresh chip or the
+        // now-ticked row, and clicking it toggled the skill straight back
+        // off. Matching is unchanged; only that one click is skipped.
+        const label = normalize(optionText(match));
+        const addedAlready = () =>
+          match.closest(MULTISELECT_CHIP_SELECTOR) ||
+          match.querySelector('[data-automation-id="DELETE_charm"]') ||
+          match.querySelector('input[type="checkbox"]:checked') ||
+          deepQueryAll(null, MULTISELECT_CHIP_SELECTOR).some((c) => !chipsBefore.has(c) && normalize(c.textContent) === label);
+        if (addedAlready()) {
+          console.log("[AskJobs] multiselect: Enter already added", text, "->", optionText(match), "— not clicking (it would remove it)");
+        } else {
+          clickMatchedOption(match);
+          console.log("[AskJobs] multiselect matched:", text, "->", optionText(match));
+        }
         filledAny = true;
-        console.log("[AskJobs] multiselect matched:", text, "->", optionText(match));
         await new Promise((resolve) => setTimeout(resolve, 200));
       } else {
         console.log("[AskJobs] multiselect no match found for:", text);
@@ -6688,24 +7258,23 @@
         continue;
       }
 
-      if (isDisabilityQuestion(questionText)) {
+      // Also by its OPTIONS — confirmed real (Ford: the disability radios are
+      // under "Please check one of the boxes below:", only the options say
+      // "disability").
+      const radioOptionTexts = groupRadios.map((r) => (labelForField(r) || r.value || "").trim()).filter(Boolean);
+      const optionsAboutDisability = radioOptionTexts.some((t) => /\bdisabilit(y|ies)\b/.test(normalize(t)));
+      if (isDisabilityQuestion(questionText) || optionsAboutDisability) {
         attemptedRadioGroups.add(name);
-        const optionTexts = groupRadios.map((r) => (labelForField(r) || r.value || "").trim()).filter(Boolean);
-        const suggestion = await resolveOptionMatch(
-          rawQuestionText,
-          eeoDisabilityText(),
-          optionTexts,
-          bestDisabilityOptionText(optionTexts),
-        );
+        const optionTexts = radioOptionTexts;
+        const suggestion = bestDisabilityOptionText(optionTexts) || (await resolveOptionMatch(rawQuestionText, eeoDisabilityText(), optionTexts, null));
+        const label = rawQuestionText && !/^please check one/i.test(rawQuestionText) ? rawQuestionText : "Disability status";
         if (suggestion) {
-          renderStoredValueSuggestion(rawQuestionText, suggestion, () => {
-            const target = groupRadios.find((r) => (labelForField(r) || r.value || "").trim() === suggestion);
-            if (target) {
-              setNativeChecked(target);
-              recordResult("filled", rawQuestionText, `${suggestion} (from the candidate's EEO profile, reviewed)`);
-            }
-          });
-          recordResult("skipped", rawQuestionText, "Suggested from the candidate's EEO profile — review above and click Insert");
+          // Filled directly with the saved answer or the user's default (No).
+          const target = groupRadios.find((r) => (labelForField(r) || r.value || "").trim() === suggestion);
+          if (target) {
+            setNativeChecked(target);
+            recordResult("filled", label, `${suggestion} (from the candidate's EEO profile)`);
+          }
         } else {
           recordResult("skipped", rawQuestionText, "Voluntary demographic question — no disability status set in the candidate's EEO profile, please answer directly");
         }
@@ -6722,8 +7291,12 @@
         const quickMatch = stored
           ? quickOptionMatch(optionTexts, normStored)
           : null;
-        // Race: the fixed rule in pickRaceOptionText, never the AI.
-        const matchedOption = isRace ? pickRaceOptionText(optionTexts) : await resolveOptionMatch(label, stored, optionTexts, quickMatch);
+        // Race: the fixed rule in pickRaceOptionText, never the AI. Veteran:
+        // bestVeteranOptionText ("No" -> "Not a Protected Veteran").
+        const isVeteran = isVeteranQuestion(questionText);
+        const matchedOption = isRace
+          ? pickRaceOptionText(optionTexts)
+          : (isVeteran && bestVeteranOptionText(optionTexts)) || (await resolveOptionMatch(label, stored, optionTexts, quickMatch));
         if (matchedOption) {
           const insertOption = () => {
             const target = groupRadios.find((r) => (labelForField(r) || r.value || "").trim() === matchedOption);
@@ -6732,7 +7305,7 @@
               recordResult("filled", label, `${matchedOption} (from the candidate's EEO profile, reviewed)`);
             }
           };
-          if (isRaceOrEthnicityQuestion(questionText)) {
+          if (isRaceOrEthnicityQuestion(questionText) || isVeteran) {
             insertOption();
           } else {
             renderStoredValueSuggestion(label, matchedOption, insertOption);
@@ -6822,7 +7395,16 @@
     );
     console.log("[AskJobs] generic comboboxes: found", buttons.length, "button(s) on this page");
 
+    let sawDetached = false;
     for (const button of buttons) {
+      // Confirmed real (an Oracle Recruiting form): picking the ZIP made the
+      // page rebuild City/State/County mid-loop — the stored triggers went
+      // DETACHED and their fills silently did nothing. Skip them (not marked
+      // attempted) and rescan the fresh ones afterwards.
+      if (!button.isConnected) {
+        sawDetached = true;
+        continue;
+      }
       const fieldLabel = labelForField(button) || button.getAttribute("aria-label") || button.name || button.id || "Unlabeled field";
 
       // Confirmed real (Ashby's RevenueCat GDPR consent checkbox): its real
@@ -7027,6 +7609,26 @@
       // it stayed unselected ("The field State is required"). Same stored
       // values the plain-input path uses (valueForKey), filled directly.
       const addressPartKey = classify(button);
+      // Street / ZIP lookup boxes in the dropdown scan too (Ford's Oracle
+      // Recruiting) — the same exact-address-only pick as fillField's path.
+      if (addressPartKey === "addressStreet" || addressPartKey === "addressPostalCode") {
+        attemptedSignatures.add(signature);
+        const stored = valueForKey(addressPartKey);
+        if (!stored) {
+          recordResult("skipped", fieldLabel, `No ${addressPartKey === "addressStreet" ? "street" : "ZIP"} saved on the profile — please fill it directly`);
+          continue;
+        }
+        const picked = await fillAddressLookupCombobox(button, addressPartKey, stored, fieldLabel);
+        recordResult(
+          picked ? "filled" : "skipped",
+          fieldLabel,
+          picked ||
+            (addressPartKey === "addressPostalCode"
+              ? `ZIP ${stored} isn't among the suggestions for this city/county — check the ZIP saved on the profile`
+              : `No suggestion matches "${stored}" in ${profile?.addressCity || "the saved city"} — please enter the street directly`),
+        );
+        continue;
+      }
       if (addressPartKey === "addressState" || addressPartKey === "addressCity") {
         attemptedSignatures.add(signature);
         const stored = valueForKey(addressPartKey);
@@ -7146,6 +7748,11 @@
           console.log("[AskJobs] generic combobox skipped — label suspiciously long (", rawLabelLength, "chars), likely an over-broad container match, not a real question:", fieldLabel);
           continue;
         }
+        if (isAddressPartLabel(fieldLabel)) {
+          attemptedSignatures.add(signature);
+          console.log("[AskJobs] address field not sent to the AI:", fieldLabel);
+          continue;
+        }
         console.log("[AskJobs] generic combobox not recognized — queueing for AI:", fieldLabel);
         queuedFieldSignatures.add(signature);
         const options = await gatherComboboxOptions(button);
@@ -7169,10 +7776,42 @@
       attemptedSignatures.add(signature);
       const wantedText = answer ? "Yes" : "No";
       console.log("[AskJobs] generic combobox recognized as", matcher.key, "-> attempting", wantedText, "for:", fieldLabel);
-      const filled = await fillCustomCombobox(button, wantedText, fieldLabel);
-      console.log("[AskJobs] generic combobox", filled ? "filled" : "fill failed", ":", fieldLabel, "->", wantedText);
-      recordResult(filled ? "filled" : "skipped", fieldLabel, filled ? wantedText : `Couldn't find a matching option for "${wantedText}"`);
+      let filled = await fillCustomCombobox(button, wantedText, fieldLabel);
+      let filledWith = wantedText;
+      // Work authorization asked as a visa-type list, no Yes/No — confirmed
+      // real (Ford's Oracle Recruiting: "What is your work authorization?" ->
+      // EAD / F1 OPT / H-1B / ... / "Other Visa Type - company sponsorship
+      // required"). The user's rule: fall back to the "Other" visa option.
+      if (!filled && matcher.key === "workAuthorized") {
+        dismissOpenCombobox(button);
+        const options = await gatherComboboxOptions(button);
+        const visaPick = pickWorkAuthorizationVisaOption(options);
+        console.log("[AskJobs] work authorization has no Yes/No — options:", options, "-> pick:", visaPick);
+        if (visaPick) {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          filled = (await fillCustomCombobox(button, visaPick, fieldLabel)) || (await pickComboboxOptionDirect(button, visaPick));
+          filledWith = visaPick;
+        }
+      }
+      console.log("[AskJobs] generic combobox", filled ? "filled" : "fill failed", ":", fieldLabel, "->", filledWith);
+      recordResult(filled ? "filled" : "skipped", fieldLabel, filled ? filledWith : `Couldn't find a matching option for "${wantedText}"`);
     }
+    if (sawDetached) {
+      console.log("[AskJobs] some dropdowns were re-built by the page during this pass — rescanning for the fresh ones");
+      setTimeout(() => scanAndFill(document), 1200);
+    }
+  }
+
+  // For a visa-type work-authorization list: a candidate needing sponsorship
+  // (saved, or the default Yes) gets the "Other Visa Type" option; one who
+  // doesn't, an "Other" option that doesn't say sponsorship is required —
+  // never a specific visa the profile doesn't record. null = leave it.
+  function pickWorkAuthorizationVisaOption(optionTexts) {
+    // The user's rule (2026-10-15): always the "Other" option, whatever it
+    // says — the "Other Visa Type ..." one first, else any "Other".
+    const n = (t) => normalize(t);
+    const others = optionTexts.filter((t) => /\bother\b/.test(n(t)));
+    return others.find((t) => /\bvisa\b/.test(n(t))) || others[0] || null;
   }
 
   const attemptedCheckboxGroups = new Set();
@@ -7319,6 +7958,21 @@
   // association radios do, so this uses each button's raw textContent
   // directly rather than labelForField/.value.
   function buttonToggleGroupQuestionText(buttons) {
+    // Confirmed real (Ford's Oracle Recruiting "cx-select-pills"): the
+    // question is the group's own aria-label — <ul role="radiogroup"
+    // aria-label="Do you meet the legal minimum age requirement…"> around
+    // <button role="radio"> pills. Text-stripping found Oracle's validation
+    // message instead ("this info is required") and sent THAT to the AI.
+    const group = buttons[0]?.closest?.('[role="radiogroup"], [role="group"]');
+    if (group && buttons.every((b) => group.contains(b))) {
+      const labelled = (group.getAttribute("aria-labelledby") || "")
+        .split(/\s+/)
+        .map((id) => id && document.getElementById(id)?.textContent?.trim())
+        .filter(Boolean)
+        .join(" ");
+      const own = (group.getAttribute("aria-label") || "").trim() || labelled;
+      if (own.length >= 3) return own;
+    }
     const optionTexts = buttons.map((b) => normalize(b.textContent || ""));
     function strippedText(container) {
       if (!container) return "";
@@ -7743,6 +8397,7 @@
         button:disabled { opacity: 0.5; cursor: default; }
         #askjobs-fill-btn { background: #C02C2A; color: #fff; box-shadow: 0 4px 10px rgba(192,44,42,0.25); }
         #askjobs-ai-fill-btn { background: #f3f4f6; color: #374151; border: 1px solid #e5e7eb; }
+        #askjobs-fill-btn:disabled, #askjobs-ai-fill-btn:disabled { opacity: 0.6; cursor: progress; box-shadow: none; }
         #askjobs-resume-link { margin-top: 10px; font-size: 11.5px; color: #6b7280; background: #f9fafb; border-radius: 8px; padding: 8px 10px; }
         #askjobs-resume-link a { color: #C02C2A; font-weight: 600; text-decoration: none; }
         #askjobs-resume-link a:hover { text-decoration: underline; }
@@ -7805,6 +8460,7 @@
     setHostPosition(host, shadow.querySelector("#askjobs-position-style"), { top: "16px", right: "16px" });
     shadow.querySelector("#askjobs-fill-btn").addEventListener("click", () => triggerEverywhere("remote-trigger-fill"));
     shadow.querySelector("#askjobs-ai-fill-btn").addEventListener("click", () => triggerEverywhere("remote-trigger-ai-fill"));
+    renderBusyButtons();
     shadow.querySelector("#askjobs-counter").addEventListener("click", () => {
       const details = shadow.querySelector("#askjobs-field-results");
       details.classList.toggle("hidden");
@@ -7927,6 +8583,47 @@
   }
 
   // Same dispatch pattern as recordResult — see its comment.
+  // Busy state for the panel's two buttons: greyed out with "Filling…" /
+  // "AI answering…" while a fill or AI-fill pass runs in ANY frame (iframe
+  // forms report here like their field results do). Counted per kind so
+  // overlapping passes in several frames all have to finish first; a
+  // 3-minute safety reset so a frame that vanished mid-pass (navigation)
+  // can never leave the buttons stuck disabled.
+  const busyCounts = { fill: 0, ai: 0 };
+  let busySafetyTimer = null;
+  function setBusy(kind, on) {
+    if (window.self !== window.top) {
+      try {
+        window.top.postMessage({ source: "askjobs-extension", type: "remote-busy", kind, on }, "*");
+      } catch {
+        // Top frame unreachable — nothing to grey out.
+      }
+      return;
+    }
+    busyCounts[kind] = Math.max(0, busyCounts[kind] + (on ? 1 : -1));
+    clearTimeout(busySafetyTimer);
+    if (busyCounts.fill || busyCounts.ai) {
+      busySafetyTimer = setTimeout(() => {
+        busyCounts.fill = 0;
+        busyCounts.ai = 0;
+        renderBusyButtons();
+      }, 180000);
+    }
+    renderBusyButtons();
+  }
+
+  function renderBusyButtons() {
+    if (!sidebarShadow) return;
+    const fillBtn = sidebarShadow.querySelector("#askjobs-fill-btn");
+    const aiBtn = sidebarShadow.querySelector("#askjobs-ai-fill-btn");
+    if (!fillBtn || !aiBtn) return;
+    const busy = busyCounts.fill > 0 || busyCounts.ai > 0;
+    fillBtn.disabled = busy;
+    aiBtn.disabled = busy;
+    fillBtn.textContent = busyCounts.fill > 0 ? "Filling…" : "Fill this application";
+    aiBtn.textContent = busyCounts.ai > 0 ? "AI answering…" : "AI-fill remaining questions";
+  }
+
   function showAiStatus(text) {
     if (window.self !== window.top) {
       window.top.postMessage({ source: "askjobs-extension", type: "remote-ai-status", text }, "*");
@@ -8035,6 +8732,9 @@
       // reasonable phrase, not a valid value for a field expecting an
       // actual calendar date. See isDateShapedField's comment.
       if (isDateShapedField(field)) continue;
+      // Same for a date split into Month/Day/Year boxes (Workday) — each
+      // box would otherwise get its own free-text AI answer.
+      if (segmentedDateInputs(field)) continue;
 
       const label = (
         labelForField(field) ||
@@ -8193,14 +8893,25 @@
     return items;
   }
 
+  // A second AI-fill click while one is still running is ignored — it used
+  // to start a parallel scan (duplicate AI requests and suggestion cards).
+  let aiFillRunning = false;
   async function handleAiFillClick() {
-    showAiStatus("Scanning for unanswered questions...");
-    const items = await collectUnansweredQuestions(document);
-    if (items.length === 0) {
-      showAiStatus("No open-ended questions found to answer.");
-      return;
+    if (aiFillRunning) return;
+    aiFillRunning = true;
+    setBusy("ai", true);
+    try {
+      showAiStatus("Scanning for unanswered questions...");
+      const items = await collectUnansweredQuestions(document);
+      if (items.length === 0) {
+        showAiStatus("No open-ended questions found to answer.");
+        return;
+      }
+      await runQualificationAnswerPass(items);
+    } finally {
+      aiFillRunning = false;
+      setBusy("ai", false);
     }
-    await runQualificationAnswerPass(items);
   }
 
   // Relays a suggestion this (non-top) frame generated to the top frame's
@@ -8276,6 +8987,8 @@
         recordResultLocal(event.data.status, event.data.label, event.data.detail);
       } else if (event.data.type === "remote-ai-status") {
         showAiStatus(event.data.text);
+      } else if (event.data.type === "remote-busy") {
+        setBusy(event.data.kind === "ai" ? "ai" : "fill", !!event.data.on);
       } else if (event.data.type === "remote-suggestion") {
         const { id, questionText, previewText, editable } = event.data;
         remoteSuggestionSources.set(id, event.source);
@@ -8307,7 +9020,7 @@
         window.top.postMessage({ source: "askjobs-extension", type: "remote-field-result", status, label, detail }, "*");
       }
     } else if (event.data.type === "remote-trigger-fill") {
-      scanAndFill(document);
+      manualFill(document);
     } else if (event.data.type === "remote-trigger-ai-fill") {
       handleAiFillClick();
     }
@@ -8325,7 +9038,7 @@
   // file: tell every child iframe directly, no background round-trip
   // needed.
   function triggerEverywhere(type) {
-    if (type === "remote-trigger-fill") scanAndFill(document);
+    if (type === "remote-trigger-fill") manualFill(document);
     else handleAiFillClick();
     for (const iframe of document.querySelectorAll("iframe")) {
       try {
@@ -8403,8 +9116,9 @@
             await fillSkillsField(item.field);
             recordResult("filled", item.questionText, `${finalValue} (AI-classified, reviewed)`);
           } else if (item.field.tagName === "TEXTAREA") {
-            typeCharacterByCharacter(item.field, finalValue);
-            recordResult("filled", item.questionText, `${finalValue} (AI-classified, reviewed)`);
+            typeCharacterByCharacter(item.field, fitTextToLimit(finalValue, characterLimitFor(item.field)));
+            const kept = await enforceCharacterLimit(item.field);
+            recordResult("filled", item.questionText, `${kept || finalValue} (AI-classified, reviewed)`);
           } else if (isMultiselectSearchBox(item.field)) {
             // Confirmed real (Analog Devices' Workday Education): "School or
             // University" / "Field of Study" are search-and-pick boxes —
@@ -8779,17 +9493,21 @@
               recordResult("skipped", item.questionText, "Couldn't find a matching option");
             }
           } else if (item.field.tagName === "TEXTAREA") {
-            typeCharacterByCharacter(item.field, finalValue);
+            // Cut to the box's limit first (maxlength / stated limit), and
+            // again after typing if the page only states it then.
+            let fittedValue = fitTextToLimit(finalValue, characterLimitFor(item.field));
+            typeCharacterByCharacter(item.field, fittedValue);
             // Only report success once the box actually holds the text — a
             // controlled React textarea can drop typed input, and the
             // sidebar used to say "filled" regardless.
             await new Promise((resolve) => setTimeout(resolve, 200));
-            if ((item.field.value || "").trim() !== finalValue.trim()) {
-              setNativeValue(item.field, finalValue);
+            if ((item.field.value || "").trim() !== fittedValue.trim()) {
+              setNativeValue(item.field, fittedValue);
               await new Promise((resolve) => setTimeout(resolve, 200));
             }
-            if ((item.field.value || "").trim() === finalValue.trim()) {
-              recordResult("filled", item.questionText, `${finalValue} (AI-answered from resume, reviewed)`);
+            if ((item.field.value || "").trim() === fittedValue.trim()) fittedValue = await enforceCharacterLimit(item.field);
+            if ((item.field.value || "").trim() && (item.field.value || "").trim() === fittedValue.trim()) {
+              recordResult("filled", item.questionText, `${fittedValue} (AI-answered from resume, reviewed)`);
             } else {
               recordResult("skipped", item.questionText, "The page didn't keep the answer — please type or paste it in directly");
             }
@@ -8812,7 +9530,19 @@
             // report "filled" unconditionally regardless of whether the
             // value actually stuck — setNativeValue already returns whether
             // it did (see its own comment), so use that instead of assuming.
-            const filled = setNativeValue(item.field, finalValue);
+            let filled = setNativeValue(item.field, finalValue);
+            // Confirmed real (Bose's Workday compensation box): the value read
+            // back fine right after the set, then the page cleared it — the
+            // sidebar said filled, the box was empty. Look again a moment
+            // later; if it was wiped, type it like a person and check again.
+            if (filled) {
+              await new Promise((resolve) => setTimeout(resolve, 400));
+              if (!(item.field.value || "").trim()) {
+                typeCharacterByCharacter(item.field, finalValue);
+                await new Promise((resolve) => setTimeout(resolve, 400));
+                filled = (item.field.value || "").trim() === finalValue.trim();
+              }
+            }
             recordResult(filled ? "filled" : "skipped", item.questionText, filled ? `${finalValue} (AI-answered from resume, reviewed)` : `Couldn't confirm "${finalValue}" was actually accepted — please check and fill directly`);
           }
         });
@@ -9259,7 +9989,7 @@
   // app's Apply button, so init() had no handoff to find.
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type === "TRIGGER_FILL") {
-      scanAndFill(document);
+      manualFill(document);
       sendResponse({ ok: true });
     } else if (message?.type === "FILL_FOR_CANDIDATE" && message.candidateId) {
       // jobId/resumeVersionId are optional — when the popup's picker also

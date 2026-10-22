@@ -447,6 +447,16 @@
         "armed forces",
       ],
     },
+    // User's rule (2026-10-22): candidates are on visas, and an active US
+    // security clearance needs citizenship — "Current Active Clearance
+    // Level" / "Do you hold an active security clearance?" answer No / the
+    // "None" option. "Able/willing to OBTAIN one" is a different question
+    // and stays with the user.
+    {
+      key: "activeClearance",
+      patterns: ["active clearance", "active security clearance", "current security clearance", "currently hold a security clearance", "hold a security clearance", "clearance level", "security clearance", "public trust"],
+      excludePatterns: ["obtain", "able to get", "eligible", "willing to", "ability to", "apply for", "be granted", "qualify for", "able to acquire", "able to receive"],
+    },
     {
       key: "workedHereBefore",
       patterns: [
@@ -503,6 +513,15 @@
   // Shared matcher used everywhere RADIO_MATCHERS is consulted — a single
   // place to apply excludePatterns rather than repeating the same
   // find/some/some logic at every call site.
+  // The "no clearance" choice in a clearance-level list: "None - No
+  // Currently Active Clearances", "No active clearance", "N/A", "Not
+  // applicable", "I do not hold a clearance". Never an "Active ..." option.
+  function pickNoClearanceOption(optionTexts) {
+    const real = optionTexts.filter((t) => normalize(t) && !PLACEHOLDER_OPTION_TEXT.test(normalize(t)));
+    const isNone = (t) => /^(none|no)\b|\bno (currently )?active\b|\bno clearance|\bnot applicable\b|^n a$|\bdo not (hold|have)\b|\bdon t (hold|have)\b/.test(normalize(t));
+    return real.find((t) => /^none\b/.test(normalize(t))) || real.find(isNone) || null;
+  }
+
   function matchRadioQuestion(questionText) {
     return RADIO_MATCHERS.find(
       (m) =>
@@ -881,7 +900,11 @@
       normalizedQuestionText.includes("learned about") ||
       normalizedQuestionText.includes("learn about us") ||
       normalizedQuestionText.includes("where have you heard") ||
-      normalizedQuestionText.includes("where did you learn")
+      normalizedQuestionText.includes("where did you learn") ||
+      // Confirmed real (Precision Solutions' iCIMS "General Source*": Job
+      // Board - LinkedIn / ... / Career Site). A bare SHORT "...source"
+      // label only — never a sentence that merely mentions a source.
+      /^(general|applicant|candidate|lead|recruitment|recruiting|job|hiring)? ?source( channel)?$/.test(normalizedQuestionText.trim())
     );
   }
 
@@ -1438,6 +1461,67 @@
       ) || null;
     const segments = { month: byLabel("month"), day: byLabel("day"), year: byLabel("year") };
     return segments.month && segments.year ? segments : null;
+  }
+
+  // A date split across sibling controls sharing an id prefix: "<p>_Month",
+  // "<p>_Date"/"<p>_Day", "<p>_Year" (iCIMS). Month and Year must exist.
+  const offeredSplitDates = new Set();
+  function splitDateParts(field) {
+    const match = (field.id || "").match(/^(.+)_(Month|Date|Day|Year)$/);
+    if (!match) return null;
+    const get = (suffix) => document.getElementById(`${match[1]}_${suffix}`);
+    const month = get("Month");
+    const year = get("Year");
+    if (!month || !year) return null;
+    return { prefix: match[1], month, day: get("Date") || get("Day"), year };
+  }
+
+  // The question a split date answers: the nearest ancestor (kept small, so
+  // it can't swallow a neighbouring question) whose own text reads as more
+  // than the parts' "Month"/"Day"/"Year" labels.
+  function splitDateQuestionText(parts) {
+    let node = parts.month.parentElement;
+    for (let i = 0; i < 6 && node; i++) {
+      if ([parts.day, parts.year].every((p) => !p || node.contains(p))) {
+        const text = (node.innerText || "").trim();
+        if (text.length > 600) return "";
+        if (/[a-z]{4,}/i.test(text.replace(/\b(month|day|year|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b/gi, ""))) return text;
+      }
+      node = node.parentElement;
+    }
+    return "";
+  }
+
+  // Picks each part: a <select> by its option text (Jan / January / 10 /
+  // 2026), a text box by typing. Returns whether every part took.
+  async function fillSplitDate(parts, date) {
+    const SHORT = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+    const m = date.getMonth();
+    const wanted = [
+      [parts.month, (t) => t.startsWith(SHORT[m]) || Number(t) === m + 1],
+      [parts.day, (t) => Number(t) === date.getDate()],
+      [parts.year, (t) => Number(t) === date.getFullYear()],
+    ];
+    let ok = true;
+    for (const [el, matches] of wanted) {
+      if (!el) continue;
+      if (el.tagName === "SELECT") {
+        const option = [...el.options].find((o) => normalize(o.textContent) && matches(normalize(o.textContent)));
+        if (!option) {
+          ok = false;
+          continue;
+        }
+        el.value = option.value;
+        el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+        ok = ok && el.value === option.value;
+      } else {
+        const value = el === parts.year ? String(date.getFullYear()) : el === parts.day ? String(date.getDate()) : String(m + 1);
+        ok = setNativeValue(el, value) && ok;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 80));
+    }
+    return ok;
   }
 
   // Types each Month/Day/Year spinbutton its own part. Confirmed real (Bose's
@@ -3455,6 +3539,36 @@
     }
     attemptedFieldElements.set(signature, field);
 
+    // Confirmed real (Precision Solutions' iCIMS "Availability to Start Date
+    // (Month / Day / Year)"): Month and Day are <select>s labelled just
+    // "Month"/"Day" and Year a text box (ids rcf2120_Month/_Date/_Year), so
+    // the start-date suggestion — keyed off the QUESTION text — never saw
+    // the question and nothing was offered. Recognized by the shared id
+    // prefix; only a start-date question takes this path, any other split
+    // date continues below exactly as before.
+    const splitDate = splitDateParts(field);
+    if (splitDate && !isInsideEducationOrExperienceSection(field)) {
+      const question = splitDateQuestionText(splitDate);
+      if (question && isStartDateQuestion(normalize(question))) {
+        for (const part of [splitDate.month, splitDate.day, splitDate.year]) {
+          if (!part) continue;
+          attemptedSignatures.add(fieldSignature(part));
+          queuedFieldSignatures.add(fieldSignature(part));
+        }
+        if (offeredSplitDates.has(splitDate.prefix)) return;
+        offeredSplitDates.add(splitDate.prefix);
+        const now = new Date();
+        const shown = `${String(now.getMonth() + 1).padStart(2, "0")}/${String(now.getDate()).padStart(2, "0")}/${now.getFullYear()}`;
+        const label = question.split("\n")[0].trim().slice(0, 120);
+        renderStoredValueSuggestion(label, `${shown} (today)`, async () => {
+          const ok = await fillSplitDate(splitDate, now);
+          recordResult(ok ? "filled" : "skipped", label, ok ? `${shown} (today's date, reviewed)` : "Couldn't enter the date correctly — please set it manually");
+        });
+        recordResult("skipped", label, "Suggested today's date — review above and click Insert, or set an exact date directly");
+        return;
+      }
+    }
+
     // Confirmed real (BambooHR's Fabric UI widget — Gender/Ethnicity/
     // Disability/State/Country selects all use this shape): the actual
     // interactive control is a <button aria-haspopup="true"> that opens a
@@ -4395,7 +4509,7 @@
 
     // Disclosure questions where "No" is the answer for virtually every
     // candidate — a fixed default, not derived from profile data.
-    if (key === "relativeEmployedHere" || key === "governmentEmployment") return false;
+    if (key === "relativeEmployedHere" || key === "governmentEmployment" || key === "activeClearance") return false;
 
     // Categories the AI classifier (Backend's classify-fields) assigns to a
     // yes/no question no fixed matcher above recognized — see
@@ -4531,6 +4645,31 @@
       return true;
     }
 
+    // Confirmed real (Precision Solutions' iCIMS EEO page): a select labelled
+    // just "Veteran" (No / Yes / Opt Out) — the sensitive-question patterns
+    // want "veteran status"/"protected veteran", so it fell through every
+    // branch and was silently skipped. Same saved-answer pick (default: not
+    // a protected veteran) and same review card as Disability above.
+    if (isVeteranQuestion(questionText) && !isSensitiveSelfIdQuestion(questionText)) {
+      const optionTexts = Array.from(field.options).map((o) => o.textContent.trim()).filter(Boolean);
+      const suggestion = bestVeteranOptionText(optionTexts);
+      console.log("[AskJobs] veteran select — saved:", eeoVeteranStatusText(), "options:", optionTexts, "-> pick:", suggestion);
+      if (suggestion) {
+        renderStoredValueSuggestion(fieldLabel, suggestion, () => {
+          const option = Array.from(field.options).find((o) => o.textContent.trim() === suggestion);
+          if (option) {
+            field.value = option.value;
+            field.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+            recordResult("filled", fieldLabel, `${suggestion} (from the candidate's EEO profile, reviewed)`);
+          }
+        });
+        recordResult("skipped", fieldLabel, "Suggested from the candidate's EEO profile — review above and click Insert");
+      } else {
+        recordResult("skipped", fieldLabel, "Veteran question — no matching option for the saved answer, please answer directly");
+      }
+      return true;
+    }
+
     if (isSensitiveSelfIdQuestion(questionText)) {
       const stored = sensitiveSelfIdSingleValue(questionText);
       const optionTexts = Array.from(field.options).map((o) => o.textContent.trim()).filter(Boolean);
@@ -4588,11 +4727,27 @@
     }
 
     const wantedText = answer ? "yes" : "no";
+    // A clearance-LEVEL list ("Active Secret ... / None - No Currently
+    // Active Clearances") has no Yes/No — its "None" option is the No.
+    const clearancePick = matcher.key === "activeClearance" ? pickNoClearanceOption(Array.from(field.options).map((o) => o.textContent)) : null;
     const option = Array.from(field.options).find((o) => {
       const label = normalize(o.textContent);
+      if (clearancePick) return o.textContent === clearancePick;
       return label === wantedText || label.startsWith(wantedText);
     });
     if (!option) {
+      // Confirmed real (Precision Solutions' iCIMS "Willing to Relocate?"):
+      // the hidden <select> holds only an empty option — Yes/No live in
+      // iCIMS's own dropdown widget next to it. Pick there instead.
+      if (isIcimsCustomDropdown(field)) {
+        const widgetTexts = [...document.querySelectorAll(`#${CSS.escape(field.id)}_dropdown-results li`)].map((li) => li.textContent.trim());
+        const widgetPick = matcher.key === "activeClearance" ? pickNoClearanceOption(widgetTexts) : answer ? "Yes" : "No";
+        if (widgetPick && (await fillIcimsCustomDropdown(field, widgetPick, fieldLabel))) {
+          attemptedSignatures.add(signature);
+          recordResult("filled", fieldLabel, widgetPick);
+          return true;
+        }
+      }
       recordResult("skipped", fieldLabel, "Couldn't find a matching Yes/No option");
       return true;
     }
@@ -7792,6 +7947,28 @@
           filled = (await fillCustomCombobox(button, visaPick, fieldLabel)) || (await pickComboboxOptionDirect(button, visaPick));
           filledWith = visaPick;
         }
+      }
+      // A clearance-level list has no Yes/No — pick its "None" option.
+      if (!filled && matcher.key === "activeClearance") {
+        dismissOpenCombobox(button);
+        const options = await gatherComboboxOptions(button);
+        const nonePick = pickNoClearanceOption(options);
+        console.log("[AskJobs] active clearance has no Yes/No — options:", options, "-> pick:", nonePick);
+        if (nonePick) {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          filled = (await fillCustomCombobox(button, nonePick, fieldLabel)) || (await pickComboboxOptionDirect(button, nonePick));
+          filledWith = nonePick;
+        }
+      }
+      // iCIMS's own dropdown widget (<a class="dropdown-select"> beside a
+      // hidden <select>) — same fallback as fillScreeningSelect's.
+      if (!filled && button.matches?.('a.dropdown-select[role="combobox"]') && button.previousElementSibling?.tagName === "SELECT") {
+        const select = button.previousElementSibling;
+        if (matcher.key === "activeClearance") {
+          const widgetTexts = [...document.querySelectorAll(`#${CSS.escape(select.id)}_dropdown-results li`)].map((li) => li.textContent.trim());
+          filledWith = pickNoClearanceOption(widgetTexts) || filledWith;
+        }
+        filled = await fillIcimsCustomDropdown(select, filledWith, fieldLabel);
       }
       console.log("[AskJobs] generic combobox", filled ? "filled" : "fill failed", ":", fieldLabel, "->", filledWith);
       recordResult(filled ? "filled" : "skipped", fieldLabel, filled ? filledWith : `Couldn't find a matching option for "${wantedText}"`);

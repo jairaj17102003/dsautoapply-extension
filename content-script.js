@@ -523,11 +523,26 @@
   }
 
   function matchRadioQuestion(questionText) {
-    return RADIO_MATCHERS.find(
-      (m) =>
-        m.patterns.some((p) => questionText.includes(p)) &&
-        !(m.excludePatterns || []).some((p) => questionText.includes(p))
-    );
+    const matches = (m) =>
+      m.patterns.some((p) => questionText.includes(p)) &&
+      !(m.excludePatterns || []).some((p) => questionText.includes(p));
+    // "...authorized to work ... without (requiring) sponsorship...?" asks
+    // the REVERSE of the sponsorship question — answered by
+    // radioAnswerForKey("authorizedWithoutSponsorship").
+    if (/\bwithout (the need for |needing |requiring |requiring the |any )?(visa |employer |employment |company )?sponsor/.test(questionText) && /\b(authori[sz]ed|eligible|legally|able|permitted|right) to work\b|\bwork authori[sz]ation\b/.test(questionText)) {
+      return { key: "authorizedWithoutSponsorship", patterns: [] };
+    }
+    const found = RADIO_MATCHERS.find(matches);
+    // Confirmed real (Seagate's SAP SuccessFactors): "Do you now or in the
+    // future require sponsorship ... or any other type of work
+    // authorization to work in the US?" matched workAuthorized ("work
+    // authorization") first and got "Yes". A question that asks about
+    // SPONSORSHIP is the sponsorship question, whatever else it mentions.
+    if (found?.key === "workAuthorized" && /\bsponsor/.test(questionText)) {
+      const sponsorship = RADIO_MATCHERS.find((m) => m.key === "visaSponsorshipNeeded");
+      if (sponsorship && matches(sponsorship)) return sponsorship;
+    }
+    return found;
   }
 
   // Voluntary demographic self-identification questions (EEO/diversity
@@ -890,6 +905,11 @@
     if (/\b(if you selected|additional details|please share|please explain)\b/.test(normalizedQuestionText)) return false;
     return (
       normalizedQuestionText.includes("how did you hear") ||
+      // Confirmed real (Zipline's Greenhouse form): "Tell us how you heard
+      // about Zipline and this job!"
+      normalizedQuestionText.includes("how you heard") ||
+      normalizedQuestionText.includes("how you found") ||
+      normalizedQuestionText.includes("how you learned about") ||
       normalizedQuestionText.includes("where did you hear") ||
       normalizedQuestionText.includes("how did you find out") ||
       normalizedQuestionText.includes("how did you learn about") ||
@@ -1191,6 +1211,9 @@
   function bestVeteranOptionText(optionTexts) {
     const stored = normalize(eeoVeteranStatusText() || "");
     const n = (t) => normalize(t);
+    // Confirmed real (Seagate's SAP SuccessFactors): the placeholder "No
+    // Selection" matched "^no" and got picked as the answer.
+    optionTexts = optionTexts.filter((t) => !/^no selection$|^none selected$|^select( one)?$/.test(n(t)));
     if (stored === "no") {
       return optionTexts.find((t) => /\bnot\b.*\bveteran\b|^no\b|\bnot a veteran\b/.test(n(t)) && !/\b(decline|don t wish|do not wish|prefer not)\b/.test(n(t))) || null;
     }
@@ -2981,8 +3004,151 @@
   // label, not prose that happens to mention the word), say so plainly and
   // point at the manual-download fallback already built for this exact
   // "couldn't auto-attach" case.
+  // Confirmed real (Seagate's SAP SuccessFactors "My Documents"): "Upload a
+  // Resume" / "Attach a Cover Letter" are tiles with no file input until
+  // one is clicked — the click opens a small "Select a source for your file
+  // upload" callout (role="dialog") holding a real <input type="file"
+  // class="fileUpload"> under "Upload from Device". Click the tile (then its
+  // "+" if that alone didn't open it), wait for that input, attach to it.
+  // Returns the attach function's result, or null when there's no tile or
+  // the callout never offered an input.
+  async function attachViaUploadTile(tileText, attach) {
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const label = deepQueryAll(document, "div, span, a, button, h3, h4, p")
+      .filter((el) => isVisible(el) && tileText.test(normalize(el.textContent || "")) && normalize(el.textContent || "").length < 40)
+      .sort((a, b) => (a.textContent || "").length - (b.textContent || "").length)[0];
+    if (!label) return null;
+    const before = new Set(deepQueryAll(document, 'input[type="file"]'));
+    const findNewInput = () =>
+      deepQueryAll(document, 'input[type="file"]').find((i) => !before.has(i) && i.closest('[role="dialog"]')) ||
+      deepQueryAll(document, 'input[type="file"]').find((i) => !before.has(i));
+    // The tile's own card: the nearest ancestor that also holds a separate
+    // clickable control (the "+" bar under the title).
+    // Confirmed real (Seagate): the first role="button" in the tile is a
+    // HIDDEN "download" label — the one that opens the callout is the
+    // visible "+" icon (<span role="button" class="... glyphicon-plus-sign
+    // addAttachments">). Visible controls only, the "+"/add icon first.
+    let card = label;
+    const controlsIn = (node) => [...node.querySelectorAll('button, [role="button"], a[href], [tabindex="0"]')].filter((el) => el !== label && isVisible(el));
+    for (let i = 0; i < 4 && card.parentElement; i++) {
+      card = card.parentElement;
+      if (controlsIn(card).length) break;
+    }
+    const controls = controlsIn(card);
+    const addIcon = controls.find((el) => /\b(add|plus)/i.test(`${el.className} ${el.getAttribute("aria-label") || ""} ${el.id}`)) || controls[0];
+    const targets = [addIcon, label].filter(Boolean);
+    for (const target of targets) {
+      for (const type of ["mousedown", "mouseup", "click"]) {
+        target.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true, view: window }));
+      }
+      for (let i = 0; i < 15; i++) {
+        await sleep(150);
+        const input = findNewInput();
+        if (input) {
+          console.log("[AskJobs] upload tile opened a file input:", normalize(label.textContent));
+          return attach(input);
+        }
+      }
+    }
+    console.log("[AskJobs] upload tile found but no file input appeared after clicking:", normalize(label.textContent));
+    return null;
+  }
+
+  // Confirmed real (Seagate's SAP SuccessFactors, tested live): uploading
+  // through the tile makes SAP parse the résumé and RELOAD the page,
+  // rebuilding the form from the parse — everything filled before it is
+  // lost. So tiles are uploaded FIRST, one per page load, before any
+  // filling; after the reload the tile shows the file name instead of
+  // "Upload a Resume", so it isn't uploaded again and the next tile (or the
+  // fill itself) goes ahead. A per-tab cap guards against a site that keeps
+  // the tile empty and reloads anyway.
+  const RESUME_TILE_TEXT = /^(upload|attach|add) (a |your )?(resume|cv|resume cv)$/;
+  const COVER_TILE_TEXT = /^(upload|attach|add) (a |your )?cover letter$/;
+  const TILE_UPLOAD_CAP_KEY = `askjobs-tile-uploads:${location.hostname}`;
+  function tileUploadsSoFar() {
+    try {
+      return Number(sessionStorage.getItem(TILE_UPLOAD_CAP_KEY) || 0);
+    } catch {
+      return 0;
+    }
+  }
+  function countTileUpload() {
+    try {
+      sessionStorage.setItem(TILE_UPLOAD_CAP_KEY, String(tileUploadsSoFar() + 1));
+    } catch {
+      // Storage blocked — the in-memory one-per-load guard still applies.
+    }
+  }
+
+  let uploadTilesTried = false;
+  // Uploads at most ONE waiting tile (résumé first, then cover letter).
+  // Returns true when something was attached — the caller then waits for
+  // the site's reload instead of filling a form that's about to be rebuilt.
+  async function tryUploadTiles() {
+    if (uploadTilesTried) return false;
+    uploadTilesTried = true;
+    if (tileUploadsSoFar() >= 4) {
+      console.log("[AskJobs] upload tiles: already uploaded", tileUploadsSoFar(), "times in this tab — not uploading again");
+      return false;
+    }
+    const resumeResult = await attachViaUploadTile(RESUME_TILE_TEXT, attachResumeFile);
+    if (resumeResult) {
+      const attached = !!resumeResult.attached;
+      recordResult(attached ? "filled" : "skipped", "Resume/CV", attached ? "Attached (through the Upload a Resume tile)" : "Opened the upload, but the site refused the file — use the download link below");
+      if (attached) {
+        resumeFileInputFound = true;
+        countTileUpload();
+        return true;
+      }
+    }
+    const coverResult = await attachViaUploadTile(COVER_TILE_TEXT, attachCoverLetterFile);
+    if (coverResult) {
+      recordResult(coverResult.attached ? "filled" : "skipped", "Cover letter", coverResult.attached ? "Attached (through the Attach a Cover Letter tile)" : coverResult.reason || "Couldn't attach — attach manually");
+      if (coverResult.attached) {
+        countTileUpload();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Run at the START of a fill pass: upload any waiting tile, then give the
+  // site time to parse/reload before filling. If it doesn't reload, the
+  // pass simply carries on after the wait.
+  let tileWaitDone = false;
+  async function uploadTilesBeforeFilling() {
+    const findTile = () =>
+      deepQueryAll(document, "div, span, a, button")
+        .some((el) => isVisible(el) && (RESUME_TILE_TEXT.test(normalize(el.textContent || "")) || COVER_TILE_TEXT.test(normalize(el.textContent || ""))));
+    let hasTile = findTile();
+    // Confirmed real (Seagate, after the résumé upload's reload): the fill
+    // started before SAP had drawn "My Documents" again, saw no "Attach a
+    // Cover Letter" tile, and moved on — the cover letter was never tried.
+    // On a page built from SAP's attachment tiles, wait for them first.
+    const usesTiles = !!document.querySelector('.attachmentBtn, [id$="_attachIcon"], .addAttachments') || /sapsf|successfactors/i.test(location.hostname);
+    // Once per page load — after both files are in, no tile is left to find
+    // and later passes mustn't each wait for nothing.
+    if (!hasTile && usesTiles && !tileWaitDone) {
+      tileWaitDone = true;
+      for (let i = 0; !hasTile && i < 16; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        hasTile = findTile();
+      }
+      console.log("[AskJobs] upload tiles: waited for SAP's tiles — waiting tile found?", hasTile);
+    }
+    if (!hasTile || !(await tryUploadTiles())) return;
+    showAiStatus("Uploaded a file — waiting for the site to read it before filling…");
+    console.log("[AskJobs] upload tile attached — waiting for the site to parse/reload before filling");
+    await new Promise((resolve) => setTimeout(resolve, 10000));
+    showAiStatus("");
+  }
+
   async function flagUnreachableResumeUploadIfNeeded() {
     if (resumeFileInputFound || resumeUploadFallbackShown) return;
+    if (await tryUploadTiles()) return;
+    // Uploaded through a tile on an earlier load of this page (the site
+    // reloaded after it) — not an unreachable upload.
+    if (tileUploadsSoFar() > 0) return;
     const candidates = deepQueryAll(document, "label, h1, h2, h3, h4, h5, h6, legend");
     const hasResumeLabel = candidates.some((el) => {
       const text = normalize(el.textContent || "");
@@ -3766,6 +3932,14 @@
       // A plain text box asking "How did you hear about us?" — no option
       // list to choose from, so LinkedIn is the fixed answer.
       if (field.tagName !== "SELECT" && isReferralSourceQuestion(normalize(fieldLabel))) {
+        // Confirmed real (Seagate's SAP SuccessFactors): the box is a
+        // dropdown's own <input role="combobox"> — typing "LinkedIn" into it
+        // selected nothing, and marking it attempted here kept the dropdown
+        // scan (which picks LinkedIn from the real options) from ever trying.
+        if (!isMultiselectSearchBox(field) && isComboboxField(field)) {
+          console.log("[AskJobs] referral source is a dropdown — leaving it to the dropdown scan:", fieldLabel);
+          return;
+        }
         attemptedSignatures.add(signature);
         // Confirmed real (Carrier's Workday): "How Did You Hear About Us?" is
         // a prompt search box, not free text — typing "LinkedIn" only ran a
@@ -3802,7 +3976,10 @@
       // which either need combobox-specific handling (dates) or already
       // have their own dedicated, safer path (location's bare-word risk is
       // handled in classify() itself, not needed again here).
-      if (field.tagName !== "SELECT") {
+      // Confirmed real (Seagate's SAP SuccessFactors): "Were you referred for
+      // this position?" matched title's "position" and got the job title
+      // typed in. A question ("?") is never a job-title/company box.
+      if (field.tagName !== "SELECT" && !fieldLabel.includes("?")) {
         const rawExperienceKey = classifyStructured(field, EXPERIENCE_FIELD_MATCHERS);
         const experienceKey = ["title", "company"].includes(rawExperienceKey) ? rawExperienceKey : null;
         if (experienceKey) {
@@ -4053,7 +4230,17 @@
       return;
     }
     if (isComboboxField(field)) {
-      const filled = await fillCustomCombobox(field, value, fieldLabel);
+      let filled = await fillCustomCombobox(field, value, fieldLabel);
+      // Confirmed real (Seagate's SAP SuccessFactors "Employer Country"): the
+      // first try read ANOTHER dropdown's still-open 3-option list, then a
+      // 100-country page without "United States" (SAP pages long lists until
+      // you type). Close whatever is open and retry once, typing the search.
+      if (!filled) {
+        dismissOpenCombobox(field);
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        filled = await fillCustomCombobox(field, value, fieldLabel, searchPrefixFor(value));
+        if (filled) console.log("[AskJobs] combobox filled on the retry (closed the open list, typed the search):", fieldLabel, "->", value);
+      }
       attemptedSignatures.add(signature);
       recordResult(filled ? "filled" : "skipped", fieldLabel, filled ? value : "Couldn't find a matching option");
       return;
@@ -4267,6 +4454,8 @@
     setBusy("fill", true);
     try {
       resetFillStateIfNewContext(deepQueryAll(root, "input, select, textarea, button"));
+      // SAP-style upload tiles go first — see uploadTilesBeforeFilling.
+      await uploadTilesBeforeFilling();
 
       // Runs before the generic per-field loop below so that, by the time it
       // reaches an education/experience field, it already has a value and is
@@ -4302,6 +4491,7 @@
       await scanAndFillRadioGroups(root);
       await scanAndFillCheckboxGroups(root);
       await scanAndFillExperienceDatePickers(root);
+      await scanAndFillUi5DatePickers();
       await scanAndFillGenericComboboxes(root);
       await scanAndFillButtonToggleGroups(root);
       await runClassificationPass();
@@ -4533,6 +4723,14 @@
       return typeof v === "boolean" ? v : true;
     }
 
+    // "Are you authorized to work ... WITHOUT sponsorship (now / in the
+    // future)?" — confirmed real (Zipline's Greenhouse form): the reverse of
+    // "do you need sponsorship?". Yes only when no sponsorship is needed;
+    // with nothing saved, the needs-sponsorship default (Yes) makes it No.
+    if (key === "authorizedWithoutSponsorship") {
+      const needs = radioAnswerForKey("visaSponsorshipNeeded", questionText);
+      return needs === null ? null : !needs;
+    }
     if (key === "visaSponsorshipNeeded" || key === "willingToRelocate") {
       const v = prefs[key];
       if (typeof v === "boolean") return v;
@@ -4655,15 +4853,14 @@
       const suggestion = bestVeteranOptionText(optionTexts);
       console.log("[AskJobs] veteran select — saved:", eeoVeteranStatusText(), "options:", optionTexts, "-> pick:", suggestion);
       if (suggestion) {
-        renderStoredValueSuggestion(fieldLabel, suggestion, () => {
-          const option = Array.from(field.options).find((o) => o.textContent.trim() === suggestion);
-          if (option) {
-            field.value = option.value;
-            field.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-            recordResult("filled", fieldLabel, `${suggestion} (from the candidate's EEO profile, reviewed)`);
-          }
-        });
-        recordResult("skipped", fieldLabel, "Suggested from the candidate's EEO profile — review above and click Insert");
+        // Filled directly — same standing rule as the dropdown version.
+        const option = Array.from(field.options).find((o) => o.textContent.trim() === suggestion);
+        if (option) {
+          field.value = option.value;
+          field.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+          attemptedSignatures.add(signature);
+          recordResult("filled", fieldLabel, `${suggestion} (from the candidate's EEO profile)`);
+        }
       } else {
         recordResult("skipped", fieldLabel, "Veteran question — no matching option for the saved answer, please answer directly");
       }
@@ -4881,7 +5078,10 @@
 
   const EXPERIENCE_FIELD_MATCHERS = [
     { key: "title", patterns: ["job title", "position", "role title", "title"] },
-    { key: "company", patterns: ["company", "employer", "organization"] },
+    // excludePatterns: confirmed real (Seagate's SAP SuccessFactors) —
+    // "Employer Country" / "Employer State" matched "employer" and searched
+    // their country/state lists for "Microsoft".
+    { key: "company", patterns: ["company", "employer", "organization"], excludePatterns: ["country", "state", "city", "province", "address", "phone", "type of business", "industry"] },
     { key: "location", patterns: ["location", "city"] },
     { key: "startDate", patterns: ["from", "start date", "started"] },
     { key: "endDate", patterns: ["to", "end date", "ended"] },
@@ -6889,6 +7089,73 @@
   // in our schema, only graduationYear) are left untouched — not marked
   // attempted — so they remain visible to the classify-fields/AI-fill
   // fallbacks instead of being silently locked out.
+  // A job entry's own dropdowns that no saved field answers directly —
+  // confirmed real (Seagate's SAP SuccessFactors Previous Employment:
+  // "Employment Type", "Type of Business", "Employer Country", "Employer
+  // State" were all "not recognized", and the AI pass had no value to match
+  // them against). Derived from the entry itself: employment type from the
+  // title (default Full-time), country/state from its location ("Redmond,
+  // WA"), and the business type left to the AI's pick among the REAL
+  // options, given the company and title.
+  const US_STATE_NAMES = {
+    AL: "Alabama", AK: "Alaska", AZ: "Arizona", AR: "Arkansas", CA: "California", CO: "Colorado", CT: "Connecticut", DE: "Delaware",
+    DC: "District of Columbia", FL: "Florida", GA: "Georgia", HI: "Hawaii", ID: "Idaho", IL: "Illinois", IN: "Indiana", IA: "Iowa",
+    KS: "Kansas", KY: "Kentucky", LA: "Louisiana", ME: "Maine", MD: "Maryland", MA: "Massachusetts", MI: "Michigan", MN: "Minnesota",
+    MS: "Mississippi", MO: "Missouri", MT: "Montana", NE: "Nebraska", NV: "Nevada", NH: "New Hampshire", NJ: "New Jersey",
+    NM: "New Mexico", NY: "New York", NC: "North Carolina", ND: "North Dakota", OH: "Ohio", OK: "Oklahoma", OR: "Oregon",
+    PA: "Pennsylvania", RI: "Rhode Island", SC: "South Carolina", SD: "South Dakota", TN: "Tennessee", TX: "Texas", UT: "Utah",
+    VT: "Vermont", VA: "Virginia", WA: "Washington", WV: "West Virginia", WI: "Wisconsin", WY: "Wyoming",
+  };
+  function usStateFromLocation(location) {
+    const parts = (location || "").split(",").map((p) => p.trim()).filter(Boolean);
+    for (const part of parts.reverse()) {
+      if (US_STATE_NAMES[part.toUpperCase()]) return US_STATE_NAMES[part.toUpperCase()];
+      const full = Object.values(US_STATE_NAMES).find((name) => normalize(name) === normalize(part));
+      if (full) return full;
+    }
+    return null;
+  }
+  function experienceDropdownTarget(fieldLabel, entry) {
+    if (!entry?.company) return null;
+    const label = normalize(fieldLabel);
+    const title = normalize(entry.title || "");
+    if (/\b(employment type|job type|type of employment|worker type|employee type|position type)\b/.test(label)) {
+      const value = /\bintern(ship)?\b/.test(title) ? "Internship" : /\bcontract(or)?\b/.test(title) ? "Contract" : /\bpart time\b/.test(title) ? "Part-time" : "Full-time";
+      return { value, ai: true };
+    }
+    if (/\b(type of business|business type|industry|sector)\b/.test(label)) {
+      return { value: `${entry.company}${entry.title ? ` (${entry.title})` : ""}`, ai: true };
+    }
+    const state = usStateFromLocation(entry.location);
+    if (/\b(employer|company|employment) country\b/.test(label) && state) return { value: "United States", ai: false };
+    if (/\b(employer|company|employment) (state|province)\b/.test(label) && state) return { value: state, ai: false };
+    return null;
+  }
+  async function fillExperienceDropdown(field, fieldLabel, target) {
+    const isSelect = field.tagName === "SELECT";
+    const optionTexts = isSelect ? Array.from(field.options).map((o) => o.textContent.trim()).filter(Boolean) : await gatherComboboxOptions(field);
+    let choice = target.value;
+    if (target.ai) {
+      const exact = optionTexts.find((t) => normalize(t) === normalize(target.value));
+      choice = exact || (await aiPickBestOption(fieldLabel, target.value, optionTexts.filter((t) => !PLACEHOLDER_OPTION_TEXT.test(normalize(t)) && !/^no selection$/.test(normalize(t)))));
+      if (!choice) return null;
+    }
+    if (isSelect) {
+      const option = Array.from(field.options).find((o) => normalize(o.textContent) === normalize(choice));
+      if (!option) return null;
+      field.value = option.value;
+      field.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      return choice;
+    }
+    dismissOpenCombobox(field);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const filled =
+      (await fillCustomCombobox(field, choice, fieldLabel)) ||
+      (await fillCustomCombobox(field, choice, fieldLabel, searchPrefixFor(choice))) ||
+      (await pickComboboxOptionDirect(field, choice));
+    return filled ? choice : null;
+  }
+
   async function fillStructuredSection(container, matchers, entryData) {
     if (!container || !entryData) return;
     // Confirmed real, serious bug via actual logs (Johns Hopkins APL's
@@ -6923,7 +7190,11 @@
       // it ever reached the dedicated checkbox-handling block right after
       // it, making that block permanently unreachable for any checkbox
       // with a non-empty default value (i.e. nearly all of them).
-      if (field.disabled || field.type === "hidden" || (field.type !== "checkbox" && field.value)) continue;
+      // A résumé parser's stand-in for "nothing found" ("UNSPECIFIED", "N/A",
+      // "Unknown" — confirmed real, SAP SuccessFactors' Company Name after
+      // the résumé upload) counts as empty here, so the saved value goes in.
+      const parserPlaceholder = /^(unspecified|unknown|n a|not applicable|no selection)$/.test(normalize(field.value || ""));
+      if (field.disabled || field.type === "hidden" || (field.type !== "checkbox" && field.value && !parserPlaceholder)) continue;
       const signature = fieldSignature(field);
       if (attemptedSignatures.has(signature)) continue;
 
@@ -6939,6 +7210,22 @@
       }
 
       const key = classifyStructured(field, matchers);
+      // The job this dropdown's own block names (SAP stacks several jobs in
+      // one container) — the scanned entry only when no Company box is
+      // found nearby; a block naming no saved job ("UNSPECIFIED") gets
+      // nothing that depends on the job.
+      let extraTarget = null;
+      if (!key && entryData?.company && (field.tagName === "SELECT" || isComboboxField(field))) {
+        const blockEntry = entryForBlock(field, "experience", profile?.experience || []);
+        extraTarget = experienceDropdownTarget(fieldLabel, blockEntry === undefined ? entryData : blockEntry);
+      }
+      if (extraTarget) {
+        attemptedSignatures.add(signature);
+        const picked = await fillExperienceDropdown(field, fieldLabel, extraTarget);
+        console.log("[AskJobs] job-entry dropdown:", fieldLabel, "-> target", extraTarget.value, "-> picked", picked);
+        recordResult(picked ? "filled" : "skipped", fieldLabel, picked ? `${picked}${extraTarget.ai ? " (picked from the options for this job)" : " (from this job's location)"}` : `Couldn't find an option for "${extraTarget.value}" — please choose directly`);
+        continue;
+      }
       if (!key) {
         console.log("[AskJobs] structured field not recognized:", fieldLabel);
         recordResult("skipped", fieldLabel, "Not recognized as a known field");
@@ -7051,6 +7338,13 @@
       // the generic <li> fallback below since it's a specific, reliable
       // signal wherever it applies.
       entryContainers = Array.from(container.querySelectorAll('[class*="iCIMS_CollectionContainer"]'));
+    }
+    if (entryContainers.length === 0) {
+      // SAP SuccessFactors: each job/school is its own
+      // ".rcmSectionComponent" block inside the section (confirmed real,
+      // Seagate — idea from studying how another autofill tool walks SAP's
+      // entries). Without this every entry's fields were treated as one.
+      entryContainers = Array.from(container.querySelectorAll(".rcmSectionComponent"));
     }
     if (entryContainers.length === 0) {
       // Breezy-style repeated entries: <ul><li ng-repeat="...">...</li></ul>,
@@ -7329,6 +7623,101 @@
       (c ? null : exps.find(titleMatches)) ||
       null
     );
+  }
+
+  // SAP SuccessFactors date fields — confirmed real (Seagate, actual HTML):
+  // "Start Date"/"End Date" are <ui5-date-picker-xweb-calendar-widget
+  // accessible-name="Start Date" format-pattern="MM/dd/yyyy"> web
+  // components whose real text box lives in a nested shadow root, so the
+  // input/select/textarea scans never saw them. Tested live: setting the
+  // component's own value plus change/input events shows the date. Each
+  // picker takes its entry's date (Education/Experience, in entry order),
+  // formatted to the picker's own pattern; a current job's End Date is left
+  // empty, like everywhere else.
+  const filledUi5DatePickers = new WeakSet();
+  function formatForPattern(iso, pattern) {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return null;
+    const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+    const dd = String(d.getUTCDate()).padStart(2, "0");
+    const yyyy = String(d.getUTCFullYear());
+    const p = (pattern || "MM/dd/yyyy").replace(/y+/i, "yyyy").replace(/M+/, "MM").replace(/d+/, "dd");
+    return p.replace("yyyy", yyyy).replace("MM", mm).replace("dd", dd);
+  }
+  // The saved job/school an element's own entry block names: walk up to the
+  // nearest ancestor holding exactly ONE Company Name / School box and match
+  // its shown value against the saved entries. Returns the entry, null when
+  // the block's name matches no saved entry (or is empty), or undefined when
+  // no name box was found at all (caller decides the fallback).
+  const ENTRY_NAME_FIELD = { experience: /\b(company|employer)\b/, education: /\b(school|university|college|institution)\b/ };
+  const ENTRY_NAME_KEY = { experience: "company", education: "institution" };
+  function entryForBlock(el, sectionKey, entries) {
+    let node = el.parentElement;
+    for (let depth = 0; depth < 10 && node && node !== document.body; depth++, node = node.parentElement) {
+      const nameBoxes = deepQueryAll(node, "input, [role='combobox']").filter(
+        (box) =>
+          ENTRY_NAME_FIELD[sectionKey].test(normalize(labelForField(box) || box.getAttribute("aria-label") || box.getAttribute("title") || "")) &&
+          !/\b(country|state|city|type|other)\b/.test(normalize(labelForField(box) || "")),
+      );
+      if (nameBoxes.length > 1) return undefined; // grew past this entry's block
+      if (nameBoxes.length === 1) {
+        const shown = normalize(nameBoxes[0].value || visibleText(nameBoxes[0]) || "");
+        if (!shown) return null;
+        return (
+          entries.find((e) => {
+            const saved = normalize(e[ENTRY_NAME_KEY[sectionKey]] || "");
+            return saved && (shown === saved || shown.includes(saved) || saved.includes(shown));
+          }) || null
+        );
+      }
+    }
+    return undefined;
+  }
+
+  async function scanAndFillUi5DatePickers() {
+    const all = deepQueryAll(document, "[ui5-date-picker]").filter((el) => /^ui5-date-picker/i.test(el.tagName));
+    if (!all.length) return;
+    // Confirmed real (Seagate, after SAP parsed the uploaded résumé): its
+    // entries aren't separate role="group"/<li> blocks, so every picker in
+    // the section was treated as entry 1 — each job's Start Date got the
+    // first job's date ("Start date must be before End date"). Each picker
+    // now belongs to the job/school named in its OWN block (the nearest
+    // ancestor holding one Company Name / School box); no match -> left
+    // alone rather than guessed.
+    const entryForPicker = (picker, sectionKey, entries) => entryForBlock(picker, sectionKey, entries) || null;
+    for (const [sectionKey, entries] of [["experience", profile?.experience || []], ["education", profile?.education || []]]) {
+      if (!entries.length) continue;
+      const container = findSectionContainer(sectionKey);
+      if (!container) continue;
+      {
+        for (const picker of all.filter((p) => container.contains(p))) {
+          const entry = entryForPicker(picker, sectionKey, entries);
+          if (!entry) {
+            if (!picker.value) console.log("[AskJobs] SAP date picker: no saved", sectionKey, "entry matches this block's name — left alone");
+            continue;
+          }
+          const i = entries.indexOf(entry);
+          if (filledUi5DatePickers.has(picker) || picker.value) continue;
+          const name = normalize(picker.getAttribute("accessible-name") || picker.getAttribute("title") || "");
+          const key = /\b(start|from|began|begin)\b/.test(name) ? "startDate" : /\b(end|to|finish|graduation|completion)\b/.test(name) ? "endDate" : null;
+          if (!key) continue;
+          filledUi5DatePickers.add(picker);
+          if (key === "endDate" && entry.current) continue;
+          const value = formatForPattern(entry[key], picker.getAttribute("format-pattern"));
+          if (!value) {
+            recordResult("skipped", picker.getAttribute("accessible-name") || key, `Recognized as "${key}" but no data on file`);
+            continue;
+          }
+          picker.value = value;
+          picker.dispatchEvent(new CustomEvent("change", { bubbles: true, composed: true, detail: { value, valid: true } }));
+          picker.dispatchEvent(new CustomEvent("input", { bubbles: true, composed: true, detail: { value } }));
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          const ok = picker.value === value;
+          console.log("[AskJobs] SAP date picker", sectionKey, i + 1, key, "->", value, ok ? "(set)" : "(didn't stick)");
+          recordResult(ok ? "filled" : "skipped", picker.getAttribute("accessible-name") || key, ok ? value : `Couldn't set "${value}" — please pick the date directly`);
+        }
+      }
+    }
   }
 
   async function scanAndFillExperienceDatePickers(root) {
@@ -7687,6 +8076,28 @@
         if (!filled) filled = await pickComboboxOptionDirect(button, choice);
         console.log("[AskJobs] generic combobox recognized as referral source ->", filled ? "filled" : "fill failed", choice, ":", fieldLabel);
         recordResult(filled ? "filled" : "skipped", fieldLabel, filled ? choice : `Couldn't select "${choice}"`);
+        continue;
+      }
+
+      // Confirmed real (Seagate's SAP SuccessFactors): a dropdown labelled
+      // just "Veteran" — "not recognized and label too short to queue".
+      // Same saved-answer pick (default: not a protected veteran) and review
+      // card as the plain-<select> version in fillScreeningSelect.
+      if (isVeteranQuestion(questionText) && !isSensitiveSelfIdQuestion(questionText)) {
+        attemptedSignatures.add(signature);
+        const options = await gatherComboboxOptions(button);
+        const choice = bestVeteranOptionText(options);
+        console.log("[AskJobs] generic combobox recognized as veteran — options:", options, "-> pick:", choice, ":", fieldLabel);
+        if (choice) {
+          // Filled directly, no review card — the user's standing rule:
+          // veteran defaults to "not a protected veteran", like disability.
+          dismissOpenCombobox(button);
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          const filled = (await fillCustomCombobox(button, choice, fieldLabel)) || (await pickComboboxOptionDirect(button, choice));
+          recordResult(filled ? "filled" : "skipped", fieldLabel, filled ? `${choice} (from the candidate's EEO profile)` : `Couldn't select "${choice}" — please choose it directly`);
+        } else {
+          recordResult("skipped", fieldLabel, "Veteran question — no matching option for the saved answer, please answer directly");
+        }
         continue;
       }
 
@@ -9252,7 +9663,12 @@
 
     items.forEach((item, i) => {
       refreshItemElements(item);
-      const key = classifications[i];
+      // The built-in screening rules win over the AI's category — confirmed
+      // real (Zipline's Greenhouse form): "authorized to work ... without
+      // sponsorship in the future?" was answered Yes by the rule, then the AI
+      // pass labelled it visaSponsorshipNeeded and overwrote it with No.
+      const localMatcher = item.questionText ? matchRadioQuestion(normalize(item.questionText)) : null;
+      const key = localMatcher && radioAnswerForKey(localMatcher.key, normalize(item.questionText)) !== null ? localMatcher.key : classifications[i];
       if (!key) {
         unresolved.push(item);
         return;
@@ -9304,11 +9720,17 @@
             // a school not in Workday's list, its own instructions say pick
             // "Other".
             const isSchool = /\b(school|university|college|institution)\b/.test(normalize(item.questionText));
-            const picked = await fillMultiselectSearch(item.field, [finalValue], item.questionText, { fallbackToOther: isSchool });
+            // Confirmed real (Caterpillar's Workday): an AI answer "+1" for
+            // "Country / Territory Phone Code" searched "+1" and picked the
+            // first hit, "Anguilla (+1)". A phone-code box always gets the
+            // candidate's phone country by NAME, never the AI's code.
+            const isPhoneCode = /country (\/ territory )?(phone )?code|phone country|dial(l)?ing code|calling code/i.test(item.questionText);
+            const searchValue = isPhoneCode ? countryForPhoneSelector() : finalValue;
+            const picked = await fillMultiselectSearch(item.field, [searchValue], item.questionText, { fallbackToOther: isSchool });
             recordResult(
               picked ? "filled" : "skipped",
               item.questionText,
-              picked ? `${finalValue} (AI-answered, picked from the list)` : `"${finalValue}" isn't in the list — please choose directly`,
+              picked ? `${searchValue} (${isPhoneCode ? "from the phone number" : "AI-answered"}, picked from the list)` : `"${searchValue}" isn't in the list — please choose directly`,
             );
           } else {
             // Confirmed real, serious (Mattel/SmartRecruiters): this used to
@@ -9696,11 +10118,17 @@
             // a school not in Workday's list, its own instructions say pick
             // "Other".
             const isSchool = /\b(school|university|college|institution)\b/.test(normalize(item.questionText));
-            const picked = await fillMultiselectSearch(item.field, [finalValue], item.questionText, { fallbackToOther: isSchool });
+            // Confirmed real (Caterpillar's Workday): an AI answer "+1" for
+            // "Country / Territory Phone Code" searched "+1" and picked the
+            // first hit, "Anguilla (+1)". A phone-code box always gets the
+            // candidate's phone country by NAME, never the AI's code.
+            const isPhoneCode = /country (\/ territory )?(phone )?code|phone country|dial(l)?ing code|calling code/i.test(item.questionText);
+            const searchValue = isPhoneCode ? countryForPhoneSelector() : finalValue;
+            const picked = await fillMultiselectSearch(item.field, [searchValue], item.questionText, { fallbackToOther: isSchool });
             recordResult(
               picked ? "filled" : "skipped",
               item.questionText,
-              picked ? `${finalValue} (AI-answered, picked from the list)` : `"${finalValue}" isn't in the list — please choose directly`,
+              picked ? `${searchValue} (${isPhoneCode ? "from the phone number" : "AI-answered"}, picked from the list)` : `"${searchValue}" isn't in the list — please choose directly`,
             );
           } else {
             // Confirmed real, serious (Mattel/SmartRecruiters): this used to

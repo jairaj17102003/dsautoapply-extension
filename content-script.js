@@ -109,6 +109,7 @@
       // them all and City + Postal Code got the street ("123 Main St").
       excludePatterns: [
         "email", "e mail", "web", "website", "ip", "url", "address line 2", "address line2", "addressline2", "address2", "line 2",
+        "address line 3", "address line3", "addressline3", "address3", "line 3",
         "city", "town", "postal", "postalcode", "postal code", "zip", "zipcode", "zip code", "postcode",
         "state", "province", "region", "county", "country", "countryregion",
       ],
@@ -286,6 +287,19 @@
   // overall question text), not per-individual-option, since "Yes"/"No"
   // alone carries no meaning without the question they're answering.
   const RADIO_MATCHERS = [
+    // Confirmed real (Alten Technology USA's Greenhouse): "By selecting YES,
+    // I consent to receive recruiting SMS messages from Alten Technology
+    // USA at the phone number provided on my job application" — always Yes
+    // (the user's rule). First, so no broader "consent" rule claims it.
+    // Spelled-out phrases only: a bare "sms" substring also sits inside
+    // words like "mechanisms".
+    {
+      key: "smsConsent",
+      patterns: [
+        "sms message", "sms messages", "recruiting sms", "receive sms", "via sms", "by sms", "sms notification", "sms notifications", "sms updates", "sms text",
+        "text message", "text messages", "text messaging", "receive texts", "receive text",
+      ],
+    },
     // Confirmed real (Analog Devices' Workday): "Are you currently enrolled
     // in an accredited degree program?" went to the AI, which answered Yes
     // for a graduated candidate. Answered from education end dates instead
@@ -1952,7 +1966,18 @@
     return ownText;
   }
 
+  // Confirmed real (Workable): an icon inside the label carries the SVG
+  // fallback "<desc><p>SVGs not supported by this browser.</p></desc>",
+  // read as part of the label — "*TitleSVGs not supported by this
+  // browser." no longer matched "title", so Title stayed empty. That
+  // fallback text is never part of a real label.
+  const SVG_FALLBACK_TEXT = /\s*SVGs? (are )?not supported by this browser\.?\s*/gi;
   function labelForField(field) {
+    const raw = labelForFieldRaw(field);
+    return raw ? raw.replace(SVG_FALLBACK_TEXT, " ").replace(/\s+/g, " ").trim() : raw;
+  }
+
+  function labelForFieldRaw(field) {
     // A custom ARIA radio (SmartRecruiters' <spl-radio label="Yes">) is its
     // own option label — climbing its shadow-host chain would return the
     // surrounding QUESTION's label instead.
@@ -1968,6 +1993,19 @@
     for (const el of shadowHostChain(field)) {
       const label = labelForOne(el);
       if (label?.trim()) return label;
+    }
+    // Confirmed real (Normal Computing's Ashby form): "How did you hear about
+    // this job?" is a <label> beside its type-to-search <input>, not tied to
+    // it by for/id — so the field read as its placeholder ("Start
+    // typing...") and the question was never recognized. Fall back to the
+    // one <label> in the nearest block that holds this field ALONE.
+    let node = field.parentElement;
+    for (let depth = 0; depth < 4 && node && node !== document.body; depth++, node = node.parentElement) {
+      const controls = node.querySelectorAll('input:not([type="hidden"]), select, textarea');
+      if (controls.length > 1) break;
+      const labels = node.querySelectorAll("label");
+      if (labels.length === 1 && labels[0].textContent.trim()) return labels[0].textContent.trim();
+      if (labels.length > 1) break;
     }
     return "";
   }
@@ -2104,6 +2142,35 @@
       if (hit && hit[1] !== "1") return hit[0];
     }
     return "United States";
+  }
+
+  // Confirmed real (ADP Workforce Now): a react-phone-number-input widget
+  // (<input class="PhoneInputInput"> beside <select name="phoneCountry">).
+  // The national digits typed alone read as an international number, so
+  // "9137455368" became India "+91 37…"; the widget's reformatting then
+  // failed the read-back and the retry appended a second copy. Pick the
+  // phone's country in the widget's own list first, then set the full
+  // "+<code><number>" once. null when it doesn't come out right.
+  async function fillReactPhoneInput(field) {
+    const country = countryForPhoneSelector();
+    const code = PHONE_DIAL_CODES[country] || "1";
+    const national = nationalPhoneDigits();
+    if (!national) return null;
+    const select = field.closest(".PhoneInput")?.querySelector("select");
+    const option = select && Array.from(select.options).find((o) => normalize(o.textContent) === normalize(country));
+    if (option && select.value !== option.value) {
+      Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set.call(select, option.value);
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+    field.focus();
+    setValue.call(field, `+${code}${national}`);
+    field.dispatchEvent(new Event("input", { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    field.blur();
+    field.dispatchEvent(new Event("blur", { bubbles: true }));
+    return field.value.replace(/\D/g, "") === code + national ? field.value : null;
   }
 
   // Just the national number ("8136040929"), for a phone field that sits
@@ -2413,6 +2480,127 @@
     return `${y.padStart(4, "0")}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
   }
 
+  // Confirmed real (Workable, a newly added job's Start date): the typed
+  // "01/2021" didn't stick, and focusing the box opened a react-datepicker
+  // MONTH picker with only a year heading ("2026") and ←/→ arrows — no year
+  // <select> like the one fillMonthPickerDate drives. Step the year with the
+  // arrows until the heading matches, then click the month. Only for an
+  // "MM/YYYY" value; false if the popup or the month isn't there.
+  async function pickFromYearHeaderMonthPicker(field, formattedValue) {
+    const parts = /^(\d{2})\/(\d{4})$/.exec(formattedValue);
+    if (!parts) return false;
+    const month = Number(parts[1]) - 1;
+    const year = Number(parts[2]);
+    field.focus();
+    field.click();
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    // The popup inside this box's own block (Workable renders it 5 levels
+    // up, beside the box) — the page-wide first one only as a fallback, so
+    // another box's popup is never the one driven.
+    // Confirmed real (Workable): Start and End sit side by side, so climbing
+    // far enough reached the row holding BOTH — the End date then drove
+    // the Start date's still-open popup and the fill hung. Stop at a block
+    // holding any other input; a page-wide popup is used only when it
+    // isn't another box's.
+    const ownPicker = () => {
+      let node = field.parentElement;
+      for (let depth = 0; depth < 7 && node && node !== document.body; depth++, node = node.parentElement) {
+        if (Array.from(node.querySelectorAll("input")).some((other) => other !== field)) break;
+        const found = node.querySelector(".react-datepicker__monthPicker");
+        if (found) return found.closest(".react-datepicker");
+      }
+      return null;
+    };
+    const ownerInputOf = (popup) => {
+      for (let node = popup?.parentElement; node && node !== document.body; node = node.parentElement) {
+        const input = node.querySelector("input");
+        if (input) return input;
+      }
+      return null;
+    };
+    const pageWidePicker = () => {
+      const popup = document.querySelector(".react-datepicker__monthPicker")?.closest(".react-datepicker");
+      const owner = ownerInputOf(popup);
+      return popup && (!owner || owner === field) ? popup : null;
+    };
+    const picker = () => ownPicker() || pageWidePicker();
+    if (!picker()) {
+      console.log("[AskJobs] month popup: didn't open");
+      return null;
+    }
+    for (let step = 0; step < 60; step++) {
+      const shown = Number((picker()?.querySelector(".react-datepicker-year-header")?.textContent || "").trim());
+      if (!shown) {
+        console.log("[AskJobs] month popup: no year heading");
+        return false;
+      }
+      if (shown === year) break;
+      const arrow = picker()?.querySelector(shown > year ? ".react-datepicker__navigation--previous" : ".react-datepicker__navigation--next");
+      if (!arrow) {
+        console.log("[AskJobs] month popup: no", shown > year ? "previous" : "next", "arrow (heading", shown, ")");
+        return false;
+      }
+      arrow.click();
+      // An arrow that doesn't move the heading would otherwise spin all
+      // 60 steps — stop once it's clearly stuck. Polled for up to 1s, not
+      // one fixed wait: a just-added job's popup can be slow to re-render.
+      let after = shown;
+      for (let poll = 0; poll < 10 && after === shown; poll++) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        after = Number((picker()?.querySelector(".react-datepicker-year-header")?.textContent || "").trim());
+      }
+      if (after === shown) {
+        console.log("[AskJobs] month popup: arrow click didn't change the year (still", shown, ")");
+        return false;
+      }
+    }
+    const cell = picker()?.querySelector(`.react-datepicker__month-${month}`);
+    if (!cell || cell.classList.contains("react-datepicker__month-text--disabled") || !(cell.getAttribute("aria-label") || "").includes(String(year))) return false;
+    const opts = { bubbles: true, cancelable: true, view: window };
+    cell.dispatchEvent(new MouseEvent("mousedown", opts));
+    cell.dispatchEvent(new MouseEvent("mouseup", opts));
+    cell.click();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const ok = (field.value || "").replace(/\D/g, "") === formattedValue.replace(/\D/g, "");
+    // Leave the box so its popup closes before the next date box opens its own.
+    field.blur();
+    field.dispatchEvent(new Event("blur", { bubbles: true }));
+    console.log("[AskJobs] date picked from the month popup:", formattedValue, ok ? "(set)" : `(box shows "${field.value}")`);
+    return ok;
+  }
+
+  // Workable's MM/YYYY box: clear it, type the date's digits one key at a
+  // time (each with its key name — a key event without one is what threw
+  // in the page's mask), press Enter, leave the box. True when it then
+  // shows exactly those digits.
+  async function typeDigitsThenEnter(field, formattedValue) {
+    const digits = formattedValue.replace(/\D/g, "");
+    if (!digits) return false;
+    const setValue = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(field), "value").set;
+    field.focus();
+    field.click();
+    setValue.call(field, "");
+    field.dispatchEvent(new Event("input", { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    for (const ch of digits) {
+      field.dispatchEvent(new KeyboardEvent("keydown", { key: ch, bubbles: true }));
+      setValue.call(field, (field.value || "") + ch);
+      field.dispatchEvent(new InputEvent("input", { data: ch, inputType: "insertText", bubbles: true }));
+      field.dispatchEvent(new KeyboardEvent("keyup", { key: ch, bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    const enter = { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true };
+    field.dispatchEvent(new KeyboardEvent("keydown", enter));
+    field.dispatchEvent(new KeyboardEvent("keyup", enter));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    field.blur();
+    field.dispatchEvent(new Event("blur", { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const ok = (field.value || "").replace(/\D/g, "") === digits;
+    console.log("[AskJobs] Workable date typed as digits + Enter:", digits, ok ? `-> "${field.value}" (set)` : `-> box shows "${field.value}" — trying the month popup`);
+    return ok;
+  }
+
   async function fillDateField(field, formattedValue) {
     if (field.type === "date") {
       setNativeValue(field, formattedValue);
@@ -2435,6 +2623,50 @@
     // tried first since it's less likely to desync a mask's own caret
     // tracking; typeCharacterByCharacter (needed by masks that only react
     // to real per-keystroke events) is the fallback, not the first attempt.
+    // Confirmed real (Workable's MM/YYYY Start/End date): setNativeValue's
+    // bare keydown/keyup/change turned "01/2025" into "01/2026" and threw
+    // in the page's own script ("reading 'slice'"), while just focus + set
+    // + input + blur (tested live) kept "01/2025". Tried first there only.
+    // Picking from the box's own month popup goes first there — tested
+    // live: it put "01/2021" in a newly added job's box that the typed
+    // value didn't stick in. Typing is the fallback.
+    if (/(^|\.)workable\.com$/.test(location.hostname)) {
+      // The user's own way, first: type just the digits ("012021") key by
+      // key like a person, then Enter — tested live, the box formatted it
+      // to "01/2021" itself with no page error.
+      if (await typeDigitsThenEnter(field, formattedValue)) return true;
+      const picked = await pickFromYearHeaderMonthPicker(field, formattedValue);
+      if (picked) return true;
+      // The popup opened but couldn't reach the date: typing after that is
+      // what left a wrong date ("05/2026" for 01/2021) — leave it empty
+      // instead. Typing is only for a box whose popup never opened.
+      if (picked === false) {
+        field.blur();
+        field.dispatchEvent(new Event("blur", { bubbles: true }));
+        console.log("[AskJobs] Workable date: month popup couldn't reach", formattedValue, "— left for the user");
+        return false;
+      }
+      console.log("[AskJobs] Workable date: month popup didn't open for", formattedValue, "— typing it instead");
+      const setValue = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(field), "value").set;
+      field.focus();
+      setValue.call(field, formattedValue);
+      field.dispatchEvent(new Event("input", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      field.blur();
+      field.dispatchEvent(new Event("blur", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      if (field.value === formattedValue) return true;
+      // The remaining approaches below (bare key events, per-character
+      // typing, ISO) are what crash Workable's own date mask ("reading
+      // 'slice'") and froze the page ("not responding") — stop here, close
+      // the popup, and leave the date for the user. Closed by leaving the
+      // box, never Escape or a page click: Escape reached Workable's form
+      // and closed the whole application (back to the job's Apply button).
+      field.blur();
+      field.dispatchEvent(new Event("blur", { bubbles: true }));
+      console.log("[AskJobs] Workable date: typed", formattedValue, "didn't stick either (box shows", JSON.stringify(field.value), ") — left for the user");
+      return false;
+    }
     setNativeValue(field, formattedValue);
     await new Promise((resolve) => setTimeout(resolve, 100));
     if (field.value === formattedValue) return true;
@@ -3917,6 +4149,21 @@
     }
 
     const key = classify(field);
+    // Confirmed real (Workable): city/postcode/country are aria-hidden,
+    // tabindex=-1 mirrors the page fills from its own Address box — and
+    // rebuilds that box's text from them, so every fill (and every refill
+    // after the page emptied them) appended ", Dallas, 75201, United States"
+    // to the visible Address. A hidden address mirror is never filled.
+    if (
+      key &&
+      ["addressStreet", "fullAddress", "addressCity", "addressState", "addressPostalCode", "addressCountry"].includes(key) &&
+      field.getAttribute("aria-hidden") === "true" &&
+      field.tabIndex === -1
+    ) {
+      attemptedSignatures.add(signature);
+      console.log("[AskJobs] hidden address mirror left to the page:", key, "->", fieldLabel);
+      return;
+    }
     if (key && field.tagName === "SELECT") {
       console.log("[AskJobs] native <select> classified as", key, "before ever reaching fillScreeningSelect:", fieldLabel);
     }
@@ -3937,6 +4184,34 @@
         // selected nothing, and marking it attempted here kept the dropdown
         // scan (which picks LinkedIn from the real options) from ever trying.
         if (!isMultiselectSearchBox(field) && isComboboxField(field)) {
+          // Type-to-search box (aria-autocomplete="list") — confirmed real
+          // (Normal Computing's Ashby form, tested live): typing "LinkedIn"
+          // narrows the list to exactly "LinkedIn". Type each term in rule
+          // order and click the matching option; on a miss the dropdown
+          // scan still gets its turn.
+          if (field.tagName === "INPUT" && /list|both/.test(field.getAttribute("aria-autocomplete") || "")) {
+            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+            for (const term of ["LinkedIn", "Careers", "Career", "Company Website", "Website"]) {
+              field.focus();
+              setter.call(field, term);
+              field.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+              await new Promise((resolve) => setTimeout(resolve, 900));
+              const options = deepQueryAll(null, '[role="option"]').filter(isRealOptionCandidate).map((o) => ({ o, t: optionText(o) }));
+              const choice = pickReferralSourceOption(options.map((x) => x.t));
+              const hit = choice && options.find((x) => x.t === choice);
+              if (hit) {
+                clickMatchedOption(hit.o);
+                await new Promise((resolve) => setTimeout(resolve, 300));
+                attemptedSignatures.add(signature);
+                console.log("[AskJobs] referral source (type-to-search):", term, "->", choice, ":", fieldLabel);
+                recordResult("filled", fieldLabel, choice);
+                return;
+              }
+            }
+            setter.call(field, "");
+            field.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+            field.blur();
+          }
           console.log("[AskJobs] referral source is a dropdown — leaving it to the dropdown scan:", fieldLabel);
           return;
         }
@@ -4208,6 +4483,12 @@
     // the number itself; the dial code is handled separately
     // (fillNearbyCountrySelector), so leave it alone here.
     if (key === "phone" && isComboboxField(field)) {
+      // Confirmed real (Alten's Greenhouse): "By selecting YES, I consent to
+      // receive recruiting SMS messages ... at the phone number provided"
+      // read as "phone" and was marked done here, so the dropdown scan's
+      // SMS-consent rule (always Yes) never saw it. Left untouched for that
+      // scan instead.
+      if (matchRadioQuestion(normalize(fieldLabel))?.key === "smsConsent") return;
       attemptedSignatures.add(signature);
       queuedFieldSignatures.add(signature);
       return;
@@ -4284,6 +4565,19 @@
     // rejected ("Enter a valid format for Phone Number"). With no picker
     // (one combined field), the full stored number goes in as-is
     // ("+1 (813) 604-0929"), replacing any bare "+1" prefix already there.
+    // react-phone-number-input (ADP) — see fillReactPhoneInput; anything it
+    // can't confirm falls through to the usual path below.
+    if (key === "phone" && field.classList?.contains("PhoneInputInput")) {
+      const shown = await fillReactPhoneInput(field);
+      if (shown) {
+        attemptedSignatures.add(signature);
+        extensionFilledSignatures.add(signature);
+        console.log("[AskJobs] generic field filled: phone (country picked in the widget) =", shown, "->", fieldLabel);
+        recordResult("filled", fieldLabel, shown);
+        return;
+      }
+      console.log("[AskJobs] phone widget fill didn't confirm — falling back to the usual phone fill:", fieldLabel);
+    }
     const hasCodePicker = key === "phone" && !!findNearbyCountrySelector(field);
     const finalValue =
       key !== "phone" ? value : hasCodePicker ? nationalPhoneDigits() || value : (profile?.phone || "").trim() || value;
@@ -4493,6 +4787,7 @@
       await scanAndFillExperienceDatePickers(root);
       await scanAndFillUi5DatePickers();
       await scanAndFillGenericComboboxes(root);
+      await scanAndFillAdpDropdowns();
       await scanAndFillButtonToggleGroups(root);
       await runClassificationPass();
       await flagUnreachableResumeUploadIfNeeded();
@@ -4512,6 +4807,14 @@
   // pass, any text field the extension itself filled that is now empty is
   // filled again — the user wants these overridden. Two checks (4s, 10s),
   // only armed once per fill so it can't loop.
+  // Confirmed real (Workable): the hidden city/postcode/country boxes behind
+  // the Address autocomplete are emptied by the page after EVERY fill, so
+  // this refilled them forever — each round re-ran the whole fill and
+  // appended "Dallas, 75201, United States" to the Address box again. A
+  // field gets at most 2 automatic refills; an explicit Fill click
+  // (manualFill) is unaffected.
+  const MAX_AUTO_REFILLS = 2;
+  const autoRefillCounts = new Map();
   let wipedRecheckArmed = false;
   function scheduleWipedFieldRecheck() {
     if (wipedRecheckArmed || extensionFilledSignatures.size === 0) return;
@@ -4520,7 +4823,13 @@
       let cleared = 0;
       for (const field of deepQueryAll(document, "input, textarea")) {
         const signature = fieldSignature(field);
-        if (!field.value && extensionFilledSignatures.has(signature) && attemptedSignatures.delete(signature)) cleared++;
+        if (field.value || !extensionFilledSignatures.has(signature)) continue;
+        const refills = autoRefillCounts.get(signature) || 0;
+        if (refills >= MAX_AUTO_REFILLS) continue;
+        if (attemptedSignatures.delete(signature)) {
+          autoRefillCounts.set(signature, refills + 1);
+          cleared++;
+        }
       }
       if (cleared) {
         console.log("[AskJobs]", cleared, "field(s) the extension filled were emptied by the page — filling them again");
@@ -4638,6 +4947,8 @@
   // "worked here before," derived per-application from resume history —
   // never stored, genuinely computed each time against the current job.
   function radioAnswerForKey(key, questionText = "") {
+    // Consent to recruiting SMS/text messages — always Yes (user's rule).
+    if (key === "smsConsent") return true;
     // Enrolled now only if an education entry ends in the future; with no
     // future end date on file (graduated, or no dates), No.
     if (key === "currentlyEnrolled") {
@@ -5012,6 +5323,18 @@
     return groups;
   }
 
+  // Confirmed real (Workable's YES/NO buttons, tested live): a
+  // <div role="radio"> around <label><input type="radio" aria-hidden></label>
+  // — clicking the div selected nothing (aria-checked stayed "false"), while
+  // clicking the label (or the input) inside it did. Radios only: a second
+  // click is harmless on a radio but would untick a checkbox.
+  function clickInnerRadioIfStillUnchecked(wrapper) {
+    if (wrapper.getAttribute("role") !== "radio" || wrapper.getAttribute("aria-checked") === "true") return;
+    const input = wrapper.querySelector('input[type="radio"]');
+    if (!input) return;
+    (input.closest("label") || input).click();
+  }
+
   // Same native-setter-override discipline as setNativeValue, applied to
   // `checked` instead of `value` — frameworks track checkbox/radio state via
   // the same kind of intercepted property setter.
@@ -5021,6 +5344,7 @@
     // (confirmed on SmartRecruiters: aria-checked flips to "true").
     if (isAriaRadio(radio)) {
       if (radio.getAttribute("aria-checked") !== "true") radio.click();
+      clickInnerRadioIfStillUnchecked(radio);
       return;
     }
     // A real input wrapped in its own ARIA checkbox/radio control (confirmed
@@ -5030,6 +5354,7 @@
     const ariaWrapper = radio.parentElement?.closest('[role="checkbox"], [role="radio"]');
     if (ariaWrapper) {
       if (ariaWrapper.getAttribute("aria-checked") !== "true") ariaWrapper.click();
+      clickInnerRadioIfStillUnchecked(ariaWrapper);
       return;
     }
     const proto = Object.getPrototypeOf(radio);
@@ -6451,6 +6776,13 @@
   // dropdown (Escape on its trigger — Workday, react-select and most ARIA
   // listboxes honor it) when a later step needs it closed.
   function dismissOpenCombobox(button) {
+    // Workable: Escape reaches its form and closes the whole application
+    // (back to the job's Apply button) — leave the box instead there.
+    if (/(^|\.)workable\.com$/.test(location.hostname)) {
+      button.blur?.();
+      button.dispatchEvent(new Event("blur", { bubbles: true }));
+      return;
+    }
     const esc = { key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true, cancelable: true };
     button.dispatchEvent(new KeyboardEvent("keydown", esc));
     button.dispatchEvent(new KeyboardEvent("keyup", esc));
@@ -7156,6 +7488,9 @@
     return filled ? choice : null;
   }
 
+  // Structured boxes tried under each signature — see the skip check in
+  // fillStructuredSection.
+  const structuredSignatureBoxes = new Map();
   async function fillStructuredSection(container, matchers, entryData) {
     if (!container || !entryData) return;
     // Confirmed real, serious bug via actual logs (Johns Hopkins APL's
@@ -7196,7 +7531,19 @@
       const parserPlaceholder = /^(unspecified|unknown|n a|not applicable|no selection)$/.test(normalize(field.value || ""));
       if (field.disabled || field.type === "hidden" || (field.type !== "checkbox" && field.value && !parserPlaceholder)) continue;
       const signature = fieldSignature(field);
-      if (attemptedSignatures.has(signature)) continue;
+      // Confirmed real (Workable): every entry's date box is the same
+      // <input name="start_date" placeholder="MM/YYYY"> with no id, so the
+      // Education one (no dates saved) made the Experience one look
+      // "already attempted" and it was silently skipped. A DIFFERENT box
+      // that's still on the page gets its own turn; the same box, or a
+      // re-rendered copy of a box already tried, is still skipped.
+      const sameSignatureBoxes = structuredSignatureBoxes.get(signature);
+      if (attemptedSignatures.has(signature)) {
+        const anotherLiveBox = sameSignatureBoxes && !sameSignatureBoxes.has(field) && [...sameSignatureBoxes].some((box) => box.isConnected);
+        if (!anotherLiveBox) continue;
+      }
+      if (sameSignatureBoxes) sameSignatureBoxes.add(field);
+      else structuredSignatureBoxes.set(signature, new Set([field]));
 
       if (field.type === "checkbox") {
         if (field.checked) continue;
@@ -7265,10 +7612,15 @@
       // matcher for the same-sounding label.
       attemptedSignatures.add(signature);
       if (await fillStructuredField(field, value, fieldLabel, key, entryData?.field)) {
-        recordResult("filled", fieldLabel, String(value));
+        const filledShown = (key === "startDate" || key === "endDate") && isDateShapedField(field) ? field.value || String(value) : String(value);
+        recordResult("filled", fieldLabel, filledShown);
         console.log("[AskJobs] structured field filled:", key, "=", value, "->", fieldLabel);
       } else {
-        recordResult("skipped", fieldLabel, `Couldn't fill with "${value}"`);
+        // A date shows as the box's own format ("01/2021"), not the saved
+        // "2021-01-01T00:00:00.000Z" — that read as if the raw value had
+        // been typed in.
+        const shownValue = (key === "startDate" || key === "endDate") && isDateShapedField(field) ? formatDateForField(field, value) || value : value;
+        recordResult("skipped", fieldLabel, `Couldn't fill with "${shownValue}" — please enter it directly`);
         console.log("[AskJobs] structured field fill failed:", key, "=", value, "->", fieldLabel);
       }
     }
@@ -7674,6 +8026,86 @@
     return undefined;
   }
 
+  // Confirmed real (ADP Workforce Now "State / Territory"): a
+  // <wfn-dropdown-list> custom element, labelled only via aria-labelledby,
+  // whose options are <sdf-select-item role="option"> rendered in a portal
+  // (shadow DOM) and read "TX - Texas" — the generic combobox path reported
+  // "Couldn't find a matching option" and the field stayed "required".
+  // Extra pass, runs after the generic ones: only an EMPTY one whose label
+  // asks for the state, matched by full name or code.
+  const attemptedAdpDropdowns = new WeakSet();
+  // Confirmed real (ADP "What is your desired salary?"): the currency
+  // beside the amount is an <sdf-select-simple aria-label="Select currency
+  // type"> whose options read "United States Dollar ( USD )". Always USD —
+  // the user's rule (every job applied to is US-based).
+  async function fillAdpCurrencyDropdowns() {
+    const hosts = deepQueryAll(document, "sdf-select-simple, wfn-dropdown-list").filter((h) =>
+      /currency/i.test([h.getAttribute("aria-label"), h.getAttribute("placeholder"), h.getAttribute("label-text")].join(" "))
+    );
+    for (const host of hosts) {
+      if (attemptedAdpDropdowns.has(host) || host.getAttribute("value") || host.value) continue;
+      const code = "USD";
+      attemptedAdpDropdowns.add(host);
+      const label = "Currency type";
+      (host.shadowRoot?.querySelector("button, [role=combobox], input") || host).click();
+      const codeRe = new RegExp(`\\(\\s*${code}\\s*\\)`);
+      let option = null;
+      for (let i = 0; i < 10 && !option; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        option = deepQueryAll(document, "[role=option]").find((o) => codeRe.test(o.getAttribute("aria-label") || o.textContent || ""));
+      }
+      if (option) {
+        option.scrollIntoView?.({ block: "nearest" });
+        option.click();
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      } else {
+        document.body.click();
+      }
+      const ok = Boolean(host.getAttribute("value") || host.value);
+      console.log("[AskJobs] ADP currency ->", code, option ? (ok ? "(picked)" : "(clicked, didn't stick)") : "(no matching option)");
+      recordResult(ok ? "filled" : "skipped", label, ok ? (option.getAttribute("aria-label") || option.textContent).trim() : `Couldn't pick ${code} — please choose it directly`);
+    }
+  }
+
+  async function scanAndFillAdpDropdowns() {
+    await fillAdpCurrencyDropdowns();
+    const hosts = deepQueryAll(document, "wfn-dropdown-list");
+    for (const host of hosts) {
+      if (attemptedAdpDropdowns.has(host) || host.getAttribute("value") || host.value) continue;
+      const labelId = host.getAttribute("aria-labelledby");
+      const labelText = (labelId && document.getElementById(labelId)?.textContent) || host.getAttribute("label-text") || "";
+      if (!/\b(state|territory|province)\b/.test(normalize(labelText))) continue;
+      const stored = profile?.addressState;
+      if (!stored) continue;
+      attemptedAdpDropdowns.add(host);
+      const code = US_STATE_NAMES[stored.trim().toUpperCase()]
+        ? stored.trim().toUpperCase()
+        : Object.keys(US_STATE_NAMES).find((k) => normalize(US_STATE_NAMES[k]) === normalize(stored));
+      const name = normalize(code ? US_STATE_NAMES[code] : stored);
+      const matches = (text) => {
+        const t = normalize(text);
+        return t === name || (t.endsWith(" " + name) && (!code || t.startsWith(code.toLowerCase() + " "))) || (code && t === code.toLowerCase());
+      };
+      const label = (labelText || "State").replace(/\s*is required\s*/i, "").replace(/\*/g, "").trim();
+      (host.shadowRoot?.querySelector("button, [role=combobox], input") || host).click();
+      let option = null;
+      for (let i = 0; i < 10 && !option; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        option = deepQueryAll(document, "[role=option]").find((o) => matches(o.getAttribute("aria-label") || o.textContent || ""));
+      }
+      if (option) {
+        option.scrollIntoView?.({ block: "nearest" });
+        option.click();
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      } else {
+        document.body.click();
+      }
+      const ok = Boolean(host.getAttribute("value") || host.value);
+      console.log("[AskJobs] ADP dropdown", label, "->", stored, option ? (ok ? "(picked)" : "(clicked, didn't stick)") : "(no matching option)");
+      recordResult(ok ? "filled" : "skipped", label, ok ? (option.textContent || stored).trim() : `Couldn't pick "${stored}" — please choose it directly`);
+    }
+  }
+
   async function scanAndFillUi5DatePickers() {
     const all = deepQueryAll(document, "[ui5-date-picker]").filter((el) => /^ui5-date-picker/i.test(el.tagName));
     if (!all.length) return;
@@ -7760,6 +8192,16 @@
       const iso = isStart ? exp.startDate : exp.endDate;
       if (!iso) {
         recordResult("skipped", resultLabel, `No ${isStart ? "start" : "end"} date stored for this job — please set it directly`);
+        continue;
+      }
+      // Confirmed real (Workable, third job): a date the month popup had
+      // left empty was typed here instead, and Workable's mask turned
+      // "01/2021" into "01/2026". There it goes through fillDateField
+      // (month popup first, never a guessed year) like the main pass.
+      if (/(^|\.)workable\.com$/.test(location.hostname)) {
+        const formatted = formatDateForField(input, iso);
+        const ok = formatted ? await fillDateField(input, formatted) : false;
+        recordResult(ok ? "filled" : "skipped", resultLabel, ok ? input.value : `Couldn't pick "${formatted || iso}" — please set it directly`);
         continue;
       }
       const stuck = await typeDateWithFormatFallback(input, iso);

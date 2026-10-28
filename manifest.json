@@ -52,6 +52,7 @@
     "https://*.recruitee.com/*",
     "https://*.catsone.com/*",
     "https://*.bamboohr.com/*",
+    "https://*.talemetry.com/*",
 
     "https://*.linkedin.com/*",
     "https://linkedin.com/*",
@@ -190,6 +191,7 @@
         "https://*.recruitee.com/*",
         "https://*.catsone.com/*",
         "https://*.bamboohr.com/*",
+        "https://*.talemetry.com/*",
 
         "https://*.linkedin.com/*",
         "https://linkedin.com/*",

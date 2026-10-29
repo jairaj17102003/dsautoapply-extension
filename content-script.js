@@ -1331,6 +1331,9 @@
   // click (often opening the native OS picker at that point, which no
   // script can drive) — meaning our scan never sees one to even attempt.
   let resumeFileInputFound = false;
+  // Signatures of upload boxes the résumé was attached to — see fillField's
+  // once-per-page check.
+  const resumeAttachedSignatures = [];
   let resumeUploadFallbackShown = false;
   // Human-readable trace of every fill attempt, shown directly in the
   // sidebar — not just a bare count — since digging through the DevTools
@@ -3375,6 +3378,73 @@
     showAiStatus("");
   }
 
+  // ---- Dayforce "Import Resume" ----
+  // Confirmed real (Dayforce, watched live): importing the résumé rebuilds
+  // the whole form ~4s after the file is picked — it creates the Education/
+  // Employment cards itself (1 + 3, matching the profile) and empties the
+  // other fields, then shows "Your file was imported.". Filling first meant
+  // everything was wiped, then duplicated. Only on Dayforce, only with its
+  // own Import Resume button and upload present.
+  function isDayforceImportPage() {
+    return (
+      /(^|\.)dayforcehcm\.com$/.test(location.hostname) &&
+      !!document.querySelector('[test-id="import-resume-section-button"]') &&
+      !!document.querySelector("#jobPostingApplication_files_resume")
+    );
+  }
+  function dayforceSavedCardCount() {
+    return document.querySelectorAll('[test-id="educationHistory-edit-button"], [test-id="workHistory-edit-button"]').length;
+  }
+  // The section's own saved cards (Edit buttons) — Dayforce already has its
+  // entries, so no "Add" and no new entry forms there.
+  function dayforceSectionHasSavedCards(sectionKey) {
+    if (!isDayforceImportPage()) return false;
+    const testId = sectionKey === "education" ? "educationHistory-edit-button" : sectionKey === "experience" ? "workHistory-edit-button" : null;
+    return !!testId && !!document.querySelector(`[test-id="${testId}"]`);
+  }
+  function markDayforceResumeInputsAttempted() {
+    for (const input of document.querySelectorAll("#jobPostingApplication_files_resume")) attemptedSignatures.add(fieldSignature(input));
+  }
+  // Run at the START of a fill pass: import the résumé first, wait for
+  // Dayforce to finish, then the normal fill runs on the rebuilt form.
+  let dayforceImportDone = false;
+  async function importResumeFirstOnDayforce() {
+    if (dayforceImportDone || !isDayforceImportPage()) return;
+    dayforceImportDone = true;
+    // Already imported (an earlier Fill, or by hand) — never import twice.
+    if (dayforceSavedCardCount() > 0) {
+      markDayforceResumeInputsAttempted();
+      resumeFileInputFound = true;
+      console.log("[AskJobs] Dayforce: résumé already imported (saved entries on the page) — not importing again");
+      return;
+    }
+    const input = document.querySelector("#jobPostingApplication_files_resume");
+    showAiStatus("Importing the résumé into Dayforce first…");
+    const started = Date.now();
+    const result = await attachResumeFile(input);
+    if (!result?.attached) {
+      showAiStatus("");
+      console.log("[AskJobs] Dayforce: couldn't attach the résumé for import — normal fill");
+      return;
+    }
+    const imported = () =>
+      dayforceSavedCardCount() > 0 ||
+      Array.from(document.querySelectorAll(".ant-message, .ant-notification, [role=alert]")).some((el) => /your file was imported/i.test(el.textContent || ""));
+    let done = false;
+    for (let i = 0; i < 80 && !done; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      done = imported();
+    }
+    // Let the rebuilt form settle before filling it.
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    markDayforceResumeInputsAttempted();
+    resumeFileInputFound = true;
+    showAiStatus("");
+    const secs = ((Date.now() - started) / 1000).toFixed(1);
+    console.log(`[AskJobs] Dayforce: résumé ${done ? "imported" : "attached, but no import confirmation within 20s"} after ${secs}s — filling the rest`);
+    recordResult("filled", "Resume/CV", done ? "Imported into Dayforce first — it filled its own education/job entries" : "Attached — Dayforce didn't confirm the import, please check");
+  }
+
   async function flagUnreachableResumeUploadIfNeeded() {
     if (resumeFileInputFound || resumeUploadFallbackShown) return;
     if (await tryUploadTiles()) return;
@@ -3932,6 +4002,15 @@
       const previous = attemptedFieldElements.get(signature);
       const rerenderedEmpty = previous && previous !== field && !previous.isConnected && !field.value;
       if (!rerenderedEmpty) return;
+      // Never for a file input: one always reads empty after the page
+      // rebuilds it, even with the file kept (shown as "prathik-reddy...").
+      // Confirmed real (Dayforce's "Import Resume"): each re-attach was
+      // re-imported, the page rebuilt the form, and the "empty" new input
+      // was attached again — an endless loop.
+      if (field.type === "file") {
+        console.log("[AskJobs] file input re-rendered by the page after it was attached — not attaching again:", fieldLabel);
+        return;
+      }
       attemptedSignatures.delete(signature);
       console.log("[AskJobs] field was re-rendered empty by the page — filling again:", fieldLabel);
     }
@@ -4064,7 +4143,21 @@
         recordResult("skipped", fieldLabel, "Not the resume field — attach manually if required");
         return;
       }
+      // Confirmed real (UKG/UltiPro): "Upload Resume" and the Documents
+      // section's general "Upload a file" were both taken as the résumé
+      // slot, so the same résumé was listed twice. Once per page: a second
+      // upload box is left alone while the first résumé box is still here
+      // (a later page of a multi-step form still gets it).
+      // By signature, not element: UKG replaces the first box after the
+      // upload, and the replacement still means "the résumé box is here".
+      const liveFileSignatures = new Set(deepQueryAll(document, 'input[type="file"]').map((input) => fieldSignature(input)));
+      if (resumeAttachedSignatures.some((sig) => sig !== signature && liveFileSignatures.has(sig))) {
+        console.log("[AskJobs] résumé already attached on this page — not attaching it to a second upload:", fieldLabel);
+        recordResult("skipped", fieldLabel, "Résumé already attached above — not added a second time");
+        return;
+      }
       const { attached, fileMissing } = await attachResumeFile(field);
+      if (attached && !resumeAttachedSignatures.includes(signature)) resumeAttachedSignatures.push(signature);
       recordResult(
         attached ? "filled" : "skipped",
         "Resume/CV",
@@ -4750,6 +4843,9 @@
       resetFillStateIfNewContext(deepQueryAll(root, "input, select, textarea, button"));
       // SAP-style upload tiles go first — see uploadTilesBeforeFilling.
       await uploadTilesBeforeFilling();
+      // Dayforce's Import Resume rebuilds the form — import first (see
+      // importResumeFirstOnDayforce). Does nothing on any other site.
+      await importResumeFirstOnDayforce();
 
       // Runs before the generic per-field loop below so that, by the time it
       // reaches an education/experience field, it already has a value and is
@@ -7852,13 +7948,17 @@
   async function fillEducationAndExperience() {
     console.log("[AskJobs] education entries:", profile?.education?.length || 0, "experience entries:", profile?.experience?.length || 0);
 
-    if (profile?.education?.length) {
+    if (profile?.education?.length && dayforceSectionHasSavedCards("education")) {
+      console.log("[AskJobs] Dayforce: education entries already saved by the résumé import — not adding more");
+    } else if (profile?.education?.length) {
       const container = findSectionContainer("education");
       console.log("[AskJobs] education section container found?", !!container, container);
       await revealFirstEntryIfNeeded(container);
       await fillRepeatedEntries(container, EDUCATION_FIELD_MATCHERS, profile.education, "education");
     }
-    if (profile?.experience?.length) {
+    if (profile?.experience?.length && dayforceSectionHasSavedCards("experience")) {
+      console.log("[AskJobs] Dayforce: job entries already saved by the résumé import — not adding more");
+    } else if (profile?.experience?.length) {
       const container = findSectionContainer("experience");
       console.log("[AskJobs] experience section container found?", !!container, container);
       await revealFirstEntryIfNeeded(container);
